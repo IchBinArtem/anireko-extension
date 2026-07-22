@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "base": "https://anireko.com",
+  "actions": {
+    "session-info": { "method": "GET", "path": "/api/auth/session-info.php", "credentials": true },
+    "search": { "method": "GET", "path": "/api/search", "credentials": false, "query": ["q", "limit"] },
+    "taste-match": { "method": "GET", "path": "/api/anime/{anime_id}/match", "credentials": true },
+    "status-get": { "method": "GET", "path": "/api/anime/status.php", "credentials": true },
+    "status-write": { "method": "POST", "path": "/api/anime/status.php", "credentials": true, "body": ["anime_id", "status", "expected_user_id"] },
+    "progress-write": { "method": "POST", "path": "/api/extension/progress.php", "credentials": true, "body": ["anime_id", "episode", "position_sec", "duration_sec", "voice", "expected_user_id"] },
+    "progress-all": { "method": "GET", "path": "/api/extension/progress.php?all=1", "credentials": true, "query": ["expected_user_id"] },
+    "diagnostic": { "method": "POST", "path": "/api/extension/diagnostic.php", "credentials": false, "body": ["report_kind", "host", "ext_version", "probe"] }
+  }
+}

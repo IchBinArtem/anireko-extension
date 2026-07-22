@@ -1,0 +1,79 @@
+name: Extension release
+
+on:
+  pull_request:
+    paths:
+      - "extension/**"
+      - "tests/e2e/extension-specs/**"
+      - "tests/e2e/playwright.extension.config.ts"
+      - ".github/workflows/extension-release.yml"
+  push:
+    paths:
+      - "extension/**"
+      - "tests/e2e/extension-specs/**"
+      - "tests/e2e/playwright.extension.config.ts"
+      - ".github/workflows/extension-release.yml"
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  verify-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm, cache-dependency-path: tests/e2e/package-lock.json }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.13" }
+      - name: Export and freeze the client-only public source boundary
+        shell: bash
+        run: |
+          PUBLIC_EXPORT="$RUNNER_TEMP/anireko-extension-public"
+          python extension/scripts/export_public.py "$PUBLIC_EXPORT"
+          test -z "$(find "$PUBLIC_EXPORT" -type f -name '*.php' -print -quit)"
+          git -C "$PUBLIC_EXPORT" init -b main
+          git -C "$PUBLIC_EXPORT" config user.name "AniReko Release CI"
+          git -C "$PUBLIC_EXPORT" config user.email "release-ci@anireko.invalid"
+          git -C "$PUBLIC_EXPORT" add --all
+          git -C "$PUBLIC_EXPORT" commit -m "verified public export"
+          echo "PUBLIC_EXPORT=$PUBLIC_EXPORT" >> "$GITHUB_ENV"
+      - run: node --test extension/tests/*.test.js
+        working-directory: ${{ env.PUBLIC_EXPORT }}
+      - run: npm ci
+        working-directory: ${{ env.PUBLIC_EXPORT }}/tests/e2e
+      - run: npx playwright install --with-deps chromium
+        working-directory: ${{ env.PUBLIC_EXPORT }}/tests/e2e
+      - run: npx playwright test -c playwright.extension.config.ts
+        working-directory: ${{ env.PUBLIC_EXPORT }}/tests/e2e
+      - name: Build deterministic ZIP
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            python "$PUBLIC_EXPORT/extension/scripts/build_release.py" --tag "${GITHUB_REF_NAME}" --output "$GITHUB_WORKSPACE/dist"
+          else
+            python "$PUBLIC_EXPORT/extension/scripts/build_release.py" --output "$GITHUB_WORKSPACE/dist"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: anireko-extension-${{ github.sha }}
+          path: |
+            dist/anireko-extension-*.zip
+            dist/SHA256SUMS
+            dist/FILE-MANIFEST.json
+            dist/SBOM.json
+          if-no-files-found: error
+      - name: Attest release ZIP
+        if: github.ref_type == 'tag'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/anireko-extension-*.zip
+      - name: Publish GitHub Release assets
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" dist/* --verify-tag --generate-notes

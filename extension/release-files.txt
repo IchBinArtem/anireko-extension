@@ -1,0 +1,13 @@
+manifest.json
+brand-mark.svg
+service-worker.js
+popup.html
+popup.css
+popup.js
+content/media-detector.js
+lib/api-client.js
+lib/auto-mark.js
+lib/progress.js
+lib/recognition.js
+lib/runtime-config.js
+lib/trust.js

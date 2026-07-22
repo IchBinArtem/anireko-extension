@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>AniReko Spike</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <main>
+      <header class="brand">
+        <img class="brand-mark" src="brand-mark.svg" alt="" aria-hidden="true">
+        <div>
+          <h1>AniReko</h1>
+          <span>Трекер просмотра аниме</span>
+        </div>
+      </header>
+      <section class="privacy-disclosure" id="privacy-disclosure" hidden>
+        <strong>Как работает AniReko</strong>
+        <ul>
+          <li>На разрешённых вами сайтах локально читаются название, серия и состояние видеоплеера.</li>
+          <li>Очищенное название отправляется в AniReko для поиска совпадения. Полный адрес страницы не отправляется.</li>
+          <li>Статус, серия, позиция и озвучка отправляются только после включения синхронизации с аккаунтом.</li>
+          <li>Если аниме не распознано, отдельная кнопка отправляет только hostname и техническую структуру — без адреса, названия страницы, cookies и истории.</li>
+        </ul>
+        <label><input type="checkbox" id="diagnostics-consent"> Отправлять обезличенную диагностику неподдерживаемых плееров (hostname и структура, без path/query)</label>
+        <div class="privacy-actions">
+          <button id="privacy-accept" type="button">Понятно, включить AniReko</button>
+          <button id="privacy-decline" class="secondary" type="button">Не использовать</button>
+        </div>
+        <a id="privacy-policy" target="_blank" rel="noopener">Политика конфиденциальности</a>
+      </section>
+      <section class="checks" aria-label="Состояние распознавания">
+        <div class="check-card anime-card pending" id="anime-check">
+          <span class="check-icon" aria-hidden="true">·</span>
+          <div class="check-copy">
+            <strong id="anime-check-title">Ищем страницу аниме</strong>
+            <span id="anime-check-detail">Проверяем метаданные страницы</span>
+            <div class="recognized-only">
+              <h2 id="title">—</h2>
+              <p class="anime-meta"><span id="episode">—</span><span aria-hidden="true">·</span><span id="voice">—</span></p>
+              <p class="taste-match" id="taste-match">—</p>
+              <a class="primary-action" id="anime-primary-action" hidden target="_blank" rel="noopener">Открыть в AniReko <span aria-hidden="true">→</span></a>
+              <p class="catalog-note" id="anireko-match">—</p>
+            </div>
+          </div>
+        </div>
+        <div class="check-card pending" id="player-check">
+          <span class="check-icon" aria-hidden="true">·</span>
+          <div class="check-copy">
+            <strong id="player-check-title">Ищем видеоплеер</strong>
+            <span id="player-check-detail">Проверяем доступные фреймы</span>
+            <div class="playback-summary">
+              <span class="status-chip" id="status">—</span>
+              <strong id="progress">—</strong>
+              <span class="player-tech"><span id="player">—</span><span aria-hidden="true">·</span><span id="player-count">—</span><span aria-hidden="true"> плеера</span></span>
+            </div>
+          </div>
+        </div>
+      </section>
+      <section class="not-found-report" id="not-found-report" hidden>
+        <button id="report-anime-miss" type="button">Здесь есть аниме — сообщить разработчику</button>
+        <p id="report-anime-miss-detail">Отправится только hostname и техническая структура страницы — без адреса, названия страницы, cookies и истории.</p>
+      </section>
+      <section class="stats-card" id="stats-card" aria-label="Локальная статистика">
+        <div class="stats-head">
+          <span>Сегодня</span>
+          <strong id="today-time">0 мин</strong>
+          <span aria-hidden="true">·</span>
+          <strong><span id="today-episodes">0</span> серий</strong>
+          <span class="local-pill">локально</span>
+        </div>
+        <div class="week-chart" id="week-chart" aria-label="Просмотр за последние 7 дней"></div>
+      </section>
+      <section class="resume-card" id="anime-fields">
+        <span id="resume-label" hidden>Где остановился</span>
+        <strong id="resume" hidden>—</strong>
+      </section>
+      <p class="hint" id="hint">История просмотра хранится локально. Для распознавания AniReko получает очищенное название, но не полный адрес страницы.</p>
+      <div class="account" id="account">
+        <span id="account-label">Проверяем аккаунт…</span>
+        <a id="account-login" hidden target="_blank" rel="noopener">Войти на сайте</a>
+        <button id="resume-sync" type="button" title="Подтянуть прогресс с других устройств">⟳ синхронизировать</button>
+      </div>
+      <p class="account-warning" id="account-warning" hidden></p>
+      <label class="automark" id="automark">
+        <input type="checkbox" id="auto-mark" disabled>
+        <span>Синхронизация с AniReko: статус «смотрю» и прогресс серий (серия, позиция, озвучка)</span>
+      </label>
+      <div class="privacy-controls">
+        <a id="privacy-link" target="_blank" rel="noopener">Конфиденциальность</a>
+        <button id="delete-local-data" type="button" disabled>Удалить локальные данные</button>
+      </div>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>

@@ -1,0 +1,25 @@
+{
+  "name": "e2e",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "npx playwright test",
+    "test:staging": "TEST_ENV=staging npx playwright test",
+    "test:prod": "TEST_ENV=prod npx playwright test",
+    "test:headed": "npx playwright test --headed",
+    "test:extension": "playwright test -c playwright.extension.config.ts",
+    "test:extension:real": "playwright test -c playwright.extension-real.config.ts",
+    "test:extension:headed": "playwright test -c playwright.extension.config.ts --headed",
+    "report": "npx playwright show-report playwright-report",
+    "update-fixtures": "curl -sf -H 'Cookie: unlock=anireko_staging_2025' -H 'Accept-Encoding: gzip, deflate, br' --compressed 'https://staging.anireko.com/api/quiz/pool' -o fixtures/quiz-pool.json && echo 'fixtures/quiz-pool.json updated' || echo 'ERROR: fixture update failed (HTTP error or network issue)'"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "@playwright/test": "^1.58.2",
+    "typescript": "^5.9.3"
+  }
+}
