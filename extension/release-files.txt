@@ -1,4 +1,6 @@
 manifest.json
+_locales/en/messages.json
+_locales/ru/messages.json
 brand-mark.svg
 service-worker.js
 popup.html

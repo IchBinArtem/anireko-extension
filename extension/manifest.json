@@ -1,8 +1,9 @@
 {
   "manifest_version": 3,
-  "name": "AniReko — трекер аниме",
-  "version": "0.3.1",
-  "description": "Узнаёт аниме на любом сайте: % совместимости с твоим вкусом, автоотметка «смотрю» и локальная статистика просмотра.",
+  "name": "__MSG_extensionName__",
+  "version": "0.3.2",
+  "description": "__MSG_extensionDescription__",
+  "default_locale": "en",
   "permissions": ["storage"],
   "host_permissions": ["<all_urls>"],
   "incognito": "not_allowed",
@@ -17,7 +18,7 @@
     "run_at": "document_start"
   }],
   "action": {
-    "default_title": "AniReko",
+    "default_title": "__MSG_extensionName__",
     "default_popup": "popup.html"
   }
 }

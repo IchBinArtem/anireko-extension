@@ -1,5 +1,45 @@
 # Chrome Web Store disclosure
 
+## Localized listing
+
+Category: **Entertainment**.
+
+### Русский
+
+**Название:** AniReko — трекер аниме
+
+**Краткое описание:** Распознаёт аниме на любом сайте, показывает совместимость, отмечает «смотрю» и хранит локальную статистику.
+
+**Описание:**
+
+AniReko помогает не терять прогресс при просмотре аниме на разных сайтах.
+
+- распознаёт название аниме, серию и озвучку;
+- показывает процент совместимости с вашим вкусом;
+- хранит локальную статистику просмотра;
+- по вашему выбору синхронизирует статус и прогресс с аккаунтом AniReko.
+
+Расширение не показывает рекламу и не продаёт пользовательские данные. Полный адрес страницы и видео не отправляются для распознавания.
+
+### English
+
+**Name:** AniReko — Anime Tracker
+
+**Short description:** Recognizes anime on any site, shows taste match, marks watching status, and keeps local viewing statistics.
+
+**Description:**
+
+AniReko helps you keep your anime progress across different websites.
+
+- recognizes the anime title, episode, and voice track;
+- shows how well the title matches your taste;
+- keeps local viewing statistics;
+- optionally syncs your status and progress with your AniReko account.
+
+The extension does not show ads or sell user data. The full page address and video are not sent for recognition.
+
+## Privacy disclosure
+
 AniReko requests `<all_urls>` because its single core purpose is to recognize anime playback on arbitrary websites and inside arbitrary cross-origin player frames. Chrome's native site-access controls let each user run it on click, on selected sites, or on all sites.
 
 - Locally read: cleaned anime title, episode/voice labels, and HTML5 player timing/state.

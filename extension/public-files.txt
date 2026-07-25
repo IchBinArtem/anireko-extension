@@ -6,6 +6,8 @@ extension/PRIVACY.md
 extension/README.md
 extension/SECURITY.md
 extension/STORE-LISTING.md
+extension/_locales/en/messages.json
+extension/_locales/ru/messages.json
 extension/api-contract.json
 extension/brand-mark.svg
 extension/content/media-detector.js
@@ -25,6 +27,7 @@ extension/scripts/build_release.py
 extension/scripts/export_public.py
 extension/service-worker.js
 extension/tests/auto-mark.test.js
+extension/tests/i18n.test.js
 extension/tests/parsers.test.js
 extension/tests/search-resolve.test.js
 extension/tests/security.test.js

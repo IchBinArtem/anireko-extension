@@ -14,6 +14,10 @@ test('store manifest uses Chrome native host controls with one static all-frame 
   const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'manifest.json'), 'utf8'));
   assert.deepEqual(manifest.permissions, ['storage']);
   assert.deepEqual(manifest.host_permissions, ['<all_urls>']);
+  assert.equal(manifest.default_locale, 'en');
+  assert.equal(manifest.name, '__MSG_extensionName__');
+  assert.equal(manifest.description, '__MSG_extensionDescription__');
+  assert.equal(manifest.action.default_title, '__MSG_extensionName__');
   assert.equal(manifest.optional_host_permissions, undefined);
   assert.equal(manifest.incognito, 'not_allowed');
   assert.deepEqual(manifest.content_scripts, [{
@@ -182,7 +186,7 @@ test('public export contains every source and fixture used by release verificati
     assert.equal(fs.existsSync(path.join(repo, relative)), true, `public source misses ${relative}`);
   }
 
-  assert.equal(listed.size, 42, 'public export allowlist changed without an explicit review');
+  assert.equal(listed.size, 45, 'public export allowlist changed without an explicit review');
   const exactSupportFiles = new Set(['.github/workflows/extension-release.yml']);
   for (const relative of listed) {
     assert.equal(

@@ -101,7 +101,9 @@ test.beforeAll(async () => {
   context = await chromium.launchPersistentContext(userDataDir, {
     channel: 'chromium',
     headless: true,
+    locale: 'ru-RU',
     args: [
+      '--lang=ru',
       `--disable-extensions-except=${extensionPath}`,
       `--load-extension=${extensionPath}`,
     ],
@@ -144,6 +146,44 @@ test.beforeEach(async () => {
     await chrome.storage.local.clear();
     await chrome.storage.local.set(access);
   });
+});
+
+test('renders the English manifest and popup for an English Chrome UI', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'anireko-extension-en-'));
+  const englishExtensionPath = path.join(root, 'extension');
+  const englishProfilePath = path.join(root, 'profile');
+  fs.cpSync(sourceExtensionPath, englishExtensionPath, { recursive: true });
+  let englishContext: BrowserContext | null = null;
+  try {
+    englishContext = await chromium.launchPersistentContext(englishProfilePath, {
+      channel: 'chromium',
+      headless: true,
+      locale: 'en-US',
+      args: [
+        '--lang=en-US',
+        `--disable-extensions-except=${englishExtensionPath}`,
+        `--load-extension=${englishExtensionPath}`,
+      ],
+    });
+    const englishWorker = englishContext.serviceWorkers()[0]
+      || await englishContext.waitForEvent('serviceworker');
+    const englishExtensionId = new URL(englishWorker.url()).host;
+    const englishPopup = await englishContext.newPage();
+    await englishPopup.goto(`chrome-extension://${englishExtensionId}/popup.html`);
+
+    await expect(englishPopup.locator('html')).toHaveAttribute('lang', 'en');
+    await expect(englishPopup.locator('.brand span')).toHaveText('Anime watch tracker');
+    await expect(englishPopup.locator('#privacy-accept')).toHaveText('Got it, enable AniReko');
+    await expect(englishPopup.locator('#anime-check-title')).toHaveText('Anime not found');
+    await expect(englishPopup.locator('#privacy-policy')).toHaveAttribute(
+      'href', 'https://anireko.com/en/privacy#browser-extension',
+    );
+    await expect.poll(() => englishWorker.evaluate(() => chrome.runtime.getManifest().name))
+      .toBe('AniReko — Anime Tracker');
+  } finally {
+    await englishContext?.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('recognizes anime before playback and confirms player after playback starts', async () => {

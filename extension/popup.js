@@ -1,5 +1,30 @@
 (async function renderPopup() {
   const requestBackground = (type, input = {}) => chrome.runtime.sendMessage({ type, ...input });
+  const t = (key, substitutions) => chrome.i18n.getMessage(key, substitutions) || key;
+  const uiLanguage = chrome.i18n.getUILanguage?.() || navigator.language || 'en';
+  const siteLocale = /^ru(?:-|$)/iu.test(uiLanguage) ? 'ru' : 'en';
+  const dateLocale = siteLocale === 'ru' ? 'ru-RU' : 'en-US';
+  const pluralCategory = (value) => {
+    if (siteLocale !== 'ru') return value === 1 ? 'One' : 'Many';
+    const lastTwo = value % 100;
+    if (lastTwo >= 11 && lastTwo <= 14) return 'Many';
+    const last = value % 10;
+    if (last === 1) return 'One';
+    if (last >= 2 && last <= 4) return 'Few';
+    return 'Many';
+  };
+  const countLabel = (base, value) => `${value} ${t(`${base}${pluralCategory(value)}`)}`;
+
+  document.documentElement.lang = siteLocale;
+  for (const element of document.querySelectorAll('[data-i18n]')) {
+    element.textContent = t(element.dataset.i18n);
+  }
+  for (const element of document.querySelectorAll('[data-i18n-title]')) {
+    element.title = t(element.dataset.i18nTitle);
+  }
+  for (const element of document.querySelectorAll('[data-i18n-aria-label]')) {
+    element.setAttribute('aria-label', t(element.dataset.i18nAriaLabel));
+  }
   let siteBase = 'https://anireko.com';
   try {
     const runtimeInfo = await requestBackground('popup-runtime-info');
@@ -48,7 +73,7 @@
     });
   }
 
-  const privacyHref = `${siteBase}/ru/privacy#browser-extension`;
+  const privacyHref = `${siteBase}/${siteLocale}/privacy#browser-extension`;
   document.getElementById('privacy-policy').href = privacyHref;
   document.getElementById('privacy-link').href = privacyHref;
   const disclosure = document.getElementById('privacy-disclosure');
@@ -74,7 +99,7 @@
 
   const deleteLocalDataButton = document.getElementById('delete-local-data');
   deleteLocalDataButton.addEventListener('click', async () => {
-    if (!confirm('Удалить локальную историю, кэши, настройки и привязку аккаунта? Данные в аккаунте AniReko не удаляются.')) return;
+    if (!confirm(t('confirmDeleteLocalData'))) return;
     await requestBackground('popup-delete-local-data');
     location.reload();
   });
@@ -107,19 +132,19 @@
         syncAccountActive = sameAccount && stored['auto-mark'] === true;
         const profile = document.createElement('a');
         profile.className = 'profile-link';
-        profile.href = `${siteBase}/ru/profile`;
+        profile.href = `${siteBase}/${siteLocale}/profile`;
         profile.target = '_blank';
         profile.rel = 'noopener';
-        profile.textContent = payload.user.name || 'профиль';
-        label.replaceChildren('Аккаунт на сайте: ', profile);
+        profile.textContent = payload.user.name || t('profileFallback');
+        label.replaceChildren(`${t('accountOnSite')} `, profile);
         autoMarkToggle.disabled = false;
         autoMarkToggle.checked = syncAccountActive;
         if (!sameAccount) {
-          const boundName = bound?.name ? `«${bound.name}»` : 'другому аккаунту';
+          const boundName = bound?.name ? t('quotedName', bound.name) : t('otherAccount');
           warning.hidden = false;
           warning.textContent = bound?.id
-            ? `Синхронизация приостановлена: расширение привязано к ${boundName}. Включите переключатель, чтобы явно перепривязать его к «${payload.user.name || 'текущему аккаунту'}».`
-            : 'Синхронизация ещё не привязана. Включите переключатель, чтобы разрешить запись в этот аккаунт.';
+            ? t('syncPausedBoundAccount', [boundName, payload.user.name || t('currentAccount')])
+            : t('syncNotBound');
           syncButton.disabled = true;
         }
         autoMarkToggle.addEventListener('change', async () => {
@@ -131,7 +156,7 @@
           }
           if (bound?.id && !sameAccount) {
             const accepted = confirm(
-              `Переключить синхронизацию с «${bound.name || bound.id}» на «${payload.user.name || payload.user.id}»?`
+              t('confirmSwitchSync', [bound.name || String(bound.id), payload.user.name || String(payload.user.id)])
             );
             if (!accepted) {
               autoMarkToggle.checked = false;
@@ -148,13 +173,13 @@
         return;
       }
     } catch { /* offline / API error — treat as not connected */ }
-    label.textContent = 'Авторизация — через сайт AniReko';
+    label.textContent = t('authorizationViaSite');
     login.hidden = false;
     autoMarkToggle.disabled = true;
     autoMarkToggle.checked = false;
-    autoMarkToggle.title = 'Сначала войдите на anireko.com — расширение использует ту же сессию';
+    autoMarkToggle.title = t('loginRequiredTitle');
     syncButton.disabled = true;
-    syncButton.title = 'Войдите на anireko.com, чтобы синхронизировать прогресс';
+    syncButton.title = t('loginRequiredSyncTitle');
   }
   function setCheck(id, kind, icon, title, detail) {
     const card = document.getElementById(id);
@@ -175,8 +200,8 @@
   function renderStats(history) {
     const now = new Date();
     const today = history?.days?.[dateKey(now)] || { watchedSeconds: 0, episodeKeys: [] };
-    set('today-time', `${Math.round(today.watchedSeconds / 60)} мин`);
-    set('today-episodes', String(today.episodeKeys.length));
+    set('today-time', t('minutesShort', String(Math.round(today.watchedSeconds / 60))));
+    set('today-episodes', countLabel('episodeCount', today.episodeKeys.length));
     const days = [];
     for (let offset = 6; offset >= 0; offset -= 1) {
       const date = new Date(now);
@@ -189,11 +214,11 @@
     chart.replaceChildren(...days.map((day) => {
       const column = document.createElement('div');
       column.className = `day-bar${day.today ? ' today' : ''}`;
-      column.title = `${Math.round(day.value / 60)} мин`;
+      column.title = t('minutesShort', String(Math.round(day.value / 60)));
       const bar = document.createElement('i');
       bar.style.height = `${Math.max(2, Math.round(day.value / max * 18))}px`;
       const label = document.createElement('span');
-      label.textContent = day.date.toLocaleDateString('ru-RU', { weekday: 'short' }).replace('.', '');
+      label.textContent = day.date.toLocaleDateString(dateLocale, { weekday: 'short' }).replace('.', '');
       column.append(bar, label);
       return column;
     }));
@@ -208,37 +233,37 @@
   ];
 
   function renderAnimeNotFound(canReport) {
-    setCheck('anime-check', 'pending', '·', 'Аниме не найдено', 'Название не удалось определить на этой странице');
+    setCheck('anime-check', 'pending', '·', t('animeNotFoundTitle'), t('animeNotFoundDetail'));
     for (const id of animeDetailIds) document.getElementById(id).hidden = true;
     reportSection.hidden = false;
     reportButton.disabled = !canReport;
     if (!canReport) {
-      reportDetail.textContent = 'Обновите страницу после установки расширения — затем отчёт можно будет отправить.';
+      reportDetail.textContent = t('reloadBeforeReport');
     }
   }
 
   reportButton.addEventListener('click', async () => {
     if (reportButton.disabled || !Number.isInteger(tab?.id)) return;
     reportButton.disabled = true;
-    reportButton.textContent = 'Отправляем…';
+    reportButton.textContent = t('sending');
     reportDetail.className = '';
     try {
       const response = await requestBackground('popup-report-recognition-miss', { tabId: tab.id });
       if (!response?.ok) throw new Error('report_failed');
       if (response.payload?.pending) {
-        reportButton.textContent = 'Отчёт уже отправляется…';
-        reportDetail.textContent = 'Дождитесь завершения текущей отправки.';
+        reportButton.textContent = t('reportAlreadySending');
+        reportDetail.textContent = t('waitForCurrentReport');
         return;
       }
-      reportButton.textContent = response.payload?.duplicate ? 'Уже отправлено, спасибо' : 'Отправлено, спасибо';
+      reportButton.textContent = response.payload?.duplicate ? t('reportAlreadySent') : t('reportSent');
       reportDetail.textContent = response.payload?.duplicate
-        ? 'Отчёт с этого сайта уже есть у разработчика.'
-        : 'Разработчик увидит обезличенный технический отчёт.';
+        ? t('reportDuplicateDetail')
+        : t('reportSuccessDetail');
       reportDetail.className = 'ok';
     } catch {
       reportButton.disabled = false;
-      reportButton.textContent = 'Повторить отправку';
-      reportDetail.textContent = 'Не удалось отправить отчёт. Проверьте интернет и попробуйте ещё раз.';
+      reportButton.textContent = t('retrySend');
+      reportDetail.textContent = t('reportFailedDetail');
       reportDetail.className = 'warn';
     }
   });
@@ -261,7 +286,7 @@
   if (consentAccepted) {
     await renderAccount();
   } else {
-    document.getElementById('account-label').textContent = 'Синхронизация выключена до согласия';
+    document.getElementById('account-label').textContent = t('syncOffUntilConsent');
     autoMarkToggle.disabled = true;
     document.getElementById('resume-sync').disabled = true;
   }
@@ -278,17 +303,17 @@
     'anime-check',
     animeFound ? 'success' : 'pending',
     animeFound ? '✓' : '·',
-    animeFound ? 'Аниме найдено' : 'Не удалось подтвердить аниме',
-    animeFound ? recognition.title : 'Название не извлечено из метаданных'
+    animeFound ? t('animeFoundTitle') : t('animeNotConfirmedTitle'),
+    animeFound ? recognition.title : t('metadataTitleMissing')
   );
   setCheck(
     'player-check',
     playerReady ? 'success' : playerFound ? 'waiting' : 'pending',
     playerReady ? '✓' : playerFound ? '▶' : '·',
-    playerReady ? 'Плеер полностью подключён' : playerFound ? 'Плеер найден — ждём видео' : 'Плеер пока не найден',
+    playerReady ? t('playerReadyTitle') : playerFound ? t('playerWaitingTitle') : t('playerMissingTitle'),
     playerReady
-      ? `${player.episode != null ? `Серия ${player.episode}` : 'Фильм / серия не размечена'} · ${Math.round(player.duration / 60)} мин · тайминг читается`
-      : playerFound ? 'Запустите воспроизведение, чтобы получить тайминг' : 'Проверяем HTML5-видео во всех доступных фреймах'
+      ? `${player.episode != null ? t('episodeLabel', String(player.episode)) : t('movieUnmarked')} · ${t('minutesShort', String(Math.round(player.duration / 60)))} · ${t('timingReadable')}`
+      : playerFound ? t('playToReadTiming') : t('checkingHtml5Frames')
   );
   // Unreadable-player diagnostics are auto-reported by the service worker
   // (KAN-2715) — no user action needed, so no UI for it here.
@@ -297,15 +322,15 @@
   const matchElement = document.getElementById('anireko-match');
   const primaryAction = document.getElementById('anime-primary-action');
   if (match?.status === 'ok' && match.slug) {
-    primaryAction.href = `${siteBase}/ru/anime/${match.slug}-${match.animeId}`;
+    primaryAction.href = `${siteBase}/${siteLocale}/anime/${match.slug}-${match.animeId}`;
     primaryAction.hidden = false;
-    set('anireko-match', `В каталоге: ${match.title}${match.year ? ` (${match.year})` : ''}${match.exact ? '' : ' · совпадение неточное'}`);
+    set('anireko-match', `${t('catalogPrefix')} ${match.title}${match.year ? ` (${match.year})` : ''}${match.exact ? '' : ` · ${t('inexactMatch')}`}`);
   } else {
     primaryAction.hidden = true;
     set('anireko-match', match?.status === 'ok'
       ? `${match.title}${match.year ? ` (${match.year})` : ''}`
-      : match?.status === 'none' ? 'не найдено в каталоге'
-        : match?.status === 'error' ? 'ошибка поиска' : null);
+      : match?.status === 'none' ? t('catalogNotFound')
+        : match?.status === 'error' ? t('searchError') : null);
   }
   // Compatibility is supporting context here; the anime page is the popup's
   // single primary destination, so we deliberately avoid a competing link.
@@ -313,10 +338,10 @@
   const tasteElement = document.getElementById('taste-match');
   if (taste?.status === 'ok' && Number.isFinite(taste.percent)) {
     const verdicts = {
-      very_likely: 'очень подходит',
-      likely: 'может понравиться',
-      mixed: 'есть спорные моменты',
-      unlikely: 'скорее не твоё',
+      very_likely: t('verdictVeryLikely'),
+      likely: t('verdictLikely'),
+      mixed: t('verdictMixed'),
+      unlikely: t('verdictUnlikely'),
     };
     const colors = {
       very_likely: '#4ecdc4',
@@ -329,8 +354,8 @@
     percent.textContent = `${taste.percent}%`;
     tasteElement.replaceChildren(percent, ` · ${verdicts[taste.labelKey] || verdicts.mixed}`);
   } else {
-    set('taste-match', taste?.status === 'guest' ? 'войди на сайте, чтобы увидеть %'
-      : taste?.status === 'no-data' ? 'мало данных о вкусе'
+    set('taste-match', taste?.status === 'guest' ? t('loginForMatch')
+      : taste?.status === 'no-data' ? t('notEnoughTasteData')
         : null);
   }
   // «Где остановился» (KAN-2725): открыл это аниме на любом сайте → сразу видно
@@ -383,10 +408,10 @@
       if (!Number.isFinite(ts)) return null;
       const startOfDay = (d) => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
       const days = Math.round((startOfDay(new Date()) - startOfDay(new Date(ts))) / 86400000);
-      if (days <= 0) return 'сегодня';
-      if (days === 1) return 'вчера';
-      if (days < 7) return `${days} дн. назад`;
-      return new Date(ts).toLocaleDateString('ru-RU');
+      if (days <= 0) return t('todayLower');
+      if (days === 1) return t('yesterday');
+      if (days < 7) return t('daysAgo', String(days));
+      return new Date(ts).toLocaleDateString(dateLocale);
     };
     let resume = null;
     if (match?.status === 'ok' && match.animeId) {
@@ -419,7 +444,7 @@
     }
     if (!resume) return;
     const parts = [];
-    if (resume.episode != null) parts.push(`Серия ${resume.episode}`);
+    if (resume.episode != null) parts.push(t('episodeLabel', String(resume.episode)));
     parts.push(fmtTime(resume.position));
     if (resume.voice) parts.push(resume.voice);
     const when = fmtWhen(resume.at);
@@ -441,7 +466,7 @@
     const remaining = SYNC_COOLDOWN_MS - (Date.now() - lastAt);
     if (remaining > 0) {
       syncButton.disabled = true;
-      syncButton.title = `Недавно синхронизировано — повтор через ${Math.ceil(remaining / 1000)}с`;
+      syncButton.title = t('syncRecently', String(Math.ceil(remaining / 1000)));
       setTimeout(() => {
         syncButton.disabled = syncButton.dataset.accountAllowed !== '1';
         syncButton.title = '';
@@ -450,32 +475,36 @@
     syncButton.addEventListener('click', async () => {
       if (syncButton.disabled) return;
       syncButton.disabled = true;
-      syncButton.textContent = '⟳ обновляем…';
+      syncButton.textContent = t('syncUpdating');
       await chrome.storage.local.set({ 'resume-sync-at': Date.now() });
       await loadResumeBulk(true);
       await renderResume(false);
-      syncButton.textContent = '✓ обновлено';
+      syncButton.textContent = t('syncUpdated');
       setTimeout(() => {
-        syncButton.textContent = '⟳ синхронизировать';
+        syncButton.textContent = t('syncButton');
         syncButton.disabled = syncButton.dataset.accountAllowed !== '1';
       }, SYNC_COOLDOWN_MS);
     });
   })();
   const episode = player?.episode ?? recognition?.episode;
-  set('episode', episode != null ? `Серия ${episode}` : 'Серия не определена');
+  set('episode', episode != null ? t('episodeLabel', String(episode)) : t('episodeUnknown'));
   set('voice', state.voice || recognition?.voice);
   set('player', player?.player);
-  set('player-count', players.length || (player?.player === 'iframe-shell' ? 1 : null));
+  const playerCount = players.length || (player?.player === 'iframe-shell' ? 1 : null);
+  set('player-count', playerCount);
+  document.getElementById('player-count-label').textContent = playerCount
+    ? ` ${t(`playerCount${pluralCategory(playerCount)}`)}`
+    : '';
   const rate = Number.isFinite(player?.playbackRate) ? player.playbackRate : 1;
   const rateSuffix = rate !== 1 ? ` ×${rate}` : '';
-  set('status', player?.watched ? 'просмотрено'
-    : player?.playing ? `смотрю${rateSuffix}`
-      : player?.playbackStarted ? `пауза${rateSuffix}` : playerFound ? 'ждём запуск' : null);
+  set('status', player?.watched ? t('statusWatched')
+    : player?.playing ? `${t('statusWatching')}${rateSuffix}`
+      : player?.playbackStarted ? `${t('statusPaused')}${rateSuffix}` : playerFound ? t('statusWaiting') : null);
   document.getElementById('status').className = `status-chip${player?.watched ? ' ok' : ''}`;
   set('progress', player?.progress == null ? null : `${(player.progress * 100).toFixed(1)}%`);
   const hint = document.getElementById('hint');
   if (playerReady) hint.hidden = true;
   else set('hint', animeFound
-    ? 'Аниме найдено. Запустите видео для полной проверки плеера.'
-    : 'Откройте страницу аниме с видеоплеером.');
+    ? t('animeFoundPlayVideo')
+    : t('openAnimeWithPlayer'));
 })();
