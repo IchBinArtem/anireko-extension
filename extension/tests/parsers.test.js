@@ -95,6 +95,41 @@ test('chooseTitle picks the first meaningful candidate', () => {
   );
 });
 
+test('page title selection skips a repeated site-brand H1 for an episode heading', () => {
+  assert.equal(
+    recognition.choosePageTitle({
+      headings: ['Hentaimama', 'Hentaimama', 'Saimin Jutsu 2 - Episode 1'],
+      ogTitle: 'Saimin Jutsu 2 Episode 1',
+      documentTitle: 'Stream Saimin Jutsu 2 Episode 1 with English subs – Hentaimama',
+    }),
+    'Saimin Jutsu 2',
+  );
+});
+
+test('page title selection does not promote an episode heading from recommendations', () => {
+  assert.equal(
+    recognition.choosePageTitle({
+      primaryHeadings: ['Saimin Jutsu The Animation'],
+      headings: [
+        'Saimin Jutsu The Animation',
+        'Jitaku Keibiin 2 - Episode 3',
+      ],
+      ogTitle: 'Saimin Jutsu The Animation',
+      documentTitle: 'Saimin Jutsu The Animation',
+    }),
+    'Saimin Jutsu The Animation',
+  );
+});
+
+test('page title selection fails closed when only a secondary episode heading exists', () => {
+  assert.equal(
+    recognition.choosePageTitle({
+      headings: ['Jitaku Keibiin 2 - Episode 3'],
+    }),
+    '',
+  );
+});
+
 test('handles aggregator dual-title with progress block (animevost style)', () => {
   assert.equal(
     recognition.chooseTitle(['Игра лжецов / Liar Game [1-14 из 24+]']),

@@ -8,6 +8,7 @@
   const videoRuntime = new WeakMap();
   const observedShadowRoots = new WeakSet();
   let mediaObserver = null;
+  let frameVisibilityTimer = null;
   let nextVideoId = 1;
   let lastEpisode = null;
   let eventEpisode = null;
@@ -23,6 +24,7 @@
     if (message?.type !== 'anireko-disable-detector') return;
     extensionContextAlive = false;
     mediaObserver?.disconnect();
+    if (frameVisibilityTimer) clearInterval(frameVisibilityTimer);
   });
 
   // Reloading an unpacked extension invalidates the content-script context in
@@ -505,9 +507,14 @@
 
   function reportTopMetadata() {
     if (window !== window.top || metadataUrl === location.href) return;
-    const h1 = document.querySelector('main h1, article h1, h1')?.textContent || '';
+    const primaryHeadings = [...document.querySelectorAll('main h1, article h1')]
+      .map((element) => element.textContent || '');
     const ogTitle = document.querySelector('meta[property="og:title"]')?.content || '';
-    const title = recognitionApi.chooseTitle([h1, ogTitle, document.title]);
+    const title = recognitionApi.choosePageTitle({
+      primaryHeadings,
+      ogTitle,
+      documentTitle: document.title
+    });
     if (!title || !likelyAnimePage(title)) return;
     metadataUrl = location.href;
     safeSendMessage({
@@ -523,7 +530,6 @@
   }
 
   function reportFrameVisibility() {
-    if (window !== window.top) return;
     const frames = deepQueryAll('iframe')
       .filter((frame) => /^https?:/iu.test(frame.src || '') && frame.src.length <= 2000)
       .slice(0, 50).map((frame) => ({
@@ -535,6 +541,10 @@
           height: Math.round(frame.getBoundingClientRect().height)
         }
       }));
+    const ownsVideo = Boolean(document.querySelector('video')) || deepQueryAll('video').length > 0;
+    if (!frameVisibilityTimer && (frames.length > 0 || ownsVideo)) {
+      frameVisibilityTimer = setInterval(reportFrameVisibility, 5000);
+    }
     safeSendMessage({
       type: 'frame-visibility',
       pageUrl: location.href,
@@ -603,11 +613,21 @@
       handleUrlChangeIfAny();
       let mediaAdded = false;
       let episodeUiAdded = false;
+      let visibilityChanged = false;
       for (const record of records) {
         if (record.type === 'attributes') {
-          invalidateEpisodeAttrCache();
-          episodeUiAdded = true;
+          if (['episode', 'data-episode'].includes(record.attributeName)) {
+            invalidateEpisodeAttrCache();
+            episodeUiAdded = true;
+          }
+          if (record.target?.tagName === 'IFRAME') visibilityChanged = true;
           continue;
+        }
+        for (const node of record.removedNodes) {
+          if (node.nodeType === Node.ELEMENT_NODE
+            && (node.matches?.('iframe') || node.querySelector?.('iframe'))) {
+            visibilityChanged = true;
+          }
         }
         for (const node of record.addedNodes) {
           const result = inspectAddedNode(node);
@@ -623,8 +643,8 @@
       if (episodeUiAdded) invalidateEpisodeAttrCache();
       if (episodeUiAdded) reportEpisodeIfChanged();
       if (episodeUiAdded) reportVoiceIfChanged();
-      if (isTop && (mediaAdded || episodeUiAdded)) {
-        reportTopMetadata();
+      if (mediaAdded || episodeUiAdded || visibilityChanged) {
+        if (isTop) reportTopMetadata();
         reportFrameVisibility();
       }
     });
@@ -632,7 +652,7 @@
       childList: true,
       subtree: true,
       attributes: true,
-      attributeFilter: ['episode', 'data-episode']
+      attributeFilter: ['episode', 'data-episode', 'class', 'style', 'hidden', 'src']
     });
   }
 
@@ -651,20 +671,38 @@
     if (isTop || looksLikePlayerDocument) reportEpisodeIfChanged();
     reportVoiceIfChanged();
     reportTopMetadata();
-    if (isTop) reportFrameVisibility();
+    if (isTop || looksLikePlayerDocument) reportFrameVisibility();
     if (!isTop && !looksLikePlayerDocument) {
       // Neutral-named frames (widgets or player mirrors without "player" in URL):
       // observer на каждый из десятков таких фреймов — дорого. Вместо этого
       // два отложенных чека: появился <video> (в т.ч. в shadow DOM) — значит
       // это всё-таки плеер, включаем полный детект.
+      let neutralActivationObserver = null;
+      const activateNeutralFrame = (includeShadowRoots) => {
+        if (mediaObserver) return true;
+        const hasVideo = Boolean(document.querySelector('video'))
+          || (includeShadowRoots && deepQueryAll('video').length > 0);
+        const hasNestedFrame = Boolean(document.querySelector('iframe'))
+          || (includeShadowRoots && deepQueryAll('iframe').length > 0);
+        if (!hasVideo && !hasNestedFrame) return false;
+        neutralActivationObserver?.disconnect();
+        activateObserver(false);
+        document.querySelectorAll('video').forEach(bindVideo);
+        deepScanForMedia(true);
+        reportFrameVisibility();
+        return true;
+      };
+      neutralActivationObserver = new MutationObserver((records) => {
+        const addedMedia = records.some((record) => [...record.addedNodes].some((node) => (
+          node.nodeType === Node.ELEMENT_NODE
+          && (node.matches?.('video, iframe') || node.querySelector?.('video, iframe'))
+        )));
+        if (addedMedia) activateNeutralFrame(false);
+      });
+      neutralActivationObserver.observe(document.documentElement, { childList: true, subtree: true });
       for (const delay of [3000, 9000]) {
         setTimeout(() => {
-          if (mediaObserver) return;
-          if (document.querySelector('video') || deepQueryAll('video').length) {
-            activateObserver(false);
-            document.querySelectorAll('video').forEach(bindVideo);
-            deepScanForMedia(true);
-          }
+          activateNeutralFrame(true);
         }, delay);
       }
       return;

@@ -66,9 +66,11 @@
     value?.voice || null,
   ]);
   const initialDisplayFingerprint = displayFingerprint(state);
+  let pauseSessionStateReload = false;
   if (key) {
     chrome.storage.onChanged.addListener((changes, areaName) => {
       if (areaName !== 'session' || !changes[key]?.newValue) return;
+      if (pauseSessionStateReload) return;
       if (displayFingerprint(changes[key].newValue) !== initialDisplayFingerprint) location.reload();
     });
   }
@@ -298,12 +300,14 @@
     && Number.isFinite(player.currentTime)
     && Number.isFinite(player.duration)
     && player.duration > 0;
+  const match = state.match;
+  const matchConfirmed = match?.status === 'ok' && (match.exact === true || match.manual === true);
 
   setCheck(
     'anime-check',
-    animeFound ? 'success' : 'pending',
-    animeFound ? '✓' : '·',
-    animeFound ? t('animeFoundTitle') : t('animeNotConfirmedTitle'),
+    matchConfirmed ? 'success' : animeFound ? 'waiting' : 'pending',
+    matchConfirmed ? '✓' : animeFound ? '?' : '·',
+    matchConfirmed ? t('animeFoundTitle') : animeFound ? t('catalogMatchRequiredTitle') : t('animeNotConfirmedTitle'),
     animeFound ? recognition.title : t('metadataTitleMissing')
   );
   setCheck(
@@ -318,20 +322,123 @@
   // Unreadable-player diagnostics are auto-reported by the service worker
   // (KAN-2715) — no user action needed, so no UI for it here.
   set('title', recognition?.title);
-  const match = state.match;
-  const matchElement = document.getElementById('anireko-match');
   const primaryAction = document.getElementById('anime-primary-action');
   if (match?.status === 'ok' && match.slug) {
     primaryAction.href = `${siteBase}/${siteLocale}/anime/${match.slug}-${match.animeId}`;
     primaryAction.hidden = false;
-    set('anireko-match', `${t('catalogPrefix')} ${match.title}${match.year ? ` (${match.year})` : ''}${match.exact ? '' : ` · ${t('inexactMatch')}`}`);
+    set('anireko-match', `${t('catalogPrefix')} ${match.title}${match.year ? ` (${match.year})` : ''}${match.manual ? ` · ${t('manualMatchMark')}` : ''}`);
   } else {
     primaryAction.hidden = true;
-    set('anireko-match', match?.status === 'ok'
-      ? `${match.title}${match.year ? ` (${match.year})` : ''}`
-      : match?.status === 'none' ? t('catalogNotFound')
+    set('anireko-match', match?.status === 'ambiguous'
+      ? t('catalogMatchNotConfirmed')
+      : match?.status === 'none' ? t('catalogNotFoundForTitle', recognition.title)
         : match?.status === 'error' ? t('searchError') : null);
   }
+
+  const resolution = document.getElementById('match-resolution');
+  const resolutionTitle = document.getElementById('match-resolution-title');
+  const resolutionDetail = document.getElementById('match-resolution-detail');
+  const candidatesElement = document.getElementById('match-candidates');
+  const searchForm = document.getElementById('match-search');
+  const searchInput = document.getElementById('match-search-query');
+  const searchButton = searchForm.querySelector('button');
+  const resetButton = document.getElementById('match-reset');
+  const feedback = document.getElementById('match-feedback');
+  searchInput.placeholder = t('searchAniRekoPlaceholder');
+  searchInput.value = recognition.title;
+
+  function candidateMeta(candidate) {
+    return [candidate.subtitle, candidate.year, candidate.type]
+      .filter(Boolean)
+      .join(' · ');
+  }
+
+  async function bindCandidate(candidate, query) {
+    for (const button of resolution.querySelectorAll('button')) button.disabled = true;
+    feedback.textContent = t('bindingAnime');
+    try {
+      const response = await requestBackground('popup-bind-anime', {
+        tabId: tab?.id,
+        animeId: candidate.animeId,
+        query,
+      });
+      if (!response?.ok) throw new Error(response?.payload?.error || 'bind_failed');
+      feedback.textContent = t('animeBound');
+      location.reload();
+    } catch {
+      feedback.textContent = t('animeBindFailed');
+      for (const button of resolution.querySelectorAll('button')) button.disabled = false;
+    }
+  }
+
+  function renderCandidates(candidates, query) {
+    candidatesElement.replaceChildren(...(candidates || []).map((candidate) => {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'match-candidate';
+      const copy = document.createElement('span');
+      copy.className = 'match-candidate-copy';
+      const title = document.createElement('strong');
+      title.textContent = candidate.title;
+      const meta = document.createElement('span');
+      meta.textContent = candidateMeta(candidate);
+      copy.append(title, meta);
+      const action = document.createElement('span');
+      action.className = 'match-candidate-action';
+      action.textContent = t('chooseThisAnime');
+      button.append(copy, action);
+      button.addEventListener('click', () => bindCandidate(candidate, query));
+      return button;
+    }));
+  }
+
+  if (!matchConfirmed || match.manual) {
+    resolution.hidden = false;
+    if (match.manual) {
+      resolutionTitle.textContent = t('manualMatchTitle');
+      resolutionDetail.textContent = t('manualMatchDetail', match.title);
+      resetButton.hidden = false;
+    } else if (match?.status === 'ambiguous') {
+      resolutionTitle.textContent = t('chooseAnimeTitle');
+      resolutionDetail.textContent = t('chooseAnimeDetail', recognition.title);
+      renderCandidates(match.candidates, match.query || recognition.title);
+    } else {
+      resolutionTitle.textContent = t('findAnimeManuallyTitle');
+      resolutionDetail.textContent = t('findAnimeManuallyDetail', recognition.title);
+    }
+  }
+
+  searchForm.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const query = searchInput.value.trim();
+    if (query.length < 2) return;
+    searchButton.disabled = true;
+    feedback.textContent = t('searchingAniReko');
+    try {
+      const response = await requestBackground('popup-search-anime', { query });
+      if (!response?.ok) throw new Error('search_failed');
+      const candidates = response.payload?.candidates || [];
+      renderCandidates(candidates, query);
+      feedback.textContent = candidates.length ? '' : t('manualSearchEmpty', query);
+    } catch {
+      feedback.textContent = t('searchError');
+    } finally {
+      searchButton.disabled = false;
+    }
+  });
+
+  resetButton.addEventListener('click', async () => {
+    resetButton.disabled = true;
+    feedback.textContent = t('resettingManualMatch');
+    try {
+      const response = await requestBackground('popup-unbind-anime', { tabId: tab?.id });
+      if (!response?.ok) throw new Error('unbind_failed');
+      location.reload();
+    } catch {
+      feedback.textContent = t('animeBindFailed');
+      resetButton.disabled = false;
+    }
+  });
   // Compatibility is supporting context here; the anime page is the popup's
   // single primary destination, so we deliberately avoid a competing link.
   const taste = state.taste;
@@ -474,12 +581,87 @@
     }
     syncButton.addEventListener('click', async () => {
       if (syncButton.disabled) return;
+      pauseSessionStateReload = true;
       syncButton.disabled = true;
       syncButton.textContent = t('syncUpdating');
-      await chrome.storage.local.set({ 'resume-sync-at': Date.now() });
-      await loadResumeBulk(true);
-      await renderResume(false);
-      syncButton.textContent = t('syncUpdated');
+      const resumeSessionReload = () => setTimeout(() => { pauseSessionStateReload = false; }, 500);
+      try {
+        let currentResponse = await requestBackground('popup-sync-current', {
+          tabId: tab?.id,
+          expectedUserId: currentUserId,
+        });
+        if (!currentResponse?.ok) {
+          syncButton.textContent = currentResponse?.payload?.error === 'anime_match_required'
+            ? t('chooseAnimeBeforeSync')
+            : t('syncFailed');
+          setTimeout(() => {
+            syncButton.textContent = t('syncButton');
+            syncButton.disabled = syncButton.dataset.accountAllowed !== '1';
+          }, 2500);
+          resumeSessionReload();
+          return;
+        }
+        if (currentResponse.payload?.confirmationRequired === true) {
+          const accepted = confirm(t('confirmLegacyHistorySync', [
+            currentResponse.payload.animeTitle || match?.title || recognition?.title || '',
+          ]));
+          if (!accepted) {
+            syncButton.textContent = t('syncButton');
+            syncButton.disabled = syncButton.dataset.accountAllowed !== '1';
+            resumeSessionReload();
+            return;
+          }
+          currentResponse = await requestBackground('popup-sync-current', {
+            tabId: tab?.id,
+            expectedUserId: currentUserId,
+            confirmLegacyHistory: true,
+          });
+          if (!currentResponse?.ok) {
+            syncButton.textContent = t('syncFailed');
+            setTimeout(() => {
+              syncButton.textContent = t('syncButton');
+              syncButton.disabled = syncButton.dataset.accountAllowed !== '1';
+            }, 2500);
+            resumeSessionReload();
+            return;
+          }
+        }
+        const wroteData = currentResponse.payload?.progressSynced === true
+          || currentResponse.payload?.statusSynced === true;
+        if (currentResponse.payload?.writeFailed === true) {
+          syncButton.textContent = t('syncFailed');
+          setTimeout(() => {
+            syncButton.textContent = t('syncButton');
+            syncButton.disabled = syncButton.dataset.accountAllowed !== '1';
+          }, 2500);
+          resumeSessionReload();
+          return;
+        }
+        if (!wroteData) {
+          syncButton.textContent = t('syncNothingToSend');
+          setTimeout(() => {
+            syncButton.textContent = t('syncButton');
+            syncButton.disabled = syncButton.dataset.accountAllowed !== '1';
+          }, 2500);
+          resumeSessionReload();
+          return;
+        }
+        await chrome.storage.local.set({ 'resume-sync-at': Date.now() });
+        try {
+          await loadResumeBulk(true);
+          await renderResume(false);
+        } catch { /* account writes succeeded; a read refresh must not invert their result */ }
+        syncButton.textContent = t('syncUpdated');
+        resumeSessionReload();
+      } catch {
+        syncButton.textContent = t('syncFailed');
+        setTimeout(() => {
+          syncButton.textContent = t('syncButton');
+          syncButton.disabled = syncButton.dataset.accountAllowed !== '1';
+        }, 2500);
+        resumeSessionReload();
+        return;
+      }
       setTimeout(() => {
         syncButton.textContent = t('syncButton');
         syncButton.disabled = syncButton.dataset.accountAllowed !== '1';

@@ -29,8 +29,8 @@
         case 'search': {
           const query = String(input.query || '').trim();
           if (query.length < 2 || query.length > 180) throw new Error('payload_invalid');
-          const limit = Math.max(1, Math.min(5, Number(input.limit) || 5));
-          path = `/api/search?q=${encodeURIComponent(query)}&limit=${limit}`;
+          const limit = Math.max(1, Math.min(20, Number(input.limit) || 5));
+          path = `/api/search?q=${encodeURIComponent(query)}&limit=${limit}&exact_alias=1`;
           init.headers = { 'Accept-Language': 'ru' };
           init.credentials = 'omit';
           break;

@@ -101,6 +101,168 @@ test('top-frame player hints require bounded HTTP iframe geometry and episode', 
   }, sender, 'extension-id').reason, 'payload_invalid');
 });
 
+test('child frames may report only their own bounded iframe visibility', () => {
+  const now = 1_800_000_000_000;
+  const trust = load('lib/trust.js', { Date: { now: () => now } }).AniRekoTrust;
+  const sender = {
+    id: 'extension-id', frameId: 4, documentId: 'wrapper-doc',
+    url: 'https://wrapper.example/embed', origin: 'https://wrapper.example',
+    tab: { id: 7, url: 'https://anime.example/watch' },
+  };
+  const result = trust.validateSensorMessage({
+    type: 'frame-visibility', observedAt: now,
+    documentToken: '1234567890abcdef', documentUrl: 'https://wrapper.example/embed',
+    frames: [{
+      src: 'https://player.example/video', visible: true,
+      episode: 6, rect: { width: 800, height: 450 },
+    }],
+  }, sender, 'extension-id');
+  assert.equal(result.ok, true);
+  assert.equal(result.documentUrl, 'https://wrapper.example/embed');
+  assert.equal(result.frameId, 4);
+  assert.equal(result.topFrame, false);
+});
+
+test('nested player visibility requires one unique visible chain from the top document', () => {
+  const now = 1_800_000_000_000;
+  const trust = load('lib/trust.js', { Date: { now: () => now } }).AniRekoTrust;
+  const frame = (src, visible, episode = null) => ({
+    src, visible, episode, rect: { width: 800, height: 450 },
+  });
+  const report = (documentUrl, frames, observedAt = now) => ({ documentUrl, frames, observedAt });
+  const reports = {
+    top: report('https://anime.example/watch', [
+      frame('https://wrapper.example/embed?episode=6', true, 6),
+    ]),
+    wrapper: report('https://wrapper.example/embed?episode=6', [
+      frame('https://player.example/video?id=42', true),
+    ]),
+    player: report('https://player.example/video?id=42', []),
+  };
+
+  assert.equal(
+    trust.resolveFrameVisibility(reports, 'top', 'https://player.example/video?id=42', 'player'),
+    true,
+  );
+  assert.deepEqual(
+    { ...trust.resolveFrameContext(reports, 'top', 'https://player.example/video?id=42', 'player') },
+    { visible: true, episode: 6 },
+  );
+  assert.deepEqual(
+    { ...trust.resolveFrameContext({
+      ...reports,
+      wrapper: report('https://wrapper.example/embed?episode=6', [
+        frame('https://player.example/video?id=42', true, 7),
+      ]),
+    }, 'top', 'https://player.example/video?id=42', 'player') },
+    { visible: true, episode: null },
+  );
+  const diamond = {
+    top: report('https://anime.example/watch', [
+      frame('https://wrapper.example/a', true, 1),
+      frame('https://wrapper.example/b', true, 2),
+    ]),
+    a: report('https://wrapper.example/a', [frame('https://wrapper.example/shared', true)]),
+    b: report('https://wrapper.example/b', [frame('https://wrapper.example/shared', true)]),
+    shared: report('https://wrapper.example/shared', [
+      frame('https://player.example/video?id=42', true),
+    ]),
+    player: reports.player,
+  };
+  assert.equal(
+    trust.resolveFrameContext(diamond, 'top', 'https://player.example/video?id=42', 'player'),
+    null,
+  );
+  diamond.top.frames[1].episode = 1;
+  assert.equal(
+    trust.resolveFrameContext(diamond, 'top', 'https://player.example/video?id=42', 'player'),
+    null,
+  );
+  assert.equal(
+    trust.resolveFrameVisibility({
+      ...reports,
+      top: { ...reports.top, frames: [frame('https://wrapper.example/embed?episode=6', false)] },
+    }, 'top', 'https://player.example/video?id=42', 'player'),
+    null,
+  );
+  assert.equal(
+    trust.resolveFrameVisibility({
+      ...reports,
+      wrapper: { ...reports.wrapper, frames: [frame('https://player.example/video?id=42', false)] },
+    }, 'top', 'https://player.example/video?id=42', 'player'),
+    false,
+  );
+  assert.equal(
+    trust.resolveFrameVisibility({
+      ...reports,
+      duplicateWrapper: report('https://wrapper.example/embed?episode=6', [
+        frame('https://player.example/video?id=42', true),
+      ]),
+    }, 'top', 'https://player.example/video?id=42', 'player'),
+    null,
+  );
+  assert.equal(
+    trust.resolveFrameVisibility({
+      top: reports.top,
+      unattached: reports.player,
+    }, 'top', 'https://player.example/video?id=42', 'player'),
+    null,
+  );
+  assert.equal(
+    trust.resolveFrameVisibility({
+      ...reports,
+      wrapper: report('https://wrapper.example/embed?episode=6', [
+        frame('https://player.example/video?id=42', true),
+      ], now - 20_001),
+    }, 'top', 'https://player.example/video?id=42', 'player'),
+    null,
+  );
+
+  const hiddenRealVisibleDecoy = {
+    top: report('https://anime.example/watch', [
+      frame('https://wrapper.example/real', false),
+      frame('https://wrapper.example/decoy', true),
+    ]),
+    realWrapper: report('https://wrapper.example/real', [
+      frame('https://player.example/video?id=42', true),
+    ]),
+    decoyWrapper: report('https://wrapper.example/decoy', [
+      frame('https://player.example/video?id=42#decoy', true),
+    ]),
+    realPlayer: report('https://player.example/video?id=42', []),
+    decoyPlayer: report('https://player.example/video?id=42#decoy', []),
+  };
+  assert.equal(
+    trust.resolveFrameVisibility(
+      hiddenRealVisibleDecoy,
+      'top',
+      'https://player.example/video?id=42',
+      'realPlayer',
+    ),
+    null,
+  );
+});
+
+test('local player episode stays ahead of inherited iframe episode across transient null reports', () => {
+  const trust = load('lib/trust.js').AniRekoTrust;
+  assert.deepEqual(
+    { ...trust.resolvePlayerEpisode(null, false, {
+      episode: 5,
+      episodeAuthoritative: false,
+      episodeSignalKind: 'player-report',
+    }, 2, false) },
+    { episode: 5, authoritative: false, signalKind: 'player-report' },
+  );
+  assert.deepEqual(
+    { ...trust.resolvePlayerEpisode(null, false, {
+      episode: 5,
+      episodeAuthoritative: false,
+      episodeSignalKind: 'iframe-chain',
+    }, 2, false) },
+    { episode: 2, authoritative: false, signalKind: 'iframe-chain' },
+  );
+});
+
 test('child-frame player visibility fails closed until the top frame confirms it', () => {
   const trust = load('lib/trust.js').AniRekoTrust;
   assert.equal(trust.playerVisibilityConfirmed({
@@ -147,7 +309,7 @@ test('runtime has no duplicate permission manager or provider-specific player or
 
 test('search cache invalidates pre-completion metadata and retries partial matches', () => {
   const worker = fs.readFileSync(path.join(__dirname, '..', 'service-worker.js'), 'utf8');
-  assert.equal(worker.includes('const SEARCH_CACHE_VERSION = 3;'), true);
+  assert.equal(worker.includes('const SEARCH_CACHE_VERSION = 7;'), true);
   assert.equal(worker.includes("['type', 'episodes', 'release_status']"), true);
   assert.equal(worker.includes('match.completionMetadataReady ? SEARCH_TTL_OK_MS : SEARCH_TTL_PARTIAL_MS'), true);
   assert.equal(worker.includes('current.match.completionMetadataReady !== true'), true);
@@ -158,6 +320,11 @@ test('search cache invalidates pre-completion metadata and retries partial match
 test('public API contract and client action allowlist stay aligned', () => {
   const contract = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'api-contract.json'), 'utf8'));
   const client = fs.readFileSync(path.join(__dirname, '..', 'lib', 'api-client.js'), 'utf8');
+  assert.equal(contract.version, 3);
+  assert.deepEqual(contract.rate_limit, {
+    status: 429,
+    retry_after_header: 'Retry-After',
+  });
   for (const action of Object.keys(contract.actions)) {
     assert.equal(client.includes(`case '${action}'`), true, `missing client action ${action}`);
   }

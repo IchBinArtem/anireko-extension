@@ -249,6 +249,67 @@ test('recognizes anime before playback and confirms player after playback starts
   await page.close();
 });
 
+test('connects playback through a visible two-level cross-origin iframe chain', async () => {
+  const page = await context.newPage();
+  await page.goto(`${siteBase}/nested-anime.html`);
+  const tabId = await extensionTabId(`${siteBase}/*`);
+  await expect.poll(async () => (await storedTabState(tabId))?.match?.status ?? null).toBe('ok');
+
+  const nestedPlayer = page.frameLocator('#outer-player').frameLocator('#nested-video-frame');
+  await setSyntheticPlayback(nestedPlayer, '#nested-video', {
+    currentTime: 155,
+    paused: false,
+  });
+  await waitForPlayerProgress(tabId, 0.5);
+
+  await expect.poll(async () => {
+    const state = await storedTabState(tabId);
+    return {
+      frameVisible: state?.player?.frameVisible ?? null,
+      playbackStarted: state?.player?.playbackStarted ?? false,
+      episode: state?.player?.episode ?? null,
+    };
+  }).toEqual({ frameVisible: true, playbackStarted: true, episode: 2 });
+
+  const popup = await openPopup(tabId);
+  await expect(popup.locator('#player-check')).toHaveClass(/success/);
+  await expect(popup.locator('#progress')).toHaveText('50.0%');
+  await expect(popup.locator('#episode')).toHaveText('Серия 2');
+
+  await page.frameLocator('#outer-player').locator('#nested-video-frame').evaluate((frame) => {
+    (frame as HTMLIFrameElement).style.display = 'none';
+  });
+  await expect.poll(async () => {
+    const state = await storedTabState(tabId);
+    const nested = Object.values(state?.players || {}).find((player: any) => (
+      player.frameUrl === `${apiBase}/nested-video.html`
+    )) as { frameVisible?: boolean } | undefined;
+    return nested?.frameVisible ?? null;
+  }, { timeout: 10_000 }).not.toBe(true);
+  await popup.reload();
+  await expect(popup.locator('#player-check')).not.toHaveClass(/success/);
+  await page.close();
+  await popup.close();
+});
+
+test('activates a neutral wrapper when its nested player appears after the settled probes', async () => {
+  const page = await context.newPage();
+  await page.goto(`${siteBase}/lazy-nested-anime.html`);
+  const tabId = await extensionTabId(`${siteBase}/*`);
+  await expect.poll(async () => (await storedTabState(tabId))?.match?.status ?? null).toBe('ok');
+
+  const nestedPlayer = page.frameLocator('#outer-player').frameLocator('#nested-video-frame');
+  await expect(nestedPlayer.locator('#nested-video')).toBeVisible({ timeout: 15_000 });
+  await setSyntheticPlayback(nestedPlayer, '#nested-video', {
+    currentTime: 155,
+    paused: false,
+  });
+  await waitForPlayerProgress(tabId, 0.5);
+  await expect.poll(async () => (await storedTabState(tabId))?.player?.frameVisible ?? null)
+    .toBe(true);
+  await page.close();
+});
+
 test('falls back to player URL episode and labeled combobox voice', async () => {
   await worker.evaluate(async () => {
     await chrome.storage.local.set({
@@ -338,6 +399,12 @@ test('shows only an anime-not-found state and manually reports a recognition mis
     };
   }, { timeout: 10_000 }).toEqual({ title: null, videos: 4 });
 
+  // A previous tab may finish an already-dispatched session-info request just
+  // after beforeEach reset. Clear counters at this test's observation boundary
+  // so only requests caused by this generic-page popup are measured.
+  await worker.evaluate(async () => {
+    await fetch('http://127.0.0.1:4178/__test/reset');
+  });
   const popup = await openPopup(tabId);
   await expect(popup.locator('#anime-check-title')).toHaveText('Аниме не найдено');
   await expect(popup.locator('#anime-check')).toHaveClass(/anime-card/);
@@ -372,6 +439,175 @@ test('shows only an anime-not-found state and manually reports a recognition mis
   const after = await worker.evaluate(async () =>
     (await (await fetch('http://127.0.0.1:4178/__test/request-counts')).json()));
   expect(after).toMatchObject({ search: 0, sessionInfo: 0, diagnostics: 1 });
+  await popup.close();
+  await page.close();
+});
+
+test('requires a choice for duplicate exact matches, stores it locally, and syncs immediately', async () => {
+  await worker.evaluate(async () => {
+    await fetch('http://127.0.0.1:4178/__test/session?on=1&user=18');
+    await chrome.storage.local.set({
+      'auto-mark': true,
+      'sync-account': { id: 18, name: 'TestUser' },
+    });
+  });
+  const page = await context.newPage();
+  await page.goto(`${siteBase}/ambiguous-anime.html`);
+  const tabId = await extensionTabId(`${siteBase}/ambiguous-anime.html`);
+  await expect.poll(async () => (await storedTabState(tabId))?.match?.status ?? null)
+    .toBe('ambiguous');
+  await waitForDetectorReady(tabId);
+  await setSyntheticPlayback(page.frameLocator('#main-player'), '#main-video', {
+    currentTime: 300,
+    paused: true,
+  });
+  await expect.poll(async () => (await storedTabState(tabId))?.player?.watched ?? false)
+    .toBe(true);
+
+  const popup = await openPopup(tabId);
+  await expect(popup.locator('#anime-check-title')).toHaveText('Нужно подтвердить аниме');
+  await expect(popup.locator('#anireko-match')).toHaveText('Совпадение в каталоге ещё не подтверждено');
+  await expect(popup.locator('.match-candidate')).toHaveCount(2);
+  const chosenCandidate = popup.locator('.match-candidate').filter({ hasText: '2022 · ONA' });
+  await expect(chosenCandidate).toHaveCount(1);
+  await expect.poll(() => worker.evaluate(
+    (id) => chrome.action.getBadgeText({ tabId: id }),
+    tabId,
+  )).toBe('!');
+  await chosenCandidate.click();
+
+  await expect(popup.locator('#anime-check-title')).toHaveText('Аниме найдено');
+  await expect(popup.locator('#anireko-match')).toContainText('выбрано вручную');
+  await expect.poll(async () => (await storedTabState(tabId))?.match ?? null)
+    .toMatchObject({ status: 'ok', animeId: 19119, manual: true, exact: false });
+  await expect.poll(() => worker.evaluate(
+    (id) => chrome.action.getBadgeText({ tabId: id }),
+    tabId,
+  )).not.toBe('!');
+  await expect.poll(async () => {
+    const posts = await worker.evaluate(async () =>
+      (await (await fetch('http://127.0.0.1:4178/__test/progress')).json()));
+    return posts.at(-1)?.anime_id ?? null;
+  }).toBe(19119);
+  await expect.poll(async () => {
+    const posts = await worker.evaluate(async () =>
+      (await (await fetch('http://127.0.0.1:4178/__test/status-posts')).json()));
+    return posts.at(-1)?.status ?? null;
+  }).toBe('watching');
+
+  await popup.locator('#match-reset').click();
+  await expect.poll(async () => (await storedTabState(tabId))?.match?.status ?? null)
+    .toBe('ambiguous');
+  await expect(popup.locator('#anime-check-title')).toHaveText('Нужно подтвердить аниме');
+  await popup.close();
+  await page.close();
+});
+
+test('treats Russian number words as exact and excludes the 100000 lookalike', async () => {
+  const page = await context.newPage();
+  await page.goto(`${siteBase}/numeric-title-anime.html`);
+  const tabId = await extensionTabId(`${siteBase}/numeric-title-anime.html`);
+
+  await expect.poll(async () => (await storedTabState(tabId))?.match ?? null)
+    .toMatchObject({ status: 'ok', animeId: 19119, exact: true, manual: false });
+  const popup = await openPopup(tabId);
+  await expect(popup.locator('#anime-check-title')).toHaveText('Аниме найдено');
+  await expect(popup.locator('#anireko-match')).toContainText('Три тысячи лет практики ци');
+  await expect(popup.locator('.match-candidate')).toHaveCount(0);
+  await popup.close();
+  await page.close();
+});
+
+test('resolves a numbered season through the catalog alias without asking for a choice', async () => {
+  const page = await context.newPage();
+  await page.goto(`${siteBase}/bookworm-season-4.html`);
+  const tabId = await extensionTabId(`${siteBase}/bookworm-season-4.html`);
+
+  await expect.poll(async () => (await storedTabState(tabId))?.match ?? null)
+    .toMatchObject({
+      status: 'ok',
+      animeId: 13124,
+      exact: true,
+      manual: false,
+      seasonAlias: true,
+    });
+  const popup = await openPopup(tabId);
+  await expect(popup.locator('#anime-check-title')).toHaveText('Аниме найдено');
+  await expect(popup.locator('#anireko-match')).toContainText('Власть книжного червя: Приёмная дочь лорда');
+  await expect(popup.locator('.match-candidate')).toHaveCount(0);
+  await popup.close();
+  await page.close();
+});
+
+test('prefers a later episode H1 over duplicated site-brand headings', async () => {
+  const page = await context.newPage();
+  await page.goto(`${siteBase}/site-brand-before-episode.html`);
+  const tabId = await extensionTabId(`${siteBase}/site-brand-before-episode.html`);
+
+  await expect.poll(async () => {
+    const state = await storedTabState(tabId);
+    return {
+      title: state?.recognition?.title ?? null,
+      animeId: state?.match?.animeId ?? null,
+    };
+  }).toEqual({ title: 'Saimin Jutsu 2', animeId: 23001 });
+  await page.close();
+});
+
+test('does not promote a recommendation episode H1 over the primary title', async () => {
+  const page = await context.newPage();
+  await page.goto(`${siteBase}/primary-title-with-decoy-episode.html`);
+  const tabId = await extensionTabId(`${siteBase}/primary-title-with-decoy-episode.html`);
+
+  await expect.poll(async () => {
+    const state = await storedTabState(tabId);
+    return {
+      title: state?.recognition?.title ?? null,
+      matchStatus: state?.match?.status ?? null,
+      animeId: state?.match?.animeId ?? null,
+    };
+  }).toEqual({
+    title: 'Saimin Jutsu The Animation',
+    matchStatus: 'none',
+    animeId: null,
+  });
+  await page.close();
+});
+
+test('does not recognize or bind an anime from a secondary episode H1 alone', async () => {
+  const page = await context.newPage();
+  await page.goto(`${siteBase}/secondary-episode-only.html`);
+  const tabId = await extensionTabId(`${siteBase}/secondary-episode-only.html`);
+
+  await expect.poll(async () => {
+    const state = await storedTabState(tabId);
+    return {
+      title: state?.recognition?.title ?? null,
+      animeId: state?.match?.animeId ?? null,
+    };
+  }).toEqual({ title: null, animeId: null });
+  await page.close();
+});
+
+test('lets the user search AniReko when the recognized title has no catalog result', async () => {
+  const page = await context.newPage();
+  await page.goto(`${siteBase}/missing-catalog-anime.html`);
+  const tabId = await extensionTabId(`${siteBase}/missing-catalog-anime.html`);
+  await expect.poll(async () => (await storedTabState(tabId))?.match?.status ?? null).toBe('none');
+
+  const popup = await openPopup(tabId);
+  await expect(popup.locator('#anireko-match')).toContainText(
+    'По названию «Совсем неизвестное» ничего не найдено',
+  );
+  await expect(popup.locator('#match-resolution-title')).toHaveText('Найдите аниме вручную');
+  await popup.locator('#match-search-query').fill('Три тысячи лет практики ци');
+  await popup.locator('#match-search').getByRole('button', { name: 'Найти' }).click();
+  await expect(popup.locator('.match-candidate')).toContainText('Три тысячи лет практики ци');
+  await popup.locator('.match-candidate').click();
+
+  await expect.poll(async () => (await storedTabState(tabId))?.match ?? null)
+    .toMatchObject({ status: 'ok', animeId: 19119, manual: true });
+  await expect(popup.locator('#anireko-match')).toContainText('выбрано вручную');
   await popup.close();
   await page.close();
 });
@@ -530,6 +766,13 @@ test('tracks a full-length movie without any episode markup', async () => {
 });
 
 test('shows episode and voice from an unstarted proprietary iframe shell', async () => {
+  await worker.evaluate(async () => {
+    await chrome.storage.local.set({
+      'auto-mark': true,
+      'sync-account': { id: 18, name: 'TestUser' },
+    });
+    await fetch('http://127.0.0.1:4178/__test/session?on=1&user=18');
+  });
   const page = await context.newPage();
   await page.goto(`${siteBase}/shell-anime.html`);
   const tabId = await extensionTabId(`${siteBase}/shell-anime.html`);
@@ -546,6 +789,138 @@ test('shows episode and voice from an unstarted proprietary iframe shell', async
   await expect(popup.locator('#episode')).toHaveText('Серия 6');
   await expect(popup.locator('#voice')).toHaveText('AniTime Voice');
   await expect(popup.locator('#player-count')).toHaveText('1');
+  const syncButton = popup.locator('#resume-sync');
+  await expect(syncButton).toBeEnabled();
+  await syncButton.click();
+  await expect(syncButton).toHaveText('Нет новых данных для отправки');
+  await expect(syncButton).toBeEnabled({ timeout: 5_000 });
+  await popup.close();
+  await page.close();
+});
+
+test('manual sync sends saved terminal progress after reload leaves the player unstarted', async () => {
+  await worker.evaluate(async () => {
+    await chrome.storage.local.set({
+      'auto-mark': true,
+      'sync-account': { id: 18, name: 'TestUser' },
+    });
+    await fetch('http://127.0.0.1:4178/__test/session?on=1&user=18');
+  });
+  const page = await context.newPage();
+  await page.goto(`${siteBase}/shell-terminal-anime.html`);
+  const tabId = await extensionTabId(`${siteBase}/shell-terminal-anime.html`);
+  await expect.poll(async () => {
+    const state = await storedTabState(tabId);
+    return {
+      title: state?.recognition?.title ?? null,
+      kind: state?.player?.player ?? null,
+      episode: state?.player?.episode ?? null,
+      started: state?.player?.playbackStarted ?? null,
+    };
+  }).toMatchObject({ kind: 'iframe-shell', episode: 12, started: false });
+  await worker.evaluate(async (id) => {
+    const state = (await chrome.storage.session.get(`tab:${id}`))[`tab:${id}`];
+    const title = String(state.recognition.title);
+    const titleKey = title.toLocaleLowerCase().replace(/\s+/gu, ' ').trim();
+    await chrome.storage.local.set({
+      'watch-history': {
+        records: {
+          [`${titleKey}::12`]: {
+            title,
+            episode: 12,
+            position: 310,
+            duration: 310,
+            progress: 1,
+            completed: true,
+            voice: 'AniTime Voice',
+            lastWatchedAt: Date.now() - 60_000,
+          },
+        },
+        days: {},
+      },
+    });
+    (globalThis as any).AniRekoTestHooks.resetVolatileCaches();
+  }, tabId);
+  const popup = await openPopup(tabId);
+  const syncButton = popup.locator('#resume-sync');
+  await expect(syncButton).toBeEnabled();
+  popup.once('dialog', async (dialog) => {
+    expect(dialog.message()).toContain('Расхититель гробниц');
+    await dialog.accept();
+  });
+  await syncButton.click();
+  await expect(syncButton).toHaveText('✓ обновлено');
+  const progress = await worker.evaluate(async () =>
+    (await (await fetch('http://127.0.0.1:4178/__test/progress')).json()));
+  expect(progress.at(-1)).toMatchObject({
+    anime_id: 4242,
+    episode: 12,
+    position_sec: 310,
+    duration_sec: 310,
+    expected_user_id: 18,
+  });
+  const status = await worker.evaluate(async () =>
+    (await (await fetch('http://127.0.0.1:4178/__test/status-posts')).json()));
+  expect(status).toEqual([{ anime_id: 4242, status: 'completed', expected_user_id: 18 }]);
+  const migratedAnimeId = await worker.evaluate(async () => {
+    const history = (await chrome.storage.local.get('watch-history'))['watch-history'];
+    return (Object.values(history.records) as any[])[0]?.animeId ?? null;
+  });
+  expect(migratedAnimeId).toBe(4242);
+
+  await popup.close();
+  await page.close();
+});
+
+test('manual sync shows a failure when saved progress exists but the write is rejected', async () => {
+  await worker.evaluate(async () => {
+    await chrome.storage.local.set({
+      'auto-mark': true,
+      'sync-account': { id: 18, name: 'TestUser' },
+    });
+    await fetch('http://127.0.0.1:4178/__test/session?on=1&user=18');
+    await fetch('http://127.0.0.1:4178/__test/fail-progress-writes?on=1');
+  });
+  const page = await context.newPage();
+  await page.goto(`${siteBase}/shell-terminal-anime.html`);
+  const tabId = await extensionTabId(`${siteBase}/shell-terminal-anime.html`);
+  await expect.poll(async () => {
+    const state = await storedTabState(tabId);
+    return { episode: state?.player?.episode ?? null, started: state?.player?.playbackStarted ?? null };
+  }).toEqual({ episode: 12, started: false });
+  await worker.evaluate(async (id) => {
+    const state = (await chrome.storage.session.get(`tab:${id}`))[`tab:${id}`];
+    const title = String(state.recognition.title);
+    const titleKey = title.toLocaleLowerCase().replace(/\s+/gu, ' ').trim();
+    await chrome.storage.local.set({
+      'watch-history': {
+        records: {
+          [`${titleKey}::12`]: {
+            title,
+            episode: 12,
+            position: 310,
+            duration: 310,
+            progress: 1,
+            completed: true,
+            lastWatchedAt: Date.now(),
+          },
+        },
+        days: {},
+      },
+    });
+    (globalThis as any).AniRekoTestHooks.resetVolatileCaches();
+  }, tabId);
+
+  const popup = await openPopup(tabId);
+  const syncButton = popup.locator('#resume-sync');
+  await expect(syncButton).toBeEnabled();
+  popup.once('dialog', async (dialog) => dialog.accept());
+  await syncButton.click();
+  await expect(syncButton).toHaveText('Не удалось синхронизировать');
+  const progress = await worker.evaluate(async () =>
+    (await (await fetch('http://127.0.0.1:4178/__test/progress')).json()));
+  expect(progress).toEqual([]);
+
   await popup.close();
   await page.close();
 });
@@ -611,7 +986,7 @@ test('promotes watching to completed once on finished episode 12 of 12', async (
     await chrome.storage.local.set({
       'auto-mark': true,
       'sync-account': { id: 18, name: 'TestUser' },
-      'search-cache-version': 3,
+      'search-cache-version': 7,
       'search-cache': {
         'расхититель гробниц': {
           match: {
@@ -740,9 +1115,16 @@ test('syncs resume progress on pause (episode, position, voice — no URL)', asy
   // Кнопка ручного синка: работает и уходит в кулдаун (защита от закликивания).
   const syncButton = popup.locator('#resume-sync');
   await expect(syncButton).toBeEnabled();
+  const postsBeforeManualSync = (await readProgress()).length;
+  await worker.evaluate((id) => {
+    const state = (globalThis as any).AniRekoTestHooks.stateForTab(id);
+    state.progressSync.at = Date.now() - 20_000;
+  }, tabId);
   await syncButton.click();
   await expect(syncButton).toHaveText('✓ обновлено');
   await expect(syncButton).toBeDisabled();
+  await expect.poll(async () => (await readProgress()).length).toBeGreaterThan(postsBeforeManualSync);
+  expect((await readProgress()).at(-1)?.position_sec).toBeGreaterThanOrEqual(100);
   // Кулдаун переживает переоткрытие попапа (timestamp в storage).
   const popup2 = await openPopup(tabId);
   await expect(popup2.locator('#resume-sync')).toBeDisabled();

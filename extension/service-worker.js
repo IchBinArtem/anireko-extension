@@ -13,8 +13,16 @@ const apiClient = AniRekoApiClient.create({
 const stateByTab = {};
 const tabQueues = {};
 const tabStateFlushAt = {};
+const actionIconRenderKeyByTab = new Map();
+const actionBadgeRenderKeyByTab = new Map();
 let historyQueue = Promise.resolve();
 const progressSyncQueues = new WeakMap();
+
+function invalidateActionPresentation(tabId) {
+  const key = String(tabId);
+  actionIconRenderKeyByTab.delete(key);
+  actionBadgeRenderKeyByTab.delete(key);
+}
 
 // --- Server-load hardening (KAN-2695) ---
 // Search mapping is cached globally: one /api/search call per unique title,
@@ -22,9 +30,9 @@ const progressSyncQueues = new WeakMap();
 // API is never hammered.
 const SEARCH_CACHE_KEY = 'search-cache';
 const SEARCH_CACHE_MAX = 200;
-// v3 invalidates matches cached while the backend did not yet expose the
-// authoritative type/release_status/episodes fields used by auto-complete.
-const SEARCH_CACHE_VERSION = 3;
+// v7 invalidates explicit-season misses cached while the exact-alias backend
+// contract was unavailable. v6 added season matching; v5 normalized numbers.
+const SEARCH_CACHE_VERSION = 7;
 const SEARCH_TTL_OK_MS = 7 * 24 * 3600 * 1000;
 const SEARCH_TTL_MISS_MS = 24 * 3600 * 1000;
 const SEARCH_TTL_PARTIAL_MS = 5 * 60 * 1000;
@@ -47,6 +55,10 @@ const completionMetadataRefreshRetryAt = {};
 const SYNC_ACCOUNT_KEY = 'sync-account';
 const PRIVACY_CONSENT_KEY = 'privacy-consent';
 const PRIVACY_CONSENT_VERSION = 1;
+const MANUAL_MATCH_BINDINGS_KEY = 'manual-match-bindings';
+const MANUAL_MATCH_BINDINGS_VERSION = 2;
+const MANUAL_MATCH_BINDINGS_MAX = 200;
+let manualMatchBindingsQueue = Promise.resolve();
 
 async function privacyConsentAccepted() {
   const stored = await chrome.storage.local.get(PRIVACY_CONSENT_KEY);
@@ -59,6 +71,7 @@ async function disableTab(tabId) {
   delete stateByTab[String(tabId)];
   delete tabQueues[String(tabId)];
   delete tabStateFlushAt[String(tabId)];
+  invalidateActionPresentation(tabId);
   await chrome.storage.session.remove(`tab:${tabId}`);
 }
 
@@ -115,6 +128,7 @@ async function currentSessionInfo(force = false) {
 }
 
 async function activeSyncAccount() {
+  if (!await privacyConsentAccepted()) return null;
   const stored = await chrome.storage.local.get(['auto-mark', SYNC_ACCOUNT_KEY]);
   const bound = stored[SYNC_ACCOUNT_KEY];
   const expectedUserId = Number(bound?.id);
@@ -167,16 +181,13 @@ function looseFrameKey(value) {
 // Exact match first (query string differs between two embeds of the same
 // player), then origin+pathname fallback for iframes that navigated away from
 // their src attribute — but only when the fallback is unambiguous.
-function frameVisibility(state, frameUrl) {
-  const frames = state.frames || [];
-  const exact = normalizedUrl(frameUrl);
-  let match = frames.find((frame) => normalizedUrl(frame.src) === exact);
-  if (!match) {
-    const loose = looseFrameKey(frameUrl);
-    const candidates = frames.filter((frame) => looseFrameKey(frame.src) === loose);
-    if (candidates.length === 1) match = candidates[0];
-  }
-  return match?.visible ?? null;
+function frameContext(state, frameUrl, documentId) {
+  return AniRekoTrust.resolveFrameContext(
+    state.frameReports || {},
+    state.topDocumentId || null,
+    frameUrl,
+    documentId || null
+  );
 }
 
 function hasVideoEvidence(player) {
@@ -262,29 +273,297 @@ function activePlayerHint(state) {
   };
 }
 
+const RU_NUMBER_WORD_VALUES = Object.freeze({
+  ноль: 0,
+  один: 1,
+  одна: 1,
+  одно: 1,
+  два: 2,
+  две: 2,
+  три: 3,
+  четыре: 4,
+  пять: 5,
+  шесть: 6,
+  семь: 7,
+  восемь: 8,
+  девять: 9,
+  десять: 10,
+  одиннадцать: 11,
+  двенадцать: 12,
+  тринадцать: 13,
+  четырнадцать: 14,
+  пятнадцать: 15,
+  шестнадцать: 16,
+  семнадцать: 17,
+  восемнадцать: 18,
+  девятнадцать: 19,
+  двадцать: 20,
+  тридцать: 30,
+  сорок: 40,
+  пятьдесят: 50,
+  шестьдесят: 60,
+  семьдесят: 70,
+  восемьдесят: 80,
+  девяносто: 90,
+  сто: 100,
+  двести: 200,
+  триста: 300,
+  четыреста: 400,
+  пятьсот: 500,
+  шестьсот: 600,
+  семьсот: 700,
+  восемьсот: 800,
+  девятьсот: 900,
+});
+const RU_NUMBER_WORD_SCALES = Object.freeze({
+  тысяча: 1000,
+  тысячи: 1000,
+  тысяч: 1000,
+  миллион: 1_000_000,
+  миллиона: 1_000_000,
+  миллионов: 1_000_000,
+});
+
+function normalizeRussianNumberWords(tokens) {
+  const normalized = [];
+  for (let index = 0; index < tokens.length;) {
+    let cursor = index;
+    let total = 0;
+    let current = 0;
+    let matched = false;
+    while (cursor < tokens.length) {
+      const token = tokens[cursor];
+      const nextToken = tokens[cursor + 1];
+      if (/^\d+$/u.test(token)
+        && (matched || Object.prototype.hasOwnProperty.call(RU_NUMBER_WORD_SCALES, nextToken))) {
+        current += Number(token);
+      } else if (Object.prototype.hasOwnProperty.call(RU_NUMBER_WORD_VALUES, token)) {
+        current += RU_NUMBER_WORD_VALUES[token];
+      } else if (Object.prototype.hasOwnProperty.call(RU_NUMBER_WORD_SCALES, token)) {
+        current ||= 1;
+        total += current * RU_NUMBER_WORD_SCALES[token];
+        current = 0;
+      } else {
+        break;
+      }
+      matched = true;
+      cursor += 1;
+    }
+    if (matched) {
+      normalized.push(String(total + current));
+      index = cursor;
+    } else {
+      normalized.push(tokens[index]);
+      index += 1;
+    }
+  }
+  return normalized;
+}
+
 function titleSearchKey(value) {
-  return String(value || '')
+  const tokens = String(value || '')
     .toLocaleLowerCase('ru')
     .replace(/ё/gu, 'е')
     .replace(/[^a-zа-я0-9]+/gu, ' ')
-    .trim();
+    .trim()
+    .split(/\s+/u)
+    .filter(Boolean);
+  return normalizeRussianNumberWords(tokens).join(' ');
+}
+
+function titleNumberTokens(value) {
+  return titleSearchKey(value).split(' ').filter((token) => /^\d+$/u.test(token));
+}
+
+function numericallyCompatibleCandidate(query, candidate) {
+  const wantedNumbers = titleNumberTokens(query);
+  if (!wantedNumbers.length) return true;
+  const candidateNumbers = new Set([
+    ...titleNumberTokens(candidate?.title),
+    ...titleNumberTokens(candidate?.subtitle),
+  ]);
+  // A translation may legitimately omit a number, but an explicit different
+  // number is a strong contradiction (3000 years is not 100000 years).
+  if (!candidateNumbers.size) return true;
+  return wantedNumbers.every((number) => candidateNumbers.has(number));
+}
+
+function explicitSeasonRequest(value) {
+  const title = String(value || '').trim();
+  const patterns = [
+    /^(.*?)(?:\s+|[-:])([0-9]{1,2})(?:-?(?:й|ый|ий))?\s*сезон(?:а)?$/iu,
+    /^(.*?)(?:\s+|[-:])сезон\s*([0-9]{1,2})$/iu,
+    /^(.*?)(?:\s+|[-:])([0-9]{1,2})(?:st|nd|rd|th)?\s*season$/iu,
+    /^(.*?)(?:\s+|[-:])season\s*([0-9]{1,2})$/iu,
+  ];
+  for (const pattern of patterns) {
+    const match = title.match(pattern);
+    const seasonNumber = Number(match?.[2]);
+    const baseTitle = String(match?.[1] || '').trim();
+    if (baseTitle.length >= 2 && Number.isInteger(seasonNumber)
+      && seasonNumber >= 2 && seasonNumber <= 99) {
+      return { baseTitle, seasonNumber };
+    }
+  }
+  return null;
+}
+
+function englishOrdinal(value) {
+  const number = Number(value);
+  const lastTwo = number % 100;
+  if (lastTwo >= 11 && lastTwo <= 13) return `${number}th`;
+  return `${number}${({ 1: 'st', 2: 'nd', 3: 'rd' })[number % 10] || 'th'}`;
+}
+
+function serialSeasonCandidate(candidate) {
+  return ['TV', 'ONA'].includes(String(candidate?.type || '').toUpperCase());
+}
+
+function catalogCandidate(row) {
+  const animeId = Number(row?.id ?? row?.animeId);
+  if (!Number.isInteger(animeId) || animeId < 1) return null;
+  const title = String(row?.title || '').trim();
+  if (!title) return null;
+  const yearRaw = row?.year;
+  const year = yearRaw == null ? null : Number(yearRaw);
+  const totalEpisodesRaw = row?.episodes ?? row?.totalEpisodes;
+  const totalEpisodes = totalEpisodesRaw == null ? null : Number(totalEpisodesRaw);
+  const completionMetadataReady = ['type', 'episodes', 'release_status']
+    .every((key) => Object.prototype.hasOwnProperty.call(row, key))
+    || row?.completionMetadataReady === true;
+  return {
+    animeId,
+    title,
+    subtitle: String(row?.subtitle || '').trim() || null,
+    slug: String(row?.slug || '').trim() || null,
+    year: Number.isInteger(year) && year > 0 ? year : null,
+    type: String(row?.type || '').trim() || null,
+    totalEpisodes: Number.isInteger(totalEpisodes) && totalEpisodes > 0 ? totalEpisodes : null,
+    releaseStatus: String(row?.release_status ?? row?.releaseStatus ?? '').trim() || null,
+    completionMetadataReady,
+    exactAliasMatch: row?.exact_alias_match === true || row?.exactAliasMatch === true,
+  };
+}
+
+async function manualMatchBinding(wanted) {
+  const stored = await chrome.storage.local.get(MANUAL_MATCH_BINDINGS_KEY);
+  const container = stored[MANUAL_MATCH_BINDINGS_KEY];
+  if (container?.version !== MANUAL_MATCH_BINDINGS_VERSION) return null;
+  const binding = container.items?.[wanted];
+  const candidate = catalogCandidate(binding);
+  if (!candidate) return null;
+  return candidate;
+}
+
+async function saveManualMatchBinding(wanted, candidate) {
+  const mutation = manualMatchBindingsQueue.catch(() => {}).then(async () => {
+    const stored = await chrome.storage.local.get(MANUAL_MATCH_BINDINGS_KEY);
+    const current = stored[MANUAL_MATCH_BINDINGS_KEY];
+    const items = current?.version === MANUAL_MATCH_BINDINGS_VERSION
+      ? { ...(current.items || {}) }
+      : {};
+    items[wanted] = {
+      ...candidate,
+      boundAt: Date.now(),
+    };
+    const ordered = Object.entries(items)
+      .sort(([, left], [, right]) => Number(right.boundAt || 0) - Number(left.boundAt || 0))
+      .slice(0, MANUAL_MATCH_BINDINGS_MAX);
+    await chrome.storage.local.set({
+      [MANUAL_MATCH_BINDINGS_KEY]: {
+        version: MANUAL_MATCH_BINDINGS_VERSION,
+        items: Object.fromEntries(ordered),
+      },
+    });
+  });
+  manualMatchBindingsQueue = mutation.catch(() => {});
+  return mutation;
+}
+
+async function removeManualMatchBinding(wanted) {
+  const mutation = manualMatchBindingsQueue.catch(() => {}).then(async () => {
+    const stored = await chrome.storage.local.get(MANUAL_MATCH_BINDINGS_KEY);
+    const current = stored[MANUAL_MATCH_BINDINGS_KEY];
+    if (current?.version !== MANUAL_MATCH_BINDINGS_VERSION || !current.items?.[wanted]) return;
+    const items = { ...current.items };
+    delete items[wanted];
+    await chrome.storage.local.set({
+      [MANUAL_MATCH_BINDINGS_KEY]: { version: MANUAL_MATCH_BINDINGS_VERSION, items },
+    });
+  });
+  manualMatchBindingsQueue = mutation.catch(() => {});
+  return mutation;
+}
+
+function confirmedAnimeMatch(match) {
+  return match?.status === 'ok' && Boolean(match.animeId) && (match.exact === true || match.manual === true);
+}
+
+async function searchCatalogCandidates(query) {
+  if (!await privacyConsentAccepted()) throw new Error('privacy consent required');
+  const { ok, status, payload } = await apiClient.request('search', { query, limit: 20 });
+  if (!ok) throw new Error(`HTTP ${status}`);
+  return (Array.isArray(payload?.data) ? payload.data : [])
+    .map(catalogCandidate)
+    .filter((candidate) => candidate && numericallyCompatibleCandidate(query, candidate));
+}
+
+async function resolveSeasonAliasCandidate(title, primaryCandidates) {
+  const request = explicitSeasonRequest(title);
+  if (!request) return null;
+  const baseWanted = titleSearchKey(request.baseTitle);
+  const roots = primaryCandidates.filter((candidate) => serialSeasonCandidate(candidate)
+    && (titleSearchKey(candidate.title) === baseWanted
+      || titleSearchKey(candidate.subtitle) === baseWanted));
+  if (roots.length !== 1) return null;
+  const aliasBase = String(roots[0].subtitle || roots[0].title || '').trim();
+  if (!aliasBase) return null;
+
+  const probe = `${aliasBase} ${englishOrdinal(request.seasonNumber)} Season`;
+  if (probe.length > 180) return null;
+  const primaryIds = new Set(primaryCandidates.map((candidate) => candidate.animeId));
+  const confirmed = (await searchCatalogCandidates(probe))
+    .filter((candidate) => serialSeasonCandidate(candidate)
+      && candidate.exactAliasMatch === true
+      && primaryIds.has(candidate.animeId));
+  return confirmed.length === 1 ? confirmed[0] : null;
 }
 
 // KAN-2054 acceptance: map the recognized title to our anime_id via the
 // existing public search API. Only the cleaned title string is sent.
-// KAN-2695: global persistent cache + in-flight dedup + error backoff, so the
-// extension can never DDoS /api/search (worst case: 1 request per new title).
+// KAN-2695: global persistent cache + in-flight dedup + error backoff. Most
+// titles use one search request; an explicit ambiguous season may use one
+// additional bounded alias probe before it is cached.
 function resolveAnimeMatch(title, { forceRefresh = false } = {}) {
   const wanted = titleSearchKey(title);
   if (!wanted) return Promise.resolve({ status: 'none', query: title, resolvedAt: Date.now() });
   const requestKey = `${wanted}:${forceRefresh ? 'fresh' : 'cached'}`;
   let pending = searchInFlight.get(requestKey);
   if (!pending) {
-    pending = resolveAnimeMatchUncached(title, wanted, forceRefresh)
+    pending = resolveAnimeMatchWithBinding(title, wanted, forceRefresh)
       .finally(() => searchInFlight.delete(requestKey));
     searchInFlight.set(requestKey, pending);
   }
   return pending;
+}
+
+async function resolveAnimeMatchWithBinding(title, wanted, forceRefresh) {
+  const binding = await manualMatchBinding(wanted);
+  if (!binding) return resolveAnimeMatchUncached(title, wanted, forceRefresh);
+  if (!forceRefresh) {
+    return { status: 'ok', query: title, ...binding, exact: false, manual: true, resolvedAt: Date.now() };
+  }
+  try {
+    const candidates = await searchCatalogCandidates(binding.title);
+    const refreshed = candidates.find((candidate) => candidate.animeId === binding.animeId);
+    if (!refreshed) {
+      return { status: 'error', query: title, error: 'manual match not found', resolvedAt: Date.now() };
+    }
+    await saveManualMatchBinding(wanted, refreshed);
+    return { status: 'ok', query: title, ...refreshed, exact: false, manual: true, resolvedAt: Date.now() };
+  } catch (error) {
+    return { status: 'error', query: title, error: String(error), resolvedAt: Date.now() };
+  }
 }
 
 async function resolveAnimeMatchUncached(title, wanted, forceRefresh = false) {
@@ -302,37 +581,38 @@ async function resolveAnimeMatchUncached(title, wanted, forceRefresh = false) {
     return cached?.match || fallback;
   }
   try {
-    const { ok, status, payload } = await apiClient.request('search', { query: title, limit: 5 });
-    if (!ok) throw new Error(`HTTP ${status}`);
-    const results = Array.isArray(payload?.data) ? payload.data : [];
+    const results = await searchCatalogCandidates(title);
     let match = { status: 'none', query: title, resolvedAt: now };
+    let seasonProbeUnavailable = false;
     if (results.length) {
-      const exact = results.find((row) => titleSearchKey(row.title) === wanted
-        || titleSearchKey(row.subtitle) === wanted);
-      const best = exact || results[0];
-      const completionMetadataReady = ['type', 'episodes', 'release_status']
-        .every((key) => Object.prototype.hasOwnProperty.call(best, key));
-      match = {
-        status: 'ok',
-        query: title,
-        animeId: best.id,
-        title: best.title,
-        slug: best.slug ?? null,
-        year: best.year ?? null,
-        type: best.type ?? null,
-        totalEpisodes: Number.isInteger(Number(best.episodes)) ? Number(best.episodes) : null,
-        releaseStatus: best.release_status ?? null,
-        completionMetadataReady,
-        exact: Boolean(exact),
-        resolvedAt: now,
-      };
+      const exact = results.filter((candidate) => titleSearchKey(candidate.title) === wanted
+        || titleSearchKey(candidate.subtitle) === wanted);
+      let seasonAlias = null;
+      if (exact.length === 0) {
+        try {
+          seasonAlias = await resolveSeasonAliasCandidate(title, results);
+        } catch {
+          // The primary result is still useful. Keep the title ambiguous and
+          // retry soon without poisoning the global search backoff.
+          seasonProbeUnavailable = true;
+        }
+      }
+      match = exact.length === 1 || seasonAlias
+        ? {
+          status: 'ok', query: title, ...(exact[0] || seasonAlias), exact: true,
+          manual: false, seasonAlias: Boolean(seasonAlias), resolvedAt: now,
+        }
+        : { status: 'ambiguous', query: title, candidates: exact.length ? exact : results, resolvedAt: now };
     }
     searchFailCount = 0;
     searchBackoffUntil = 0;
+    const retryAmbiguousSeason = match.status === 'ambiguous'
+      && Boolean(explicitSeasonRequest(title));
     cache[wanted] = {
       match,
       expiresAt: now + (match.status !== 'ok'
-        ? SEARCH_TTL_MISS_MS
+        ? seasonProbeUnavailable || retryAmbiguousSeason
+          ? SEARCH_TTL_PARTIAL_MS : SEARCH_TTL_MISS_MS
         : match.completionMetadataReady ? SEARCH_TTL_OK_MS : SEARCH_TTL_PARTIAL_MS),
     };
     const keys = Object.keys(cache);
@@ -407,19 +687,49 @@ async function resolveTasteMatchUncached(animeId, userKey, cacheKey) {
   }
 }
 
-async function updateMatchBadge(tabId, state) {
+function matchBadgePresentation(state) {
   const taste = state.taste;
+  const actionRequired = Boolean(state.recognition?.title)
+    && ['ambiguous', 'none'].includes(state.match?.status);
   const showBadge = taste?.status === 'ok' && Number.isFinite(taste.percent);
+  const text = actionRequired ? '!' : showBadge ? String(taste.percent) : '';
+  const color = actionRequired
+    ? '#ffa502'
+    : showBadge ? MATCH_BADGE_COLORS[taste.labelKey] || MATCH_BADGE_COLORS.mixed : null;
+  const title = actionRequired
+    ? chrome.i18n?.getMessage('actionRequiredTitle') || 'AniReko — требуется выбрать аниме'
+    : chrome.i18n?.getMessage('extensionName') || 'AniReko';
+  return {
+    key: JSON.stringify([text, color, title]),
+    text,
+    color,
+    title,
+  };
+}
+
+async function updateMatchBadge(tabId, state) {
+  const presentation = matchBadgePresentation(state);
+  const cacheKey = String(tabId);
+  if (actionBadgeRenderKeyByTab.get(cacheKey) === presentation.key) return false;
   try {
-    await chrome.action.setBadgeText({ tabId, text: showBadge ? String(taste.percent) : '' });
-    if (showBadge) {
-      const color = MATCH_BADGE_COLORS[taste.labelKey] || MATCH_BADGE_COLORS.mixed;
-      await chrome.action.setBadgeBackgroundColor({ tabId, color });
+    await chrome.action.setBadgeText({
+      tabId,
+      text: presentation.text,
+    });
+    if (presentation.color) {
+      await chrome.action.setBadgeBackgroundColor({ tabId, color: presentation.color });
       if (chrome.action.setBadgeTextColor) {
         await chrome.action.setBadgeTextColor({ tabId, color: '#0a0a0f' });
       }
     }
-  } catch { /* tab gone */ }
+    if (chrome.action.setTitle) {
+      await chrome.action.setTitle({ tabId, title: presentation.title });
+    }
+    actionBadgeRenderKeyByTab.set(cacheKey, presentation.key);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // Auto-report unreadable players (KAN-2715): anime recognized, the page has
@@ -620,11 +930,12 @@ function historyTitleKey(title) {
   return String(title || '').toLocaleLowerCase().replace(/\s+/gu, ' ').trim();
 }
 
-function countWatchedForTitle(history, titleKey) {
+function countWatchedForTitle(history, titleKey, animeId) {
   let episodes = 0;
   let fullWatch = false;
   for (const [key, record] of Object.entries(history?.records || {})) {
-    if (!record?.completed || !key.startsWith(`${titleKey}::`)) continue;
+    if (!record?.completed || !key.startsWith(`${titleKey}::`)
+      || Number(record.animeId) !== Number(animeId)) continue;
     if (key.endsWith('::full')) fullWatch = true;
     else episodes += 1;
   }
@@ -643,10 +954,10 @@ async function trustedWriteContext(state) {
 async function maybeAutoMark(state) {
   let match = state.match;
   const player = state.player;
-  if (!player?.watched || match?.status !== 'ok' || !match.exact || !match.animeId) return;
+  if (!player?.watched || !confirmedAnimeMatch(match)) return;
   const history = await loadHistory();
   const { episodes, fullWatch } = countWatchedForTitle(
-    history, historyTitleKey(state.recognition?.title)
+    history, historyTitleKey(state.recognition?.title), match.animeId
   );
   const currentEpisode = Number(player.episode);
   const reachedLaterEpisode = Number.isInteger(currentEpisode) && currentEpisode >= 2;
@@ -660,7 +971,7 @@ async function maybeAutoMark(state) {
       completionMetadataRefreshInFlight.add(refreshKey);
       try {
         const refreshed = await resolveAnimeMatch(state.recognition?.title, { forceRefresh: true });
-        if (refreshed?.status !== 'ok' || !refreshed.exact
+        if (!confirmedAnimeMatch(refreshed)
           || Number(refreshed.animeId) !== Number(match.animeId)) {
           completionMetadataRefreshRetryAt[refreshKey] = now + 120_000;
           return;
@@ -700,6 +1011,7 @@ async function maybeAutoMark(state) {
     }
     const statusResult = await apiClient.request('status-get', { animeId: match.animeId });
     if (!statusResult.ok || !statusResult.payload?.success) {
+      state.syncWriteFailed = true;
       autoMarkRetryAt[markKey] = now + (statusResult.status >= 500 ? 120_000 : 6 * 3600_000);
       return;
     }
@@ -723,9 +1035,11 @@ async function maybeAutoMark(state) {
         at: now,
       };
     } else {
+      state.syncWriteFailed = true;
       autoMarkRetryAt[markKey] = now + (postResult.status >= 500 ? 120_000 : 6 * 3600_000);
     }
   } catch {
+    state.syncWriteFailed = true;
     autoMarkRetryAt[markKey] = now + 120_000;
   } finally {
     autoMarkInFlight.delete(markKey);
@@ -759,7 +1073,7 @@ async function updateResumeCache(userId, animeId, progress) {
 async function syncProgressOnce(state, urgent) {
   const match = state.match;
   const player = state.player;
-  if (match?.status !== 'ok' || !match.exact || !match.animeId) return;
+  if (!confirmedAnimeMatch(match)) return;
   if (!player?.playbackStarted || !Number.isFinite(player.currentTime)
     || !Number.isFinite(player.duration) || player.duration < 300) return;
   const now = Date.now();
@@ -797,6 +1111,7 @@ async function syncProgressOnce(state, urgent) {
     });
     if (!result.ok && result.status !== 204) {
       state.progressSync = sync;
+      state.syncWriteFailed = true;
       return;
     }
     // Мы сами — источник правды на этом девайсе: попап читает кэш, не сервер.
@@ -809,6 +1124,7 @@ async function syncProgressOnce(state, urgent) {
     });
   } catch {
     state.progressSync = sync; // транзиент — уйдёт со следующим триггером
+    state.syncWriteFailed = true;
   }
 }
 
@@ -845,6 +1161,16 @@ function activePlayer(state) {
   })[0] || null;
 }
 
+function actionIconRenderKey(state) {
+  const animeFound = Boolean(state.recognition?.title);
+  if (animeFound && ['ambiguous', 'none'].includes(state.match?.status)) return 'attention';
+  if (!animeFound) return 'idle';
+  if (state.player?.watched) return 'recognized:watched';
+  if (state.player?.playing) return 'recognized:playing';
+  if (state.player?.playbackStarted) return 'recognized:paused';
+  return 'recognized:idle';
+}
+
 function statusIcon(size, state) {
   const canvas = new OffscreenCanvas(size, size);
   const context = canvas.getContext('2d');
@@ -852,6 +1178,7 @@ function statusIcon(size, state) {
   context.scale(scale, scale);
 
   const animeFound = Boolean(state.recognition?.title);
+  const actionRequired = animeFound && ['ambiguous', 'none'].includes(state.match?.status);
   const player = state.player;
   const watched = Boolean(player?.watched);
   const playing = Boolean(player?.playing);
@@ -865,7 +1192,9 @@ function statusIcon(size, state) {
   context.arc(16, 16, 15, 0, Math.PI * 2);
   context.fill();
   let brand = '#9ca3af';
-  if (animeFound) {
+  if (actionRequired) {
+    brand = '#ffa502';
+  } else if (animeFound) {
     brand = context.createLinearGradient(2, 2, 30, 30);
     brand.addColorStop(0, '#ff4757');
     brand.addColorStop(1, '#ff6b81');
@@ -896,10 +1225,10 @@ function statusIcon(size, state) {
 
   // Player state badge, top-right overlay (bottom is reserved for the
   // chrome match% badge text): ✓ watched / ▶ playing / ⏸ paused.
-  if (watched || playing || paused) {
+  if (actionRequired || watched || playing || paused) {
     const cx = 24;
     const cy = 8;
-    context.fillStyle = watched || playing ? '#2ed573' : '#ffa502';
+    context.fillStyle = actionRequired ? '#ffa502' : watched || playing ? '#2ed573' : '#ffa502';
     context.beginPath();
     context.arc(cx, cy, 7, 0, Math.PI * 2);
     context.fill();
@@ -907,7 +1236,13 @@ function statusIcon(size, state) {
     context.lineWidth = 1.5;
     context.stroke();
     context.fillStyle = '#ffffff';
-    if (watched) {
+    if (actionRequired) {
+      context.fillStyle = '#0a0a0f';
+      context.font = 'bold 11px sans-serif';
+      context.textAlign = 'center';
+      context.textBaseline = 'middle';
+      context.fillText('!', cx, cy + 0.5);
+    } else if (watched) {
       context.strokeStyle = '#ffffff';
       context.lineWidth = 2;
       context.lineCap = 'round';
@@ -933,6 +1268,9 @@ function statusIcon(size, state) {
 }
 
 async function updateActionIcon(tabId, state) {
+  const renderKey = actionIconRenderKey(state);
+  const cacheKey = String(tabId);
+  if (actionIconRenderKeyByTab.get(cacheKey) === renderKey) return false;
   try {
     await chrome.action.setIcon({
       tabId,
@@ -941,8 +1279,11 @@ async function updateActionIcon(tabId, state) {
         32: statusIcon(32, state),
       },
     });
+    actionIconRenderKeyByTab.set(cacheKey, renderKey);
+    return true;
   } catch (error) {
     console.warn('[AniReko] dynamic icon unavailable', error);
+    return false;
   }
 }
 
@@ -965,6 +1306,116 @@ async function loadHistory() {
     }
   }
   return historyCache;
+}
+
+function legacyCurrentHistoryRecord(state, history) {
+  if (!confirmedAnimeMatch(state?.match)) return null;
+  const titleKey = historyTitleKey(state?.recognition?.title);
+  if (!titleKey || !state?.player) return null;
+  const episode = Number(state.player.episode ?? state.recognition?.episode);
+  const episodeKey = Number.isInteger(episode) && episode > 0 ? episode : 'full';
+  const record = history?.records?.[`${titleKey}::${episodeKey}`];
+  if (!record || Number.isInteger(Number(record.animeId))
+    || Number(record.position) <= 0
+    || !Number.isFinite(Number(record.duration))
+    || Number(record.duration) < 300) return null;
+  return record;
+}
+
+async function bindLegacyCurrentHistoryRecord(state, history, record) {
+  // A separate popup confirmation names the resolved catalog anime before a
+  // legacy title-only record is upgraded. Background writes never guess.
+  record.animeId = Number(state.match.animeId);
+  history.updatedAt = Date.now();
+  await chrome.storage.local.set({ 'watch-history': history });
+}
+
+function historyPlayerForManualSync(state, history) {
+  const titleKey = historyTitleKey(state?.recognition?.title);
+  if (!titleKey) return null;
+  const currentEpisode = Number(state?.player?.episode ?? state?.recognition?.episode);
+  const candidates = Object.entries(history?.records || {})
+    .filter(([key, record]) => key.startsWith(`${titleKey}::`)
+      && Number.isInteger(Number(record?.animeId))
+      && Number(record.animeId) === Number(state?.match?.animeId)
+      && Number(record?.position) > 0
+      && Number.isFinite(Number(record?.duration))
+      && Number(record.duration) >= 300)
+    .map(([key, record]) => {
+      const suffix = key.slice(titleKey.length + 2);
+      const storedEpisode = Number(record.episode);
+      const suffixEpisode = Number(suffix);
+      const episode = Number.isInteger(storedEpisode) && storedEpisode > 0
+        ? storedEpisode
+        : Number.isInteger(suffixEpisode) && suffixEpisode > 0 ? suffixEpisode : null;
+      return { record, episode };
+    })
+    .sort((left, right) => {
+      const leftCurrent = Number.isInteger(currentEpisode) && left.episode === currentEpisode ? 1 : 0;
+      const rightCurrent = Number.isInteger(currentEpisode) && right.episode === currentEpisode ? 1 : 0;
+      if (leftCurrent !== rightCurrent) return rightCurrent - leftCurrent;
+      const lastWatchedDelta = Number(right.record.lastWatchedAt || 0)
+        - Number(left.record.lastWatchedAt || 0);
+      if (lastWatchedDelta !== 0) return lastWatchedDelta;
+      if (Boolean(left.record.completed) !== Boolean(right.record.completed)) {
+        return Number(Boolean(right.record.completed)) - Number(Boolean(left.record.completed));
+      }
+      return 0;
+    });
+  const selected = candidates[0];
+  if (!selected) return null;
+  const position = Number(selected.record.position);
+  const duration = Number(selected.record.duration);
+  return {
+    ...(state.player || {}),
+    player: state.player?.player || 'local-history',
+    episode: selected.episode,
+    currentTime: position,
+    duration,
+    progress: Math.max(0, Math.min(1, position / duration)),
+    watched: selected.record.completed === true,
+    playbackStarted: true,
+    playing: false,
+    paused: true,
+    ended: selected.record.completed === true,
+    voice: selected.record.voice || state.player?.voice || state.voice || null,
+    reason: 'manual-history-sync',
+    observedAt: Number(selected.record.lastWatchedAt) || Date.now(),
+  };
+}
+
+async function syncCurrentOrHistoryFromPopup(state, options = {}) {
+  state.syncWriteFailed = false;
+  const history = await loadHistory();
+  const livePlayer = state.player;
+  const liveUsable = Boolean(livePlayer?.playbackStarted)
+    && Number.isFinite(livePlayer.currentTime)
+    && Number.isFinite(livePlayer.duration)
+    && livePlayer.duration >= 300;
+  if (!liveUsable) {
+    const legacyRecord = legacyCurrentHistoryRecord(state, history);
+    if (legacyRecord && options.confirmLegacyHistory !== true) {
+      return {
+        writeFailed: false,
+        confirmationRequired: true,
+        animeTitle: state.match.title || state.recognition?.title || '',
+      };
+    }
+    if (legacyRecord) await bindLegacyCurrentHistoryRecord(state, history, legacyRecord);
+  }
+  const historyPlayer = historyPlayerForManualSync(state, history);
+  const player = liveUsable ? livePlayer : historyPlayer;
+  const syncState = player && player !== livePlayer ? { ...state, player } : state;
+  await maybeSyncProgress(syncState, true);
+  if (syncState.player?.watched) await maybeAutoMark(syncState);
+  if (syncState !== state) {
+    state.match = syncState.match;
+    state.progressSync = syncState.progressSync;
+    state.autoMark = syncState.autoMark;
+    state.syncDeniedReason = syncState.syncDeniedReason;
+    state.syncWriteFailed = syncState.syncWriteFailed;
+  }
+  return { writeFailed: state.syncWriteFailed === true, confirmationRequired: false };
 }
 
 // Timeupdate ticks only mutate the in-memory history; the full-object storage
@@ -1016,17 +1467,28 @@ function queueHistoryUpdate(state, player, previousPlayer) {
       && mediaDelta > 0 && mediaDelta <= 20
       ? Math.min(wallDelta, mediaDelta)
       : 0;
-    const existing = history.records[recordKey] || {
-      title: recognition.title,
-      episode: player.episode,
-      watchedSeconds: 0,
-      firstWatchedAt: player.observedAt,
-    };
+    const matchedAnimeId = confirmedAnimeMatch(state.match) ? Number(state.match.animeId) : null;
+    const storedRecord = history.records[recordKey];
+    if (storedRecord?.animeId && matchedAnimeId == null) return;
+    const existing = storedRecord?.animeId && Number(storedRecord.animeId) !== matchedAnimeId
+      ? {
+        title: recognition.title,
+        episode: player.episode,
+        watchedSeconds: 0,
+        firstWatchedAt: player.observedAt,
+      }
+      : storedRecord || {
+        title: recognition.title,
+        episode: player.episode,
+        watchedSeconds: 0,
+        firstWatchedAt: player.observedAt,
+      };
     const watchedTransition = Boolean(player.watched && !existing.completed);
     history.records[recordKey] = {
       ...existing,
       title: recognition.title,
       episode: player.episode,
+      animeId: matchedAnimeId,
       voice: player.voice || state.topVoice || recognition.voice || existing.voice || null,
       watchedSeconds: Math.round((existing.watchedSeconds + watchedDelta) * 10) / 10,
       position: player.currentTime,
@@ -1052,7 +1514,7 @@ async function updateTabState(message, sender, messageContext) {
   let current = stateByTab[tabId];
   if (!current) {
     const stored = await chrome.storage.session.get(storageKey);
-    current = stored[storageKey] || { players: {}, frames: [] };
+    current = stored[storageKey] || { players: {}, frames: [], frameReports: {} };
   }
   current.documents ||= {};
   if (messageContext.topFrame) {
@@ -1064,10 +1526,12 @@ async function updateTabState(message, sender, messageContext) {
     }
     if (message.type === 'page-observed'
       && (changedDocument || (current.pageUrl && current.pageUrl !== message.url))) {
-      current = { players: {}, frames: [], documents: {} };
+      invalidateActionPresentation(tabId);
+      current = { players: {}, frames: [], frameReports: {}, documents: {} };
     }
     current.navigationToken = messageContext.documentToken;
     current.sourceOrigin = messageContext.topOrigin;
+    current.topDocumentId = messageContext.documentId;
   } else {
     if (!current.navigationToken || current.sourceOrigin !== messageContext.topOrigin) {
       current.lastRejectReason = 'stale_navigation';
@@ -1094,11 +1558,13 @@ async function updateTabState(message, sender, messageContext) {
   }
   if (message.type === 'recognition') {
     if (current.recognition?.url && current.recognition.url !== message.url) {
+      invalidateActionPresentation(tabId);
       // SPA-переход, который не поймал page-observed (напр. только hash):
       // сбрасываем всё контекстное старой страницы, иначе players нового URL
       // получат stale-эпизод/пробу.
       current.players = {};
       current.frames = [];
+      current.frameReports = {};
       current.player = null;
       current.pendingEpisodeSignals = [];
       current.pendingVoiceByDocument = {};
@@ -1141,9 +1607,29 @@ async function updateTabState(message, sender, messageContext) {
     });
   }
   if (message.type === 'frame-visibility') {
-    current.frames = message.frames || [];
+    current.frameReports ||= {};
+    for (const [documentId, report] of Object.entries(current.frameReports)) {
+      if (documentId !== messageContext.documentId && report.frameId === messageContext.frameId) {
+        delete current.frameReports[documentId];
+      }
+    }
+    current.frameReports[messageContext.documentId] = {
+      documentUrl: messageContext.documentUrl,
+      frameId: messageContext.frameId,
+      frames: message.frames || [],
+      observedAt: message.observedAt,
+    };
+    if (messageContext.topFrame) current.frames = message.frames || [];
     for (const player of Object.values(current.players || {})) {
-      player.frameVisible = frameVisibility(current, player.frameUrl);
+      const resolvedFrame = frameContext(current, player.frameUrl, player.documentId);
+      player.frameVisible = resolvedFrame?.visible ?? null;
+      if (player.episodeAuthoritative !== true
+        && (player.episode == null || player.episodeSignalKind === 'iframe-chain')) {
+        player.episode = resolvedFrame?.episode ?? null;
+        player.episodeSignalKind = Number.isInteger(resolvedFrame?.episode)
+          ? 'iframe-chain'
+          : null;
+      }
     }
     applyPendingEpisodeSignals(current);
   }
@@ -1161,20 +1647,26 @@ async function updateTabState(message, sender, messageContext) {
       && message.currentTime > previous.currentTime + 0.2;
     const frameNavigated = Boolean(previous?.frameUrl)
       && normalizedUrl(previous.frameUrl) !== normalizedUrl(message.frameUrl);
-    const previousAuthoritative = !frameNavigated && previous?.episodeAuthoritative === true;
     const messageAuthoritative = message.episodeAuthoritative === true;
     const documentVoice = current.pendingVoiceByDocument?.[messageContext.documentId] || null;
+    const resolvedFrame = frameContext(current, message.frameUrl, messageContext.documentId);
+    const episodeResolution = AniRekoTrust.resolvePlayerEpisode(
+      message.episode,
+      messageAuthoritative,
+      previous,
+      resolvedFrame?.episode,
+      frameNavigated,
+    );
     current.players[playerKey] = {
       ...previous,
       ...message,
-      episode: messageAuthoritative
-        ? message.episode
-        : previousAuthoritative ? previous.episode : message.episode ?? previous?.episode ?? null,
-      episodeAuthoritative: messageAuthoritative || previousAuthoritative,
+      episode: episodeResolution.episode,
+      episodeAuthoritative: episodeResolution.authoritative,
+      episodeSignalKind: episodeResolution.signalKind,
       voice: documentVoice || (frameNavigated ? null : previous?.voice) || null,
       frameId: sender.frameId ?? 0,
       documentId: sender.documentId || null,
-      frameVisible: frameVisibility(current, message.frameUrl),
+      frameVisible: resolvedFrame?.visible ?? null,
       playbackStarted: Boolean(previous?.playbackStarted || message.playbackStarted),
       lastAdvancedAt: advanced ? message.observedAt : previous?.lastAdvancedAt || null
     };
@@ -1262,6 +1754,173 @@ function isPopupSender(sender) {
   }
 }
 
+async function popupTabState(tabId) {
+  if (!Number.isInteger(tabId) || tabId < 1) return null;
+  const memoryState = stateByTab[String(tabId)];
+  if (memoryState) return memoryState;
+  const storageKey = `tab:${tabId}`;
+  const stored = await chrome.storage.session.get(storageKey);
+  return stored[storageKey] || null;
+}
+
+async function popupTabExists(tabId) {
+  try {
+    return Boolean(await chrome.tabs.get(tabId));
+  } catch {
+    return false;
+  }
+}
+
+async function persistPopupTabState(tabId, state) {
+  if (!await popupTabExists(tabId)) {
+    delete stateByTab[String(tabId)];
+    invalidateActionPresentation(tabId);
+    await chrome.storage.session.remove(`tab:${tabId}`);
+    return false;
+  }
+  state.updatedAt = Date.now();
+  stateByTab[String(tabId)] = state;
+  await chrome.storage.session.set({ [`tab:${tabId}`]: state });
+  await Promise.all([
+    updateActionIcon(tabId, state),
+    updateMatchBadge(tabId, state),
+  ]);
+  return true;
+}
+
+async function popupSearchAnime(query) {
+  if (!await privacyConsentAccepted()) {
+    return { ok: false, status: 403, payload: { error: 'privacy_consent_required' } };
+  }
+  const cleaned = String(query || '').trim();
+  if (cleaned.length < 2 || cleaned.length > 180) {
+    return { ok: false, status: 400, payload: { error: 'invalid_query' } };
+  }
+  try {
+    const candidates = await searchCatalogCandidates(cleaned);
+    const wanted = titleSearchKey(cleaned);
+    const exact = candidates.filter((candidate) => titleSearchKey(candidate.title) === wanted
+      || titleSearchKey(candidate.subtitle) === wanted);
+    const seasonAlias = exact.length === 0
+      ? await resolveSeasonAliasCandidate(cleaned, candidates).catch(() => null)
+      : null;
+    const ordered = seasonAlias
+      ? [seasonAlias, ...candidates.filter((candidate) => candidate.animeId !== seasonAlias.animeId)]
+      : candidates;
+    return { ok: true, status: 200, payload: { query: cleaned, candidates: ordered } };
+  } catch {
+    return { ok: false, status: 503, payload: { error: 'search_unavailable' } };
+  }
+}
+
+async function bindPopupAnime(message) {
+  const tabId = Number(message.tabId);
+  const animeId = Number(message.animeId);
+  const query = String(message.query || '').trim();
+  if (!Number.isInteger(tabId) || tabId < 1 || !Number.isInteger(animeId) || animeId < 1
+    || query.length < 2 || query.length > 180) {
+    return { ok: false, status: 400, payload: { error: 'invalid_binding' } };
+  }
+  if (!await privacyConsentAccepted()) {
+    return { ok: false, status: 403, payload: { error: 'privacy_consent_required' } };
+  }
+  const state = await popupTabState(tabId);
+  const recognizedTitle = String(state?.recognition?.title || '').trim();
+  const wanted = titleSearchKey(recognizedTitle);
+  if (!state || !wanted) {
+    return { ok: false, status: 409, payload: { error: 'recognition_state_changed' } };
+  }
+  if (!await popupTabExists(tabId)) {
+    return { ok: false, status: 404, payload: { error: 'tab_not_found' } };
+  }
+  let candidate;
+  try {
+    candidate = (await searchCatalogCandidates(query))
+      .find((item) => item.animeId === animeId);
+  } catch {
+    return { ok: false, status: 503, payload: { error: 'search_unavailable' } };
+  }
+  if (!candidate) {
+    return { ok: false, status: 409, payload: { error: 'candidate_not_confirmed' } };
+  }
+  if (!await popupTabExists(tabId)) {
+    return { ok: false, status: 404, payload: { error: 'tab_not_found' } };
+  }
+  await saveManualMatchBinding(wanted, candidate);
+  state.match = {
+    status: 'ok',
+    query: recognizedTitle,
+    ...candidate,
+    exact: false,
+    manual: true,
+    resolvedAt: Date.now(),
+  };
+  const userKey = sessionIdentityKey(await currentSessionInfo());
+  state.taste = await resolveTasteMatch(candidate.animeId, userKey);
+  if (await popupTabExists(tabId)) {
+    await syncCurrentOrHistoryFromPopup(state, { confirmLegacyHistory: true });
+  }
+  await persistPopupTabState(tabId, state);
+  return { ok: true, status: 200, payload: { match: state.match } };
+}
+
+async function unbindPopupAnime(message) {
+  const tabId = Number(message.tabId);
+  const state = await popupTabState(tabId);
+  const recognizedTitle = String(state?.recognition?.title || '').trim();
+  const wanted = titleSearchKey(recognizedTitle);
+  if (!state || !wanted) {
+    return { ok: false, status: 409, payload: { error: 'recognition_state_changed' } };
+  }
+  if (!await privacyConsentAccepted()) {
+    return { ok: false, status: 403, payload: { error: 'privacy_consent_required' } };
+  }
+  if (!await popupTabExists(tabId)) {
+    return { ok: false, status: 404, payload: { error: 'tab_not_found' } };
+  }
+  await removeManualMatchBinding(wanted);
+  state.match = await resolveAnimeMatch(recognizedTitle, { forceRefresh: true });
+  state.taste = confirmedAnimeMatch(state.match)
+    ? await resolveTasteMatch(state.match.animeId, sessionIdentityKey(await currentSessionInfo()))
+    : null;
+  await persistPopupTabState(tabId, state);
+  return { ok: true, status: 200, payload: { match: state.match } };
+}
+
+async function syncPopupCurrent(message) {
+  const tabId = Number(message.tabId);
+  const expectedUserId = Number(message.expectedUserId);
+  const state = await popupTabState(tabId);
+  if (!state) return { ok: false, status: 404, payload: { error: 'tab_state_not_found' } };
+  if (!await popupTabExists(tabId)) {
+    return { ok: false, status: 404, payload: { error: 'tab_not_found' } };
+  }
+  if (!confirmedAnimeMatch(state.match)) {
+    return { ok: false, status: 409, payload: { error: 'anime_match_required' } };
+  }
+  const syncAccount = await activeSyncAccount();
+  if (!syncAccount || syncAccount.userId !== expectedUserId) {
+    return { ok: false, status: 409, payload: { error: 'sync_account_mismatch' } };
+  }
+  const progressAt = Number(state.progressSync?.at || 0);
+  const autoMarkAt = Number(state.autoMark?.at || 0);
+  const syncOutcome = await syncCurrentOrHistoryFromPopup(state, {
+    confirmLegacyHistory: message.confirmLegacyHistory === true,
+  });
+  await persistPopupTabState(tabId, state);
+  return {
+    ok: true,
+    status: 200,
+    payload: {
+      progressSynced: Number(state.progressSync?.at || 0) > progressAt,
+      statusSynced: Number(state.autoMark?.at || 0) > autoMarkAt,
+      writeFailed: syncOutcome.writeFailed,
+      confirmationRequired: syncOutcome.confirmationRequired === true,
+      animeTitle: syncOutcome.animeTitle || null,
+    },
+  };
+}
+
 async function handlePopupRequest(message) {
   switch (message?.type) {
     case 'popup-runtime-info':
@@ -1272,6 +1931,14 @@ async function handlePopupRequest(message) {
       };
     case 'popup-session-info':
       return currentSessionInfo(true);
+    case 'popup-search-anime':
+      return popupSearchAnime(message.query);
+    case 'popup-bind-anime':
+      return bindPopupAnime(message);
+    case 'popup-unbind-anime':
+      return unbindPopupAnime(message);
+    case 'popup-sync-current':
+      return syncPopupCurrent(message);
     case 'popup-progress-all': {
       const expectedUserId = Number(message.expectedUserId);
       const syncAccount = await activeSyncAccount();
@@ -1348,6 +2015,7 @@ async function finalizeRemovedTab(tabId) {
     delete stateByTab[id];
     delete tabQueues[id];
     delete tabStateFlushAt[id];
+    invalidateActionPresentation(tabId);
     await chrome.storage.session.remove(storageKey);
   }
 }
@@ -1359,19 +2027,36 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 if (AniRekoRuntimeConfig.testMode === true) {
   globalThis.AniRekoTestHooks = Object.freeze({
     resetVolatileCaches() {
+      historyCache = null;
+      historyLastFlushAt = 0;
       sessionInfoCache = null;
       sessionInfoExpiresAt = 0;
       sessionInfoInFlight = null;
       tasteCache.clear();
       tasteInFlight.clear();
+      actionIconRenderKeyByTab.clear();
+      actionBadgeRenderKeyByTab.clear();
+      autoMarkedInSession.clear();
+      autoMarkInFlight.clear();
+      completionMetadataRefreshedInSession.clear();
+      completionMetadataRefreshInFlight.clear();
+      for (const key of Object.keys(autoMarkRetryAt)) delete autoMarkRetryAt[key];
+      for (const key of Object.keys(completionMetadataRefreshRetryAt)) {
+        delete completionMetadataRefreshRetryAt[key];
+      }
     },
     syncProgress: maybeSyncProgress,
     finalizeRemovedTab,
     stateForTab(tabId) {
       return stateByTab[String(tabId)] || null;
     },
+    async manualHistoryPlayerForTab(tabId) {
+      const state = stateByTab[String(tabId)] || null;
+      return state ? historyPlayerForManualSync(state, await loadHistory()) : null;
+    },
     dropTabState(tabId) {
       delete stateByTab[String(tabId)];
+      invalidateActionPresentation(tabId);
     },
   });
 }

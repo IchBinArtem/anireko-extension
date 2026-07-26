@@ -11,6 +11,7 @@ Security invariants:
 - status/progress writes require both an explicitly trusted top origin and a live account ID matching the bound account;
 - account-scoped reads carry the expected user ID and taste caches are partitioned by the live account;
 - server endpoints repeat the expected-user check before mutation;
+- only one lexical exact catalog result auto-confirms; ambiguous/inexact candidates require an explicit local binding that is freshly revalidated against catalog search, while stale/closed tabs and revoked privacy consent fail closed before popup-triggered writes;
 - Chrome native host controls govern where the static detector can run; diagnostics and account mutation are independently fail-closed.
 
 ## Public source boundary

@@ -42,6 +42,17 @@
               <p class="taste-match" id="taste-match">—</p>
               <a class="primary-action" id="anime-primary-action" hidden target="_blank" rel="noopener"><span data-i18n="openInAniReko"></span> <span aria-hidden="true">→</span></a>
               <p class="catalog-note" id="anireko-match">—</p>
+              <div class="match-resolution" id="match-resolution" hidden>
+                <strong id="match-resolution-title"></strong>
+                <p id="match-resolution-detail"></p>
+                <div class="match-candidates" id="match-candidates"></div>
+                <form class="match-search" id="match-search">
+                  <input id="match-search-query" type="search" minlength="2" maxlength="180" autocomplete="off">
+                  <button type="submit" data-i18n="searchAniReko"></button>
+                </form>
+                <button class="match-reset" id="match-reset" type="button" hidden data-i18n="resetManualMatch"></button>
+                <p class="match-feedback" id="match-feedback" aria-live="polite"></p>
+              </div>
             </div>
           </div>
         </div>

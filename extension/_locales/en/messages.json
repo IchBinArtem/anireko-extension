@@ -120,11 +120,54 @@
   },
   "syncUpdating": { "message": "⟳ updating…" },
   "syncUpdated": { "message": "✓ updated" },
+  "syncNothingToSend": { "message": "No new data to send" },
+  "confirmLegacyHistorySync": {
+    "message": "This local history predates catalog binding. Send it specifically to “$TITLE$”?",
+    "placeholders": { "title": { "content": "$1" } }
+  },
   "episodeUnknown": { "message": "Episode not identified" },
   "statusWatched": { "message": "watched" },
   "statusWatching": { "message": "watching" },
   "statusPaused": { "message": "paused" },
   "statusWaiting": { "message": "waiting to start" },
   "animeFoundPlayVideo": { "message": "Anime found. Start the video to complete the player check." },
-  "openAnimeWithPlayer": { "message": "Open an anime page with a video player." }
+  "openAnimeWithPlayer": { "message": "Open an anime page with a video player." },
+  "catalogMatchRequiredTitle": { "message": "Confirm the anime" },
+  "catalogMatchNotConfirmed": { "message": "The catalog match has not been confirmed yet" },
+  "catalogNotFoundForTitle": {
+    "message": "Nothing was found for “$TITLE$”",
+    "placeholders": { "title": { "content": "$1" } }
+  },
+  "manualMatchMark": { "message": "chosen manually" },
+  "chooseAnimeTitle": { "message": "Which anime are you watching?" },
+  "chooseAnimeDetail": {
+    "message": "“$TITLE$” does not produce one unambiguous match. Choose the right title—the binding is stored only in this browser.",
+    "placeholders": { "title": { "content": "$1" } }
+  },
+  "findAnimeManuallyTitle": { "message": "Find the anime manually" },
+  "findAnimeManuallyDetail": {
+    "message": "AniReko found no exact match for “$TITLE$”. Edit the query and link this page to a catalog title.",
+    "placeholders": { "title": { "content": "$1" } }
+  },
+  "searchAniReko": { "message": "Search" },
+  "searchAniRekoPlaceholder": { "message": "Title in AniReko" },
+  "chooseThisAnime": { "message": "Choose" },
+  "bindingAnime": { "message": "Binding and syncing…" },
+  "animeBound": { "message": "Done—the anime is linked" },
+  "animeBindFailed": { "message": "Could not change the binding. Reload the page and try again." },
+  "searchingAniReko": { "message": "Searching AniReko…" },
+  "actionRequiredTitle": { "message": "AniReko — choose the anime" },
+  "manualSearchEmpty": {
+    "message": "Nothing was found for “$QUERY$”.",
+    "placeholders": { "query": { "content": "$1" } }
+  },
+  "manualMatchTitle": { "message": "You chose this title manually" },
+  "manualMatchDetail": {
+    "message": "This page is linked to “$TITLE$”. You can find another title or reset the binding.",
+    "placeholders": { "title": { "content": "$1" } }
+  },
+  "resetManualMatch": { "message": "Reset binding" },
+  "resettingManualMatch": { "message": "Resetting binding…" },
+  "chooseAnimeBeforeSync": { "message": "Choose the anime first" },
+  "syncFailed": { "message": "Sync failed" }
 }

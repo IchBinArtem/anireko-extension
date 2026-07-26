@@ -120,11 +120,54 @@
   },
   "syncUpdating": { "message": "⟳ обновляем…" },
   "syncUpdated": { "message": "✓ обновлено" },
+  "syncNothingToSend": { "message": "Нет новых данных для отправки" },
+  "confirmLegacyHistorySync": {
+    "message": "Старая локальная история ещё не была привязана к каталогу. Отправить её именно в «$TITLE$»?",
+    "placeholders": { "title": { "content": "$1" } }
+  },
   "episodeUnknown": { "message": "Серия не определена" },
   "statusWatched": { "message": "просмотрено" },
   "statusWatching": { "message": "смотрю" },
   "statusPaused": { "message": "пауза" },
   "statusWaiting": { "message": "ждём запуск" },
   "animeFoundPlayVideo": { "message": "Аниме найдено. Запустите видео для полной проверки плеера." },
-  "openAnimeWithPlayer": { "message": "Откройте страницу аниме с видеоплеером." }
+  "openAnimeWithPlayer": { "message": "Откройте страницу аниме с видеоплеером." },
+  "catalogMatchRequiredTitle": { "message": "Нужно подтвердить аниме" },
+  "catalogMatchNotConfirmed": { "message": "Совпадение в каталоге ещё не подтверждено" },
+  "catalogNotFoundForTitle": {
+    "message": "По названию «$TITLE$» ничего не найдено",
+    "placeholders": { "title": { "content": "$1" } }
+  },
+  "manualMatchMark": { "message": "выбрано вручную" },
+  "chooseAnimeTitle": { "message": "Какое аниме вы смотрите?" },
+  "chooseAnimeDetail": {
+    "message": "Название «$TITLE$» не даёт однозначного совпадения. Выберите правильный тайтл — привязка сохранится только в этом браузере.",
+    "placeholders": { "title": { "content": "$1" } }
+  },
+  "findAnimeManuallyTitle": { "message": "Найдите аниме вручную" },
+  "findAnimeManuallyDetail": {
+    "message": "AniReko не нашёл точное совпадение для «$TITLE$». Измените запрос и свяжите страницу с тайтлом из каталога.",
+    "placeholders": { "title": { "content": "$1" } }
+  },
+  "searchAniReko": { "message": "Найти" },
+  "searchAniRekoPlaceholder": { "message": "Название в AniReko" },
+  "chooseThisAnime": { "message": "Это оно" },
+  "bindingAnime": { "message": "Привязываем и синхронизируем…" },
+  "animeBound": { "message": "Готово — аниме привязано" },
+  "animeBindFailed": { "message": "Не удалось изменить привязку. Обновите страницу и попробуйте ещё раз." },
+  "searchingAniReko": { "message": "Ищем в AniReko…" },
+  "actionRequiredTitle": { "message": "AniReko — требуется выбрать аниме" },
+  "manualSearchEmpty": {
+    "message": "По запросу «$QUERY$» ничего не найдено.",
+    "placeholders": { "query": { "content": "$1" } }
+  },
+  "manualMatchTitle": { "message": "Вы выбрали тайтл вручную" },
+  "manualMatchDetail": {
+    "message": "Эта страница связана с «$TITLE$». Можно найти другой тайтл или сбросить привязку.",
+    "placeholders": { "title": { "content": "$1" } }
+  },
+  "resetManualMatch": { "message": "Сбросить привязку" },
+  "resettingManualMatch": { "message": "Сбрасываем привязку…" },
+  "chooseAnimeBeforeSync": { "message": "Сначала выберите аниме" },
+  "syncFailed": { "message": "Не удалось синхронизировать" }
 }

@@ -1,9 +1,13 @@
 {
-  "version": 1,
+  "version": 3,
   "base": "https://anireko.com",
+  "rate_limit": {
+    "status": 429,
+    "retry_after_header": "Retry-After"
+  },
   "actions": {
     "session-info": { "method": "GET", "path": "/api/auth/session-info.php", "credentials": true },
-    "search": { "method": "GET", "path": "/api/search", "credentials": false, "query": ["q", "limit"] },
+    "search": { "method": "GET", "path": "/api/search", "credentials": false, "query": ["q", "limit", "exact_alias"], "response_item": ["id", "title", "subtitle", "slug", "year", "type", "episodes", "release_status", "exact_alias_match"] },
     "taste-match": { "method": "GET", "path": "/api/anime/{anime_id}/match", "credentials": true },
     "status-get": { "method": "GET", "path": "/api/anime/status.php", "credentials": true },
     "status-write": { "method": "POST", "path": "/api/anime/status.php", "credentials": true, "body": ["anime_id", "status", "expected_user_id"] },

@@ -118,8 +118,9 @@
       .replace(/\s*\|\s*[^|]{2,60}$/u, '')
       // Aggregator progress blocks: «Liar Game [1-14 из 24+]», «[ТВ-2]».
       .replace(/\s*\[[^\]]*\]\s*$/u, '')
-      .replace(new RegExp(`\\s+\\d{1,4}[\\s-]*${EPISODE_WORD}(?![a-zа-яё]).*$`, 'iu'), '')
       .replace(new RegExp(`\\s*(?<![a-zа-яё])${EPISODE_WORD}[\\s:#№-]*\\d{1,4}.*$`, 'iu'), '')
+      .replace(new RegExp(`\\s+\\d{1,4}[\\s-]*${EPISODE_WORD}(?![a-zа-яё]).*$`, 'iu'), '')
+      .replace(/\s*[|—–:-]+\s*$/u, '')
       .replace(/^аниме\s+/iu, '')
       .replace(/\s+смотреть(?:\s+онлайн)?.*$/iu, '')
       .replace(/\s+аниме$/iu, '')
@@ -142,6 +143,34 @@
     return '';
   }
 
+  function choosePageTitle({
+    primaryHeadings = [],
+    ogTitle = '',
+    documentTitle = ''
+  } = {}) {
+    const primary = primaryHeadings
+      .map((value) => String(value || '').trim())
+      .filter(Boolean);
+    const metadata = [ogTitle, documentTitle]
+      .map((value) => String(value || '').trim())
+      .filter(Boolean);
+    const primaryEpisodeTitles = primary
+      .filter((value) => parseEpisode([value]) !== null);
+    const metadataEpisodeTitles = metadata
+      .filter((value) => parseEpisode([value]) !== null);
+    // Aggregators often render their brand as the first H1 and the actual
+    // episode title in metadata. Arbitrary secondary H1s are never trusted:
+    // a recommendation/sidebar heading must not authorize a catalog match.
+    return chooseTitle([
+      ...new Set([
+        ...primaryEpisodeTitles,
+        ...metadataEpisodeTitles,
+        ...primary,
+        ...metadata
+      ])
+    ]);
+  }
+
   global.AniRekoRecognition = {
     cleanText,
     hasEpisodeMarker,
@@ -151,6 +180,7 @@
     episodeFromPlayerUrl,
     normalizeVoiceLabel,
     normalizeTitle,
-    chooseTitle
+    chooseTitle,
+    choosePageTitle
   };
 })(typeof globalThis !== 'undefined' ? globalThis : window);
