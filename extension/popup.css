@@ -147,7 +147,8 @@ h1 { margin: 0; font-size: 17px; line-height: 1.15; letter-spacing: -.02em; }
   font-size: 10.5px;
 }
 .match-search button,
-.match-reset {
+.match-reset,
+.match-change {
   padding: 7px 9px;
   border: 0;
   border-radius: 8px;
@@ -159,11 +160,14 @@ h1 { margin: 0; font-size: 17px; line-height: 1.15; letter-spacing: -.02em; }
   cursor: pointer;
 }
 .match-search button:hover,
-.match-reset:hover { background: #475569; }
+.match-reset:hover,
+.match-change:hover { background: #475569; }
 .match-search button:disabled,
 .match-reset:disabled,
+.match-change:disabled,
 .match-candidate:disabled { opacity: .55; cursor: default; }
 .match-reset { margin-top: 8px; }
+.match-change { margin-top: 7px; }
 .match-feedback { min-height: 14px; color: #fbbf24 !important; }
 .playback-summary { display: flex; align-items: center; gap: 7px; margin-top: 7px; min-width: 0; }
 .playback-summary > strong { font-size: 11px; color: #e2e8f0; }

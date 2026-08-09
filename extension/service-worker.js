@@ -371,6 +371,23 @@ function titleSearchKey(value) {
   return normalizeRussianNumberWords(tokens).join(' ');
 }
 
+function titleExactKeys(value) {
+  const source = String(value || '');
+  const compactIntrawordHyphens = source.replace(
+    /([a-zа-я])[-‐‑‒–—―]+([a-zа-я])/giu,
+    '$1$2',
+  );
+  return new Set([
+    titleSearchKey(source),
+    titleSearchKey(compactIntrawordHyphens),
+  ].filter(Boolean));
+}
+
+function lexicallyExactTitle(left, right) {
+  const rightKeys = titleExactKeys(right);
+  return Array.from(titleExactKeys(left)).some((key) => rightKeys.has(key));
+}
+
 function titleNumberTokens(value) {
   return titleSearchKey(value).split(' ').filter((token) => /^\d+$/u.test(token));
 }
@@ -511,10 +528,9 @@ async function searchCatalogCandidates(query) {
 async function resolveSeasonAliasCandidate(title, primaryCandidates) {
   const request = explicitSeasonRequest(title);
   if (!request) return null;
-  const baseWanted = titleSearchKey(request.baseTitle);
   const roots = primaryCandidates.filter((candidate) => serialSeasonCandidate(candidate)
-    && (titleSearchKey(candidate.title) === baseWanted
-      || titleSearchKey(candidate.subtitle) === baseWanted));
+    && (lexicallyExactTitle(candidate.title, request.baseTitle)
+      || lexicallyExactTitle(candidate.subtitle, request.baseTitle)));
   if (roots.length !== 1) return null;
   const aliasBase = String(roots[0].subtitle || roots[0].title || '').trim();
   if (!aliasBase) return null;
@@ -574,7 +590,27 @@ async function resolveAnimeMatchUncached(title, wanted, forceRefresh = false) {
     ? (stored[SEARCH_CACHE_KEY] || {})
     : {};
   const cached = cache[wanted];
-  if (!forceRefresh && cached?.match && now < cached.expiresAt) return cached.match;
+  if (!forceRefresh && cached?.match && now < cached.expiresAt) {
+    const onlyCandidate = cached.match.status === 'ambiguous'
+      && Array.isArray(cached.match.candidates)
+      && cached.match.candidates.length === 1
+      ? catalogCandidate(cached.match.candidates[0])
+      : null;
+    if (onlyCandidate && (lexicallyExactTitle(onlyCandidate.title, title)
+      || lexicallyExactTitle(onlyCandidate.subtitle, title))) {
+      const promoted = {
+        status: 'ok', query: title, ...onlyCandidate, exact: true, manual: false,
+        seasonAlias: false, resolvedAt: now,
+      };
+      cache[wanted] = { match: promoted, expiresAt: now + SEARCH_TTL_PARTIAL_MS };
+      await chrome.storage.local.set({
+        [SEARCH_CACHE_KEY]: cache,
+        'search-cache-version': cacheVersion,
+      });
+      return promoted;
+    }
+    return cached.match;
+  }
   if (now < searchBackoffUntil) {
     const fallback = { status: 'error', query: title, error: 'search backoff', resolvedAt: now };
     if (forceRefresh) return fallback;
@@ -585,8 +621,8 @@ async function resolveAnimeMatchUncached(title, wanted, forceRefresh = false) {
     let match = { status: 'none', query: title, resolvedAt: now };
     let seasonProbeUnavailable = false;
     if (results.length) {
-      const exact = results.filter((candidate) => titleSearchKey(candidate.title) === wanted
-        || titleSearchKey(candidate.subtitle) === wanted);
+      const exact = results.filter((candidate) => lexicallyExactTitle(candidate.title, title)
+        || lexicallyExactTitle(candidate.subtitle, title));
       let seasonAlias = null;
       if (exact.length === 0) {
         try {
@@ -1798,9 +1834,8 @@ async function popupSearchAnime(query) {
   }
   try {
     const candidates = await searchCatalogCandidates(cleaned);
-    const wanted = titleSearchKey(cleaned);
-    const exact = candidates.filter((candidate) => titleSearchKey(candidate.title) === wanted
-      || titleSearchKey(candidate.subtitle) === wanted);
+    const exact = candidates.filter((candidate) => lexicallyExactTitle(candidate.title, cleaned)
+      || lexicallyExactTitle(candidate.subtitle, cleaned));
     const seasonAlias = exact.length === 0
       ? await resolveSeasonAliasCandidate(cleaned, candidates).catch(() => null)
       : null;

@@ -859,6 +859,61 @@ test('multiple exact catalog rows remain ambiguous', async () => {
   assert.deepEqual(Array.from(result.candidates, (candidate) => candidate.animeId), [10, 11]);
 });
 
+test('cached sole candidate becomes exact when only an intraword hyphen differs', async () => {
+  const { fetchImpl, calls } = searchFetch([]);
+  const { context, storage } = loadServiceWorker({ fetchImpl });
+  const title = 'Мое анти-божественное оружие';
+  const wanted = context.titleSearchKey(title);
+  await storage.local.set({
+    'search-cache-version': 7,
+    'search-cache': {
+      [wanted]: {
+        match: {
+          status: 'ambiguous',
+          query: title,
+          candidates: [{
+            animeId: 37259,
+            title: 'Моё антибожественное оружие',
+            slug: 'wo-de-ni-tian-shen-qi',
+            year: 2024,
+            type: 'ONA',
+            totalEpisodes: 16,
+            releaseStatus: 'FINISHED',
+            completionMetadataReady: true,
+          }],
+        },
+        expiresAt: Date.now() + 60_000,
+      },
+    },
+  });
+
+  const result = await context.resolveAnimeMatch(title);
+
+  assert.equal(result.status, 'ok');
+  assert.equal(result.animeId, 37259);
+  assert.equal(result.exact, true);
+  assert.equal(result.manual, false);
+  assert.equal(calls.length, 0);
+});
+
+test('one merely fuzzy catalog result still requires user confirmation', async () => {
+  const { fetchImpl } = searchFetch([{
+    id: 42,
+    title: 'Совсем другое оружие',
+    slug: 'other-weapon',
+    year: 2024,
+    type: 'ONA',
+    episodes: 12,
+    release_status: 'FINISHED',
+  }]);
+  const { context } = loadServiceWorker({ fetchImpl });
+
+  const result = await context.resolveAnimeMatch('Мое анти-божественное оружие');
+
+  assert.equal(result.status, 'ambiguous');
+  assert.deepEqual(Array.from(result.candidates, (candidate) => candidate.animeId), [42]);
+});
+
 test('manual binding is local, title-scoped, and authorizes only the selected anime id', async () => {
   const { fetchImpl } = searchFetch([{
     id: 19119,

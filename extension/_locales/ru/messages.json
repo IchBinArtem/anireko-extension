@@ -166,6 +166,12 @@
     "message": "Эта страница связана с «$TITLE$». Можно найти другой тайтл или сбросить привязку.",
     "placeholders": { "title": { "content": "$1" } }
   },
+  "changeAnime": { "message": "Изменить аниме" },
+  "changeAnimeTitle": { "message": "Исправить совпадение" },
+  "changeAnimeDetail": {
+    "message": "Сейчас выбрано «$TITLE$». Найдите и выберите правильный тайтл. Изменение сохранится только в этом браузере.",
+    "placeholders": { "title": { "content": "$1" } }
+  },
   "resetManualMatch": { "message": "Сбросить привязку" },
   "resettingManualMatch": { "message": "Сбрасываем привязку…" },
   "chooseAnimeBeforeSync": { "message": "Сначала выберите аниме" },

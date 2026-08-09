@@ -190,6 +190,20 @@ pages['/ambiguous-anime.html'] = [
     </body></html>`,
 ];
 
+pages['/hyphen-title-anime.html'] = [
+  'text/html; charset=utf-8',
+  `<!doctype html>
+    <html lang="ru"><head>
+      <meta charset="utf-8">
+      <meta name="description" content="Смотреть аниме онлайн, 1 серия">
+      <meta property="og:title" content="Мое анти-божественное оружие — смотреть аниме онлайн">
+      <title>Мое анти-божественное оружие — аниме</title>
+    </head><body>
+      <main><h1>Мое анти-божественное оружие</h1></main>
+      <iframe id="main-player" src="http://localhost:4178/player.html" width="800" height="450"></iframe>
+    </body></html>`,
+];
+
 pages['/bookworm-season-4.html'] = [
   'text/html; charset=utf-8',
   `<!doctype html>
@@ -316,6 +330,17 @@ const server = http.createServer((request, response) => {
           { id: 13128, title: 'Власть книжного червя: Рекапы', year: 2022, type: 'SPECIAL' },
           { ...bookwormFourth, exact_alias_match: false },
         ]
+        : /анти-божественное оружие/iu.test(query)
+          ? [{
+            id: 37259,
+            title: 'Моё антибожественное оружие',
+            subtitle: 'Wo De Ni Tian Shen Qi',
+            slug: 'wo-de-ni-tian-shen-qi',
+            year: 2024,
+            type: 'ONA',
+            episodes: 16,
+            release_status: 'FINISHED',
+          }]
         : /расхититель/iu.test(query)
       ? [{
         id: 4242,

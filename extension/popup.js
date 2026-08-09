@@ -342,6 +342,7 @@
   const searchForm = document.getElementById('match-search');
   const searchInput = document.getElementById('match-search-query');
   const searchButton = searchForm.querySelector('button');
+  const changeButton = document.getElementById('match-change');
   const resetButton = document.getElementById('match-reset');
   const feedback = document.getElementById('match-feedback');
   searchInput.placeholder = t('searchAniRekoPlaceholder');
@@ -392,13 +393,20 @@
     }));
   }
 
-  if (!matchConfirmed || match.manual) {
+  function openCorrection() {
     resolution.hidden = false;
-    if (match.manual) {
-      resolutionTitle.textContent = t('manualMatchTitle');
-      resolutionDetail.textContent = t('manualMatchDetail', match.title);
-      resetButton.hidden = false;
-    } else if (match?.status === 'ambiguous') {
+    resolutionTitle.textContent = t('changeAnimeTitle');
+    resolutionDetail.textContent = t('changeAnimeDetail', match.title);
+    resetButton.hidden = !match.manual;
+    searchInput.focus();
+  }
+
+  if (matchConfirmed) {
+    changeButton.hidden = false;
+    changeButton.addEventListener('click', openCorrection);
+  } else {
+    resolution.hidden = false;
+    if (match?.status === 'ambiguous') {
       resolutionTitle.textContent = t('chooseAnimeTitle');
       resolutionDetail.textContent = t('chooseAnimeDetail', recognition.title);
       renderCandidates(match.candidates, match.query || recognition.title);

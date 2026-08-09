@@ -495,10 +495,45 @@ test('requires a choice for duplicate exact matches, stores it locally, and sync
     return posts.at(-1)?.status ?? null;
   }).toBe('watching');
 
+  await expect(popup.locator('#match-change')).toBeVisible();
+  await expect(popup.locator('#match-resolution')).toBeHidden();
+  await popup.locator('#match-change').click();
+  await expect(popup.locator('#match-resolution')).toBeVisible();
+  await expect(popup.locator('#match-resolution-title')).toHaveText('Исправить совпадение');
+  await expect(popup.locator('#match-reset')).toBeVisible();
   await popup.locator('#match-reset').click();
   await expect.poll(async () => (await storedTabState(tabId))?.match?.status ?? null)
     .toBe('ambiguous');
   await expect(popup.locator('#anime-check-title')).toHaveText('Нужно подтвердить аниме');
+  await popup.close();
+  await page.close();
+});
+
+test('accepts an intraword hyphen variant as exact and still lets the user correct it', async () => {
+  const page = await context.newPage();
+  await page.goto(`${siteBase}/hyphen-title-anime.html`);
+  const tabId = await extensionTabId(`${siteBase}/hyphen-title-anime.html`);
+
+  await expect.poll(async () => (await storedTabState(tabId))?.match ?? null)
+    .toMatchObject({ status: 'ok', animeId: 37259, exact: true, manual: false });
+  const popup = await openPopup(tabId);
+  await expect(popup.locator('#anime-check-title')).toHaveText('Аниме найдено');
+  await expect(popup.locator('#anireko-match')).toContainText('Моё антибожественное оружие');
+  await expect(popup.locator('#match-change')).toBeVisible();
+  await expect(popup.locator('#match-resolution')).toBeHidden();
+
+  await popup.locator('#match-change').click();
+  await expect(popup.locator('#match-resolution')).toBeVisible();
+  await expect(popup.locator('#match-resolution-title')).toHaveText('Исправить совпадение');
+  await expect(popup.locator('#match-resolution-detail')).toContainText('только в этом браузере');
+  await expect(popup.locator('#match-reset')).toBeHidden();
+  await popup.locator('#match-search-query').fill('Одинаковое имя');
+  await popup.locator('#match-search').evaluate((form: HTMLFormElement) => form.requestSubmit());
+  await expect(popup.locator('.match-candidate')).toHaveCount(2);
+  await popup.locator('.match-candidate').filter({ hasText: '2022 · ONA' }).click();
+  await expect.poll(async () => (await storedTabState(tabId))?.match ?? null)
+    .toMatchObject({ status: 'ok', animeId: 19119, exact: false, manual: true });
+  await expect(popup.locator('#anireko-match')).toContainText('выбрано вручную');
   await popup.close();
   await page.close();
 });

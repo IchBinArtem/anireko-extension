@@ -166,6 +166,12 @@
     "message": "This page is linked to “$TITLE$”. You can find another title or reset the binding.",
     "placeholders": { "title": { "content": "$1" } }
   },
+  "changeAnime": { "message": "Change anime" },
+  "changeAnimeTitle": { "message": "Correct the match" },
+  "changeAnimeDetail": {
+    "message": "“$TITLE$” is selected now. Find and choose the correct title. The change is stored only in this browser.",
+    "placeholders": { "title": { "content": "$1" } }
+  },
   "resetManualMatch": { "message": "Reset binding" },
   "resettingManualMatch": { "message": "Resetting binding…" },
   "chooseAnimeBeforeSync": { "message": "Choose the anime first" },
