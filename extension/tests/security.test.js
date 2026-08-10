@@ -334,6 +334,24 @@ test('public API contract and client action allowlist stay aligned', () => {
   ]);
 });
 
+test('taste match remains an account-linked request disclosed by privacy text', async () => {
+  let request = null;
+  const fetch = async (url, init) => {
+    request = { url, init };
+    return { ok: true, status: 200, json: async () => ({ percent: 75 }) };
+  };
+  const context = load('lib/api-client.js', {
+    fetch,
+    AbortSignal: { timeout: () => null },
+  });
+  const client = context.AniRekoApiClient.create({ baseUrl: 'https://anireko.com', fetchImpl: fetch });
+
+  await client.request('taste-match', { animeId: 42 });
+
+  assert.equal(request.url, 'https://anireko.com/api/anime/42/match');
+  assert.equal(request.init.credentials, 'include');
+});
+
 test('public export contains every source and fixture used by release verification', () => {
   const repo = path.join(__dirname, '..', '..');
   const listed = new Set(fs.readFileSync(path.join(__dirname, '..', 'public-files.txt'), 'utf8')

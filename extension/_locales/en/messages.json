@@ -4,7 +4,7 @@
   "brandTagline": { "message": "Anime watch tracker" },
   "privacyDisclosureTitle": { "message": "How AniReko works" },
   "privacyDisclosureLocalRead": { "message": "On sites you allow, the extension locally reads the anime title, episode, and video player state." },
-  "privacyDisclosureMatch": { "message": "A cleaned title is sent to AniReko to find a catalog match. The full page address is not sent." },
+  "privacyDisclosureMatch": { "message": "A cleaned title is sent to AniReko to find a catalog match. If you are already signed in to AniReko, the recognized anime ID is also sent with the current session to show the taste-match percentage; this does not change your list. The full page address is not sent." },
   "privacyDisclosureSync": { "message": "Status, episode, position, and voice track are sent only after you enable account sync." },
   "privacyDisclosureReport": { "message": "If anime is not recognized, a separate button sends only the hostname and technical structure—without the address, page title, cookies, or history." },
   "diagnosticsConsent": { "message": "Send anonymous diagnostics for unsupported players (hostname and structure, without path/query)" },

@@ -43,8 +43,9 @@ The extension does not show ads or sell user data. The full page address and vid
 AniReko requests `<all_urls>` because its single core purpose is to recognize anime playback on arbitrary websites and inside arbitrary cross-origin player frames. Chrome's native site-access controls let each user run it on click, on selected sites, or on all sites.
 
 - Locally read: cleaned anime title, episode/voice labels, and HTML5 player timing/state.
-- Sent for catalog matching when a permitted page looks like anime: cleaned title only. No full page URL or video content.
-- Sent only when account sync is enabled: anime ID, status, episode, position, duration, voice track, and expected bound account ID.
+- Sent for catalog matching when a permitted page looks like anime: the cleaned title, without credentials. No full page URL or video content.
+- Sent automatically for a signed-in user to calculate the taste-match percentage: the recognized anime ID with the current AniReko session. This does not write to the user's list.
+- Sent only when account sync is enabled to write status and progress: anime ID, status, episode, position, duration, voice track, and expected bound account ID.
 - Sent only with diagnostics opt-in: unsupported-player hostname and a compact structural probe without path, query, cookies, or watch history.
 - Sent only after the user clicks “anime is present” on an unrecognized page: hostname and the same compact structural probe, without URL/path/query, page title/content, cookies, account identity, or watch history.
 - Stored locally: consent, minimal watch history, account binding, and caches. URL-bearing tab state uses browser-session storage and is cleared when Chrome closes.
