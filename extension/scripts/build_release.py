@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 from pathlib import Path
 import subprocess
 import sys
@@ -31,6 +30,27 @@ def git_clean(repo: Path) -> bool:
     return not result.stdout.strip()
 
 
+def git_blob(repo: Path, repo_relative_path: str) -> bytes:
+    """Read the exact bytes stored in HEAD, without worktree line-ending conversion."""
+    result = subprocess.run(
+        ["git", "show", f"HEAD:{repo_relative_path}"],
+        cwd=repo, capture_output=True, check=False,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", errors="replace").strip()
+        raise SystemExit(f"missing release file in HEAD: {repo_relative_path}: {detail}")
+    return result.stdout
+
+
+def release_source_bytes(repo: Path, extension: Path, name: str, allow_dirty: bool) -> bytes:
+    if allow_dirty:
+        path = extension / name
+        if not path.is_file():
+            raise SystemExit(f"missing release file: {name}")
+        return path.read_bytes()
+    return git_blob(repo, f"extension/{name}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--tag", help="Expected release tag, e.g. v0.2.4")
@@ -40,21 +60,24 @@ def main() -> int:
 
     extension = Path(__file__).resolve().parents[1]
     repo = extension.parent
-    manifest = json.loads((extension / "manifest.json").read_text(encoding="utf-8"))
+    if not args.allow_dirty and not git_clean(repo):
+        raise SystemExit("dirty_or_untracked_release: commit the clean source before building")
+
+    manifest = json.loads(
+        release_source_bytes(repo, extension, "manifest.json", args.allow_dirty).decode("utf-8")
+    )
     version = manifest["version"]
     expected_tag = f"v{version}"
     if args.tag and args.tag != expected_tag:
         raise SystemExit(f"tag_manifest_mismatch: {args.tag} != {expected_tag}")
-    if not args.allow_dirty and not git_clean(repo):
-        raise SystemExit("dirty_or_untracked_release: commit the clean source before building")
 
-    files = [line.strip() for line in (extension / "release-files.txt").read_text(encoding="utf-8").splitlines()
+    release_files_text = release_source_bytes(
+        repo, extension, "release-files.txt", args.allow_dirty
+    ).decode("utf-8")
+    files = [line.strip() for line in release_files_text.splitlines()
              if line.strip() and not line.lstrip().startswith("#")]
     if files != sorted(set(files), key=files.index):
         raise SystemExit("release-files.txt contains duplicates")
-    missing = [name for name in files if not (extension / name).is_file()]
-    if missing:
-        raise SystemExit(f"missing release files: {missing}")
 
     output = (args.output or (repo / "dist")).resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -63,7 +86,7 @@ def main() -> int:
     # STORE (no deflate) avoids zlib-version drift across Windows/Linux runners.
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_STORED) as archive:
         for name in files:
-            data = (extension / name).read_bytes()
+            data = release_source_bytes(repo, extension, name, args.allow_dirty)
             info = zipfile.ZipInfo(name, FIXED_TIME)
             info.compress_type = zipfile.ZIP_STORED
             info.create_system = 3
