@@ -61,7 +61,15 @@
   const displayFingerprint = (value) => JSON.stringify([
     value?.recognition?.title || null,
     value?.match || null,
-    value?.player || null,
+    value?.player ? {
+      player: value.player.player || null,
+      playbackStarted: value.player.playbackStarted === true,
+      playing: value.player.playing === true,
+      watched: value.player.watched === true,
+      duration: Number.isFinite(value.player.duration) ? value.player.duration : null,
+      episode: value.player.episode ?? null,
+      playbackRate: Number.isFinite(value.player.playbackRate) ? value.player.playbackRate : 1,
+    } : null,
     value?.episode || null,
     value?.voice || null,
   ]);
@@ -71,7 +79,17 @@
     chrome.storage.onChanged.addListener((changes, areaName) => {
       if (areaName !== 'session' || !changes[key]?.newValue) return;
       if (pauseSessionStateReload) return;
-      if (displayFingerprint(changes[key].newValue) !== initialDisplayFingerprint) location.reload();
+      const nextState = changes[key].newValue;
+      if (displayFingerprint(nextState) !== initialDisplayFingerprint) {
+        location.reload();
+        return;
+      }
+      const progressElement = document.getElementById('progress');
+      if (progressElement) {
+        progressElement.textContent = nextState.player?.progress == null
+          ? '—'
+          : `${(nextState.player.progress * 100).toFixed(1)}%`;
+      }
     });
   }
 

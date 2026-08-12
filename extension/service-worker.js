@@ -13,8 +13,16 @@ const apiClient = AniRekoApiClient.create({
 const stateByTab = {};
 const tabQueues = {};
 const tabStateFlushAt = {};
+const actionIconRenderKeyByTab = new Map();
+const actionBadgeRenderKeyByTab = new Map();
 let historyQueue = Promise.resolve();
 const progressSyncQueues = new WeakMap();
+
+function invalidateActionPresentation(tabId) {
+  const key = String(tabId);
+  actionIconRenderKeyByTab.delete(key);
+  actionBadgeRenderKeyByTab.delete(key);
+}
 
 // --- Server-load hardening (KAN-2695) ---
 // Search mapping is cached globally: one /api/search call per unique title,
@@ -63,6 +71,7 @@ async function disableTab(tabId) {
   delete stateByTab[String(tabId)];
   delete tabQueues[String(tabId)];
   delete tabStateFlushAt[String(tabId)];
+  invalidateActionPresentation(tabId);
   await chrome.storage.session.remove(`tab:${tabId}`);
 }
 
@@ -714,32 +723,49 @@ async function resolveTasteMatchUncached(animeId, userKey, cacheKey) {
   }
 }
 
-async function updateMatchBadge(tabId, state) {
+function matchBadgePresentation(state) {
   const taste = state.taste;
   const actionRequired = Boolean(state.recognition?.title)
     && ['ambiguous', 'none'].includes(state.match?.status);
   const showBadge = taste?.status === 'ok' && Number.isFinite(taste.percent);
+  const text = actionRequired ? '!' : showBadge ? String(taste.percent) : '';
+  const color = actionRequired
+    ? '#ffa502'
+    : showBadge ? MATCH_BADGE_COLORS[taste.labelKey] || MATCH_BADGE_COLORS.mixed : null;
+  const title = actionRequired
+    ? chrome.i18n?.getMessage('actionRequiredTitle') || 'AniReko — требуется выбрать аниме'
+    : chrome.i18n?.getMessage('extensionName') || 'AniReko';
+  return {
+    key: JSON.stringify([text, color, title]),
+    text,
+    color,
+    title,
+  };
+}
+
+async function updateMatchBadge(tabId, state) {
+  const presentation = matchBadgePresentation(state);
+  const cacheKey = String(tabId);
+  if (actionBadgeRenderKeyByTab.get(cacheKey) === presentation.key) return false;
   try {
     await chrome.action.setBadgeText({
       tabId,
-      text: actionRequired ? '!' : showBadge ? String(taste.percent) : ''
+      text: presentation.text,
     });
-    if (actionRequired || showBadge) {
-      const color = actionRequired
-        ? '#ffa502'
-        : MATCH_BADGE_COLORS[taste.labelKey] || MATCH_BADGE_COLORS.mixed;
-      await chrome.action.setBadgeBackgroundColor({ tabId, color });
+    if (presentation.color) {
+      await chrome.action.setBadgeBackgroundColor({ tabId, color: presentation.color });
       if (chrome.action.setBadgeTextColor) {
         await chrome.action.setBadgeTextColor({ tabId, color: '#0a0a0f' });
       }
     }
     if (chrome.action.setTitle) {
-      const title = actionRequired
-        ? chrome.i18n?.getMessage('actionRequiredTitle') || 'AniReko — требуется выбрать аниме'
-        : chrome.i18n?.getMessage('extensionName') || 'AniReko';
-      await chrome.action.setTitle({ tabId, title });
+      await chrome.action.setTitle({ tabId, title: presentation.title });
     }
-  } catch { /* tab gone */ }
+    actionBadgeRenderKeyByTab.set(cacheKey, presentation.key);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // Auto-report unreadable players (KAN-2715): anime recognized, the page has
@@ -1171,6 +1197,16 @@ function activePlayer(state) {
   })[0] || null;
 }
 
+function actionIconRenderKey(state) {
+  const animeFound = Boolean(state.recognition?.title);
+  if (animeFound && ['ambiguous', 'none'].includes(state.match?.status)) return 'attention';
+  if (!animeFound) return 'idle';
+  if (state.player?.watched) return 'recognized:watched';
+  if (state.player?.playing) return 'recognized:playing';
+  if (state.player?.playbackStarted) return 'recognized:paused';
+  return 'recognized:idle';
+}
+
 function statusIcon(size, state) {
   const canvas = new OffscreenCanvas(size, size);
   const context = canvas.getContext('2d');
@@ -1268,6 +1304,9 @@ function statusIcon(size, state) {
 }
 
 async function updateActionIcon(tabId, state) {
+  const renderKey = actionIconRenderKey(state);
+  const cacheKey = String(tabId);
+  if (actionIconRenderKeyByTab.get(cacheKey) === renderKey) return false;
   try {
     await chrome.action.setIcon({
       tabId,
@@ -1276,8 +1315,11 @@ async function updateActionIcon(tabId, state) {
         32: statusIcon(32, state),
       },
     });
+    actionIconRenderKeyByTab.set(cacheKey, renderKey);
+    return true;
   } catch (error) {
     console.warn('[AniReko] dynamic icon unavailable', error);
+    return false;
   }
 }
 
@@ -1520,6 +1562,7 @@ async function updateTabState(message, sender, messageContext) {
     }
     if (message.type === 'page-observed'
       && (changedDocument || (current.pageUrl && current.pageUrl !== message.url))) {
+      invalidateActionPresentation(tabId);
       current = { players: {}, frames: [], frameReports: {}, documents: {} };
     }
     current.navigationToken = messageContext.documentToken;
@@ -1551,6 +1594,7 @@ async function updateTabState(message, sender, messageContext) {
   }
   if (message.type === 'recognition') {
     if (current.recognition?.url && current.recognition.url !== message.url) {
+      invalidateActionPresentation(tabId);
       // SPA-переход, который не поймал page-observed (напр. только hash):
       // сбрасываем всё контекстное старой страницы, иначе players нового URL
       // получат stale-эпизод/пробу.
@@ -1766,6 +1810,7 @@ async function popupTabExists(tabId) {
 async function persistPopupTabState(tabId, state) {
   if (!await popupTabExists(tabId)) {
     delete stateByTab[String(tabId)];
+    invalidateActionPresentation(tabId);
     await chrome.storage.session.remove(`tab:${tabId}`);
     return false;
   }
@@ -2005,6 +2050,7 @@ async function finalizeRemovedTab(tabId) {
     delete stateByTab[id];
     delete tabQueues[id];
     delete tabStateFlushAt[id];
+    invalidateActionPresentation(tabId);
     await chrome.storage.session.remove(storageKey);
   }
 }
@@ -2023,6 +2069,8 @@ if (AniRekoRuntimeConfig.testMode === true) {
       sessionInfoInFlight = null;
       tasteCache.clear();
       tasteInFlight.clear();
+      actionIconRenderKeyByTab.clear();
+      actionBadgeRenderKeyByTab.clear();
       autoMarkedInSession.clear();
       autoMarkInFlight.clear();
       completionMetadataRefreshedInSession.clear();
@@ -2043,6 +2091,7 @@ if (AniRekoRuntimeConfig.testMode === true) {
     },
     dropTabState(tabId) {
       delete stateByTab[String(tabId)];
+      invalidateActionPresentation(tabId);
     },
   });
 }

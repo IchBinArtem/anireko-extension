@@ -218,6 +218,20 @@ test('recognizes anime before playback and confirms player after playback starts
   await expect(popup.locator('#episode')).toHaveText('Серия 2');
   await expect(popup.locator('#status')).toHaveText('смотрю');
   await expect(popup.locator('#progress')).toHaveText(/\d+\.\d%/);
+  let popupReloads = 0;
+  popup.on('framenavigated', (frame) => {
+    if (frame === popup.mainFrame()) popupReloads += 1;
+  });
+  await worker.evaluate(async (key) => {
+    const stored = await chrome.storage.session.get(key);
+    const next = structuredClone(stored[key]);
+    next.player.currentTime = next.player.duration * 0.42;
+    next.player.progress = 0.42;
+    await chrome.storage.session.set({ [key]: next });
+  }, `tab:${tabId}`);
+  await expect(popup.locator('#progress')).toHaveText('42.0%');
+  await popup.waitForTimeout(250);
+  expect(popupReloads).toBe(0);
   await expect(popup.locator('#title')).toHaveText('Расхититель гробниц');
   await expect(popup.locator('#anireko-match')).toHaveText('В каталоге: Расхититель гробниц (2024)');
   await expect(popup.locator('#anime-primary-action')).toHaveText('Открыть в AniReko →');

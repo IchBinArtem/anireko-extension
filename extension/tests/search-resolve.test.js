@@ -38,6 +38,7 @@ function loadServiceWorker({ fetchImpl } = {}) {
   const local = makeStorage();
   const session = makeStorage();
   const actionCalls = {
+    icon: [],
     badgeText: [],
     badgeBackgroundColor: [],
     badgeTextColor: [],
@@ -67,7 +68,7 @@ function loadServiceWorker({ fetchImpl } = {}) {
       setBadgeBackgroundColor: async (value) => actionCalls.badgeBackgroundColor.push(value),
       setBadgeTextColor: async (value) => actionCalls.badgeTextColor.push(value),
       setTitle: async (value) => actionCalls.title.push(value),
-      setIcon: async () => {},
+      setIcon: async (value) => actionCalls.icon.push(value),
     },
     i18n: {
       getMessage: (key) => ({
@@ -96,6 +97,108 @@ function loadServiceWorker({ fetchImpl } = {}) {
   vm.runInContext(fs.readFileSync(serviceWorkerPath, 'utf8'), context);
   return { context, storage: { local, session }, chrome, actionCalls };
 }
+
+test('routine progress ticks do not redraw the action icon without a semantic transition', async () => {
+  const { context, actionCalls } = loadServiceWorker({
+    fetchImpl: async () => ({ ok: false, status: 404, json: async () => ({}) }),
+  });
+  context.statusIcon = (size, state) => ({ size, key: context.actionIconRenderKey(state) });
+  const state = {
+    recognition: { title: 'Test Anime' },
+    match: { status: 'ok' },
+    player: {
+      playbackStarted: true,
+      playing: true,
+      watched: false,
+      currentTime: 5,
+      progress: 0.01,
+      reason: 'timeupdate',
+    },
+  };
+
+  await context.updateActionIcon(7, state);
+  await context.updateActionIcon(7, {
+    ...state,
+    player: { ...state.player, currentTime: 10, progress: 0.02 },
+  });
+  await context.updateActionIcon(7, {
+    ...state,
+    player: { ...state.player, currentTime: 15, progress: 0.03 },
+  });
+  assert.equal(actionCalls.icon.length, 1, 'same playing state renders once');
+
+  const paused = { ...state, player: { ...state.player, playing: false, reason: 'pause' } };
+  await context.updateActionIcon(7, paused);
+  await context.updateActionIcon(7, {
+    ...paused,
+    player: { ...paused.player, currentTime: 16, progress: 0.04, reason: 'timeupdate' },
+  });
+  assert.equal(actionCalls.icon.length, 2, 'pause transition renders exactly once');
+
+  await context.updateActionIcon(7, { ...paused, match: { status: 'ambiguous' } });
+  assert.equal(actionCalls.icon.length, 3, 'manual attention transition renders exactly once');
+  await context.updateActionIcon(7, { ...paused, match: { status: 'ok', manual: true } });
+  assert.equal(actionCalls.icon.length, 4, 'manual resolution renders exactly once');
+});
+
+test('navigation and tab removal invalidate per-tab action presentation caches', async () => {
+  const { context, actionCalls } = loadServiceWorker({
+    fetchImpl: async () => ({ ok: false, status: 404, json: async () => ({}) }),
+  });
+  context.statusIcon = (size, state) => ({ size, key: context.actionIconRenderKey(state) });
+  const sender = { tab: { id: 9 }, frameId: 0, documentId: 'doc-1' };
+  const firstContext = {
+    topFrame: true,
+    documentToken: 'token-1',
+    documentId: 'doc-1',
+    topOrigin: 'https://anime.example',
+    origin: 'https://anime.example',
+  };
+  const firstPage = {
+    type: 'page-observed',
+    url: 'https://anime.example/watch/1',
+    observedAt: Date.now(),
+  };
+
+  await context.updateTabState(firstPage, sender, firstContext);
+  await context.updateTabState(firstPage, sender, firstContext);
+  assert.equal(actionCalls.icon.length, 1, 'same document keeps its render cache');
+
+  await context.updateTabState(
+    { ...firstPage, url: 'https://anime.example/watch/2' },
+    { ...sender, documentId: 'doc-2' },
+    { ...firstContext, documentToken: 'token-2', documentId: 'doc-2' },
+  );
+  assert.equal(actionCalls.icon.length, 2, 'new document forces one fresh render');
+
+  await context.finalizeRemovedTab(9);
+  await context.updateActionIcon(9, {});
+  assert.equal(actionCalls.icon.length, 3, 'closed tab drops its presentation cache');
+});
+
+test('failed action icon writes are retried and cached only after success', async () => {
+  const { context, chrome, actionCalls } = loadServiceWorker({
+    fetchImpl: async () => ({ ok: false, status: 404, json: async () => ({}) }),
+  });
+  context.statusIcon = (size, state) => ({ size, key: context.actionIconRenderKey(state) });
+  let attempts = 0;
+  chrome.action.setIcon = async (value) => {
+    attempts += 1;
+    if (attempts === 1) throw new Error('temporary action failure');
+    actionCalls.icon.push(value);
+  };
+  const state = {
+    recognition: { title: 'Test Anime' },
+    match: { status: 'ok' },
+    player: { playbackStarted: true, playing: true },
+  };
+
+  assert.equal(await context.updateActionIcon(8, state), false);
+  assert.equal(await context.updateActionIcon(8, state), true);
+  assert.equal(await context.updateActionIcon(8, state), false);
+  assert.equal(attempts, 2);
+  assert.equal(actionCalls.icon.length, 1);
+});
 
 function httpErrorFetch(status = 503) {
   const calls = [];
