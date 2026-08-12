@@ -15,6 +15,12 @@ on:
       - ".github/workflows/extension-release.yml"
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      verify_cws_access:
+        description: Verify Chrome Web Store authentication without uploading
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -68,12 +74,87 @@ jobs:
             dist/SBOM.json
           if-no-files-found: error
       - name: Attest release ZIP
-        if: github.ref_type == 'tag'
+        if: github.event_name == 'push' && github.ref_type == 'tag' && startsWith(github.ref, 'refs/tags/v')
         uses: actions/attest-build-provenance@v2
         with:
           subject-path: dist/anireko-extension-*.zip
       - name: Publish GitHub Release assets
-        if: github.ref_type == 'tag'
+        if: github.event_name == 'push' && github.ref_type == 'tag' && startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release create "${GITHUB_REF_NAME}" dist/* --verify-tag --generate-notes
+
+  verify-chrome-web-store-access:
+    if: github.event_name == 'workflow_dispatch' && inputs.verify_cws_access
+    needs: verify-build
+    runs-on: ubuntu-latest
+    concurrency:
+      group: chrome-web-store-publisher
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.13" }
+      - name: Authenticate to Google Cloud with GitHub OIDC
+        id: google-auth
+        uses: google-github-actions/auth@v3
+        with:
+          create_credentials_file: false
+          token_format: access_token
+          access_token_scopes: https://www.googleapis.com/auth/chromewebstore
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_CWS_SERVICE_ACCOUNT }}
+      - name: Verify Chrome Web Store access
+        env:
+          CWS_ACCESS_TOKEN: ${{ steps.google-auth.outputs.access_token }}
+        run: >-
+          python extension/scripts/cws_publish.py
+          --publisher-id 3f669473-129b-48f0-942f-5f99d60af803
+          --extension-id leojnckhalnjpfcpiabhdcgnnlfppdap
+          --check-only
+
+  publish-chrome-web-store:
+    if: github.event_name == 'push' && github.ref_type == 'tag' && startsWith(github.ref, 'refs/tags/v')
+    needs: verify-build
+    runs-on: ubuntu-latest
+    concurrency:
+      group: chrome-web-store-publisher
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.13" }
+      - uses: actions/download-artifact@v4
+        with:
+          name: anireko-extension-${{ github.sha }}
+          path: dist
+      - name: Authenticate to Google Cloud with GitHub OIDC
+        id: google-auth
+        uses: google-github-actions/auth@v3
+        with:
+          create_credentials_file: false
+          token_format: access_token
+          access_token_scopes: https://www.googleapis.com/auth/chromewebstore
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_CWS_SERVICE_ACCOUNT }}
+      - name: Upload and submit the verified package
+        shell: bash
+        env:
+          CWS_ACCESS_TOKEN: ${{ steps.google-auth.outputs.access_token }}
+        run: |
+          mapfile -t packages < <(find dist -maxdepth 1 -type f -name 'anireko-extension-*.zip' -print)
+          if [[ "${#packages[@]}" -ne 1 ]]; then
+            echo "expected exactly one release ZIP, found ${#packages[@]}" >&2
+            exit 1
+          fi
+          python extension/scripts/cws_publish.py \
+            --publisher-id 3f669473-129b-48f0-942f-5f99d60af803 \
+            --extension-id leojnckhalnjpfcpiabhdcgnnlfppdap \
+            --expected-version "${GITHUB_REF_NAME#v}" \
+            --package "${packages[0]}"

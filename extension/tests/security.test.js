@@ -361,7 +361,9 @@ test('public export contains every source and fixture used by release verificati
   const required = [
     '.github/workflows/extension-release.yml',
     'extension/api-contract.json',
+    'extension/scripts/cws_publish.py',
     'extension/tests/search-resolve.test.js',
+    'extension/tests/test_cws_publish.py',
     'tests/e2e/extension-specs/global-setup.cjs',
     'tests/e2e/extension-specs/ad.mp4',
     'tests/e2e/extension-specs/episode.mp4',
@@ -371,7 +373,7 @@ test('public export contains every source and fixture used by release verificati
     assert.equal(fs.existsSync(path.join(repo, relative)), true, `public source misses ${relative}`);
   }
 
-  assert.equal(listed.size, 45, 'public export allowlist changed without an explicit review');
+  assert.equal(listed.size, 47, 'public export allowlist changed without an explicit review');
   const exactSupportFiles = new Set(['.github/workflows/extension-release.yml']);
   for (const relative of listed) {
     assert.equal(

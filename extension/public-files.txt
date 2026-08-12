@@ -24,6 +24,7 @@ extension/popup.js
 extension/public-files.txt
 extension/release-files.txt
 extension/scripts/build_release.py
+extension/scripts/cws_publish.py
 extension/scripts/export_public.py
 extension/service-worker.js
 extension/tests/auto-mark.test.js
@@ -31,6 +32,7 @@ extension/tests/i18n.test.js
 extension/tests/parsers.test.js
 extension/tests/search-resolve.test.js
 extension/tests/security.test.js
+extension/tests/test_cws_publish.py
 tests/e2e/extension-specs/ad.mp4
 tests/e2e/extension-specs/episode.mp4
 tests/e2e/extension-specs/extension.spec.ts

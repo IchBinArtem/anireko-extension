@@ -34,7 +34,8 @@ def main() -> int:
     shutil.copyfile(extension / "README.md", target / "README.md")
     shutil.copyfile(extension / "LICENSE", target / "LICENSE")
     (target / ".gitignore").write_text(
-        "dist/\nnode_modules/\ntest-results/\nplaywright-report/\n__pycache__/\n*.pyc\n",
+        "dist/\nnode_modules/\ntest-results/\nplaywright-report/\n__pycache__/\n*.pyc\n"
+        "gha-creds-*.json\n",
         encoding="utf-8",
     )
     print(target)
