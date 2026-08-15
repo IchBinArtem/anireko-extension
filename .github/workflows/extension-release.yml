@@ -97,8 +97,9 @@ jobs:
       - name: Publish GitHub Release assets
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ github.ref_name }}
-        run: gh release create "$RELEASE_TAG" dist/* --verify-tag --generate-notes
+        run: gh release create "$RELEASE_TAG" dist/* --verify-tag --generate-notes --repo "$GH_REPO"
 
   verify-chrome-web-store-access:
     if: github.event_name == 'workflow_dispatch' && inputs.verify_cws_access

@@ -51,6 +51,9 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("attestations: write", release)
         self.assertIn("attest-build-provenance", release)
         self.assertIn("gh release create", release)
+        self.assertNotIn("actions/checkout", release)
+        self.assertIn("GH_REPO: ${{ github.repository }}", release)
+        self.assertIn('--repo "$GH_REPO"', release)
 
     def test_chrome_web_store_jobs_have_no_repository_write_access(self) -> None:
         for name in ("verify-chrome-web-store-access", "publish-chrome-web-store"):
