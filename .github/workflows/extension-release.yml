@@ -23,18 +23,18 @@ on:
         type: boolean
 
 permissions:
-  contents: write
-  id-token: write
-  attestations: write
+  contents: read
 
 jobs:
   verify-build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with: { node-version: 22, cache: npm, cache-dependency-path: tests/e2e/package-lock.json }
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with: { python-version: "3.13" }
       - name: Export and freeze the client-only public source boundary
         shell: bash
@@ -50,6 +50,8 @@ jobs:
           echo "PUBLIC_EXPORT=$PUBLIC_EXPORT" >> "$GITHUB_ENV"
       - run: node --test extension/tests/*.test.js
         working-directory: ${{ env.PUBLIC_EXPORT }}
+      - run: python -m unittest discover -s extension/tests -p "test_*.py"
+        working-directory: ${{ env.PUBLIC_EXPORT }}
       - run: npm ci
         working-directory: ${{ env.PUBLIC_EXPORT }}/tests/e2e
       - run: npx playwright install --with-deps chromium
@@ -58,13 +60,15 @@ jobs:
         working-directory: ${{ env.PUBLIC_EXPORT }}/tests/e2e
       - name: Build deterministic ZIP
         shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
-            python "$PUBLIC_EXPORT/extension/scripts/build_release.py" --tag "${GITHUB_REF_NAME}" --output "$GITHUB_WORKSPACE/dist"
+            python "$PUBLIC_EXPORT/extension/scripts/build_release.py" --tag "$RELEASE_TAG" --output "$GITHUB_WORKSPACE/dist"
           else
             python "$PUBLIC_EXPORT/extension/scripts/build_release.py" --output "$GITHUB_WORKSPACE/dist"
           fi
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: anireko-extension-${{ github.sha }}
           path: |
@@ -73,16 +77,28 @@ jobs:
             dist/FILE-MANIFEST.json
             dist/SBOM.json
           if-no-files-found: error
+  publish-github-release:
+    if: github.event_name == 'push' && github.ref_type == 'tag' && startsWith(github.ref, 'refs/tags/v')
+    needs: verify-build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: anireko-extension-${{ github.sha }}
+          path: dist
       - name: Attest release ZIP
-        if: github.event_name == 'push' && github.ref_type == 'tag' && startsWith(github.ref, 'refs/tags/v')
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: dist/anireko-extension-*.zip
       - name: Publish GitHub Release assets
-        if: github.event_name == 'push' && github.ref_type == 'tag' && startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${GITHUB_REF_NAME}" dist/* --verify-tag --generate-notes
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: gh release create "$RELEASE_TAG" dist/* --verify-tag --generate-notes
 
   verify-chrome-web-store-access:
     if: github.event_name == 'workflow_dispatch' && inputs.verify_cws_access
@@ -95,12 +111,12 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with: { python-version: "3.13" }
       - name: Authenticate to Google Cloud with GitHub OIDC
         id: google-auth
-        uses: google-github-actions/auth@v3
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
         with:
           create_credentials_file: false
           token_format: access_token
@@ -127,16 +143,20 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with: { python-version: "3.13" }
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: anireko-extension-${{ github.sha }}
           path: dist
+      - name: Verify downloaded release checksums
+        shell: bash
+        working-directory: dist
+        run: sha256sum --check SHA256SUMS
       - name: Authenticate to Google Cloud with GitHub OIDC
         id: google-auth
-        uses: google-github-actions/auth@v3
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
         with:
           create_credentials_file: false
           token_format: access_token
@@ -147,6 +167,7 @@ jobs:
         shell: bash
         env:
           CWS_ACCESS_TOKEN: ${{ steps.google-auth.outputs.access_token }}
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
           mapfile -t packages < <(find dist -maxdepth 1 -type f -name 'anireko-extension-*.zip' -print)
           if [[ "${#packages[@]}" -ne 1 ]]; then
@@ -156,5 +177,5 @@ jobs:
           python extension/scripts/cws_publish.py \
             --publisher-id 3f669473-129b-48f0-942f-5f99d60af803 \
             --extension-id leojnckhalnjpfcpiabhdcgnnlfppdap \
-            --expected-version "${GITHUB_REF_NAME#v}" \
+            --expected-version "${RELEASE_TAG#v}" \
             --package "${packages[0]}"

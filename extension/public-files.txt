@@ -1,3 +1,4 @@
+.github/dependabot.yml
 .github/workflows/extension-release.yml
 extension/LICENSE
 extension/NETWORK.md
@@ -32,7 +33,9 @@ extension/tests/i18n.test.js
 extension/tests/parsers.test.js
 extension/tests/search-resolve.test.js
 extension/tests/security.test.js
+extension/tests/test_build_release.py
 extension/tests/test_cws_publish.py
+extension/tests/test_release_workflow.py
 tests/e2e/extension-specs/ad.mp4
 tests/e2e/extension-specs/episode.mp4
 tests/e2e/extension-specs/extension.spec.ts

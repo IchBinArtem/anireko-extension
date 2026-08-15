@@ -53,7 +53,7 @@ class CwsPublishTests(unittest.TestCase):
             "&& startsWith(github.ref, 'refs/tags/v')"
         )
 
-        self.assertEqual(3, workflow.count(pushed_tag_guard))
+        self.assertEqual(2, workflow.count(pushed_tag_guard))
 
     @mock.patch.object(cws_publish, "request_json")
     def test_check_only_never_mutates_store(self, request_json: mock.Mock) -> None:
