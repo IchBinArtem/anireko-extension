@@ -51,6 +51,9 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("attestations: write", release)
         self.assertIn("attest-build-provenance", release)
         self.assertIn("gh release create", release)
+        self.assertNotIn("actions/checkout", release)
+        self.assertIn("GH_REPO: ${{ github.repository }}", release)
+        self.assertIn('--repo "$GH_REPO"', release)
 
     def test_chrome_web_store_jobs_have_no_repository_write_access(self) -> None:
         for name in ("verify-chrome-web-store-access", "publish-chrome-web-store"):
@@ -108,6 +111,14 @@ class ReleaseWorkflowTests(unittest.TestCase):
             'python -m unittest discover -s extension/tests -p "test_*.py"',
             build,
         )
+
+    def test_every_pull_request_reports_the_required_check(self) -> None:
+        pull_request = self.workflow.split("  push:", maxsplit=1)[0]
+        self.assertIn("  pull_request:\n", pull_request)
+        self.assertNotIn("paths:", pull_request)
+
+        build = job_block(self.workflow, "verify-build")
+        self.assertIn("    name: verify-build", build)
 
     def test_dependabot_covers_actions_and_e2e_npm_dependencies(self) -> None:
         dependabot = DEPENDABOT.read_text(encoding="utf-8")
