@@ -212,8 +212,8 @@ test('recognizes anime before playback and confirms player after playback starts
     const record = Object.values(history?.records || {})[0] as { watchedSeconds?: number } | undefined;
     return record?.watchedSeconds || 0;
   }, { timeout: 25_000 }).toBeGreaterThan(3);
-  await popup.reload();
-
+  // The popup owns semantic-transition reloads through storage.onChanged.
+  // A second test-driven reload races the extension navigation and can abort it.
   await expect(popup.locator('#player-check')).toHaveClass(/success/);
   await expect(popup.locator('#episode')).toHaveText('Серия 2');
   await expect(popup.locator('#status')).toHaveText('смотрю');
@@ -300,7 +300,7 @@ test('connects playback through a visible two-level cross-origin iframe chain', 
     )) as { frameVisible?: boolean } | undefined;
     return nested?.frameVisible ?? null;
   }, { timeout: 10_000 }).not.toBe(true);
-  await popup.reload();
+  // Observe the product-owned semantic reload; do not start a competing navigation.
   await expect(popup.locator('#player-check')).not.toHaveClass(/success/);
   await page.close();
   await popup.close();
