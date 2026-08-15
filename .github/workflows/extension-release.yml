@@ -2,16 +2,13 @@ name: Extension release
 
 on:
   pull_request:
-    paths:
-      - "extension/**"
-      - "tests/e2e/extension-specs/**"
-      - "tests/e2e/playwright.extension.config.ts"
-      - ".github/workflows/extension-release.yml"
   push:
     paths:
       - "extension/**"
       - "tests/e2e/extension-specs/**"
       - "tests/e2e/playwright.extension.config.ts"
+      - "tests/e2e/package.json"
+      - "tests/e2e/package-lock.json"
       - ".github/workflows/extension-release.yml"
     tags: ["v*"]
   workflow_dispatch:
@@ -27,6 +24,7 @@ permissions:
 
 jobs:
   verify-build:
+    name: verify-build
     runs-on: ubuntu-latest
     permissions:
       contents: read
