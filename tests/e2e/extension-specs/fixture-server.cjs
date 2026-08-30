@@ -106,10 +106,46 @@ const pages = {
       <title>Расхититель гробниц — аниме</title>
     </head><body>
       <main><h1>Расхититель гробниц аниме</h1></main>
+      <button class="display-flex" id="unrelated-action">Показать описание</button>
       <iframe id="opaque-player" src="http://localhost:4178/empty-player.html" width="800" height="450"></iframe>
     </body></html>`],
   '/empty-player.html': ['text/html; charset=utf-8', `<!doctype html>
-    <html><body><div id="proprietary-player">no html5 video here</div></body></html>`],
+    <html><body><div id="proprietary-player">
+      <button id="start-player">Play</button>
+      <span>no html5 video here</span>
+    </div></body></html>`],
+  '/click-to-play-anime.html': ['text/html; charset=utf-8', `<!doctype html>
+    <html lang="ru"><head>
+      <meta charset="utf-8">
+      <meta property="og:title" content="Расхититель гробниц — смотреть аниме онлайн">
+      <title>Расхититель гробниц — аниме</title>
+    </head><body>
+      <main><h1>Расхититель гробниц аниме</h1></main>
+      <iframe id="click-player" src="http://localhost:4178/click-player.html" width="800" height="450"></iframe>
+    </body></html>`],
+  '/click-player.html': ['text/html; charset=utf-8', `<!doctype html>
+    <html><body><div id="provider-player">
+      <button id="start-player">Play</button>
+    </div><script>
+      document.getElementById('start-player').addEventListener('click', () => {
+        const video = document.createElement('video');
+        video.id = 'started-video';
+        video.src = '/episode.mp4';
+        video.muted = true;
+        video.style.cssText = 'display:block;width:800px;height:450px';
+        document.getElementById('provider-player').appendChild(video);
+        video.play();
+      });
+    </script></body></html>`],
+  '/missing-catalog-broken-anime.html': ['text/html; charset=utf-8', `<!doctype html>
+    <html lang="ru"><head>
+      <meta charset="utf-8">
+      <meta property="og:title" content="Совсем неизвестное аниме — смотреть онлайн">
+      <title>Совсем неизвестное аниме</title>
+    </head><body>
+      <main><h1>Совсем неизвестное аниме</h1></main>
+      <iframe id="opaque-player" src="http://localhost:4178/empty-player.html" width="800" height="450"></iframe>
+    </body></html>`],
   '/shell-player.html?episode=6&translations=false': ['text/html; charset=utf-8', `<!doctype html>
     <html><body><div id="proprietary-player">video starts only after user interaction</div></body></html>`],
   // Movie page: full-length video, no episode markup anywhere (KAN-2714).

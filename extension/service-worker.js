@@ -768,11 +768,11 @@ async function updateMatchBadge(tabId, state) {
   }
 }
 
-// Auto-report unreadable players (KAN-2715): anime recognized, the page has
-// player-ish structure, but no readable <video> appeared within the grace
-// period. Anonymous by design — fetch WITHOUT credentials, hostname only
-// (no path/query), structural probe only. Server stores 1 report/host/day;
-// client dedups per host for 7 days.
+// Auto-report unreadable players (KAN-2715): an exact/manual catalog match is
+// confirmed and the user actually interacted with a player, but no readable
+// <video> appeared within the grace period. Anonymous by design — fetch
+// WITHOUT credentials, hostname only (no path/query), structural probe only.
+// Server stores 1 report/host/day; client dedups per host for 7 days.
 const DIAG_DEDUP_MS = 7 * 24 * 3600 * 1000;
 const diagInFlight = new Set();
 const diagTimers = new Set();
@@ -820,7 +820,11 @@ const diagCycles = new Set();
 
 async function maybeScheduleDiagnostic(tabId) {
   const current = stateByTab[tabId];
-  if (!current?.recognition?.title || current.diagSentAt || current.diagDone
+  if (!current?.recognition?.title || !confirmedAnimeMatch(current.match)
+    || !Number.isFinite(current.playerInteractionAt)
+    || current.playerInteractionPageUrl !== (current.pageUrl || current.recognition.url)
+    || current.playerInteractionNavigationAt !== current.pageNavigationAt
+    || current.diagSentAt || current.diagDone
     || diagTimers.has(tabId)) return;
   const stored = await chrome.storage.local.get(['diag-grace-ms', PRIVACY_CONSENT_KEY]);
   if (stored[PRIVACY_CONSENT_KEY]?.diagnostics !== true) return;
@@ -829,14 +833,19 @@ async function maybeScheduleDiagnostic(tabId) {
   if (diagCycles.size > 500) diagCycles.clear();
   diagCycles.add(cycleKey);
   const graceMs = Number.isFinite(stored['diag-grace-ms']) ? stored['diag-grace-ms'] : 15000;
-  const delay = Math.max(500, current.recognition.observedAt + graceMs + 250 - Date.now());
+  const signalAt = Math.max(current.recognition.observedAt, current.playerInteractionAt);
+  const delay = Math.max(500, signalAt + graceMs + 250 - Date.now());
   scheduleDiagTimer(tabId, delay, 1, Math.max(graceMs, 5000));
 }
 
 async function maybeSendDiagnostic(current) {
   const recognition = current.recognition;
   const probe = current.probe;
-  if (!recognition?.title || !probe || current.diagSentAt) return;
+  if (!recognition?.title || !probe || !confirmedAnimeMatch(current.match)
+    || !Number.isFinite(current.playerInteractionAt)
+    || current.playerInteractionPageUrl !== (current.pageUrl || recognition.url)
+    || current.playerInteractionNavigationAt !== current.pageNavigationAt
+    || current.diagSentAt) return;
   const readablePlayer = Object.values(current.players || {})
     .some((player) => Number.isFinite(player.duration) && player.duration > 0);
   if (readablePlayer) {
@@ -851,7 +860,8 @@ async function maybeSendDiagnostic(current) {
   if (!playerSignal) return;
   const stored = await chrome.storage.local.get(['diag-grace-ms', 'diag-sent']);
   const graceMs = Number.isFinite(stored['diag-grace-ms']) ? stored['diag-grace-ms'] : 15000;
-  if (Date.now() - recognition.observedAt < graceMs) return;
+  const signalAt = Math.max(recognition.observedAt, current.playerInteractionAt);
+  if (Date.now() - signalAt < graceMs) return;
 
   let host;
   try {
@@ -1586,6 +1596,7 @@ async function updateTabState(message, sender, messageContext) {
   current.lastRejectReason = null;
   if (message.type === 'page-observed') {
     current.pageUrl = message.url;
+    current.pageNavigationAt ||= message.observedAt;
     if (message.probe) current.probe = message.probe;
   }
   if (message.type === 'probe-update') {
@@ -1609,11 +1620,25 @@ async function updateTabState(message, sender, messageContext) {
       current.probe = null;
       delete current.diagSentAt;
       delete current.diagDone;
+      delete current.playerInteractionAt;
+      delete current.playerInteractionPageUrl;
+      delete current.playerInteractionNavigationAt;
+      current.pageNavigationAt = message.observedAt;
     }
     current.recognition = message;
     current.pageUrl = message.url;
     if (titleSearchKey(current.match?.query) !== titleSearchKey(message.title)) {
       current.match = await resolveAnimeMatch(message.title);
+    }
+  }
+  if (message.type === 'player-interaction') {
+    if (!Number.isFinite(current.pageNavigationAt)
+      || message.observedAt <= current.pageNavigationAt) {
+      current.lastRejectReason = 'stale_player_interaction';
+    } else {
+      current.playerInteractionAt = message.observedAt;
+      current.playerInteractionPageUrl = current.pageUrl || current.recognition?.url || sender.tab.url;
+      current.playerInteractionNavigationAt = current.pageNavigationAt;
     }
   }
   if (message.type === 'voice-change') {

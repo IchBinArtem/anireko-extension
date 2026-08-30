@@ -16,6 +16,7 @@
   let metadataUrl = '';
   let observedUrl = '';
   let lastShadowScanAt = 0;
+  let playerInteractionReported = false;
   let extensionContextAlive = true;
   const documentToken = globalThis.__anirekoDocumentToken ||= globalThis.crypto?.randomUUID?.()
     || `${Date.now()}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
@@ -122,6 +123,30 @@
       if (shadow && shadow.querySelector('video, iframe')) return true;
     }
     return false;
+  }
+
+  function isPlayerInteractionTarget(target) {
+    const element = target instanceof Element ? target : target?.parentElement;
+    if (!element) return false;
+    if (element.closest(
+      'video, iframe, [id*="player" i], [class*="player" i]'
+    )) return true;
+    // Inside a cross-origin player frame, the clickable control may have a
+    // provider-specific name while its document still exposes a player shell.
+    return window !== window.top && hasPlayerElement();
+  }
+
+  function reportPlayerInteraction(event) {
+    if (playerInteractionReported || event.isTrusted !== true) return;
+    if (event.type === 'keydown' && !['Enter', ' ', 'Spacebar'].includes(event.key)) return;
+    if (!isPlayerInteractionTarget(event.target)) return;
+    playerInteractionReported = true;
+    safeSendMessage({
+      type: 'player-interaction',
+      interactionKind: event.type === 'keydown' ? 'keyboard' : 'pointer',
+      frameUrl: location.href,
+      observedAt: Date.now()
+    }).catch(() => {});
   }
 
   // Diagnostic DOM probe (KAN-2714): a compact structural summary of the top
@@ -593,6 +618,7 @@
     lastEpisode = null;
     eventEpisode = null;
     lastVoice = '';
+    playerInteractionReported = false;
     observedUrl = location.href;
     if (window === window.top) {
       reportPageObserved();
@@ -655,6 +681,12 @@
       attributeFilter: ['episode', 'data-episode', 'class', 'style', 'hidden', 'src']
     });
   }
+
+  document.addEventListener('pointerdown', reportPlayerInteraction, {
+    capture: true,
+    passive: true,
+  });
+  document.addEventListener('keydown', reportPlayerInteraction, true);
 
   function start() {
     const isTop = window === window.top;

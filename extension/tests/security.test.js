@@ -71,6 +71,12 @@ test('episode and voice signals reject malformed cross-frame payloads', () => {
   assert.equal(trust.validateSensorMessage({
     ...envelope, type: 'voice-change', voice: 'x'.repeat(101),
   }, sender, 'extension-id').reason, 'payload_invalid');
+  assert.equal(trust.validateSensorMessage({
+    ...envelope, type: 'player-interaction', interactionKind: 'pointer',
+  }, sender, 'extension-id').ok, true);
+  assert.equal(trust.validateSensorMessage({
+    ...envelope, type: 'player-interaction', interactionKind: 'synthetic',
+  }, sender, 'extension-id').reason, 'payload_invalid');
 });
 
 test('top-frame player hints require bounded HTTP iframe geometry and episode', () => {

@@ -736,7 +736,7 @@ test('detects a shadow-DOM web-component player and joins the host episode attri
   await page.close();
 });
 
-test('auto-reports a diagnostic when the anime is recognized but the player is unreadable', async () => {
+test('auto-report requires a confirmed anime and a real player interaction', async () => {
   // Diagnostics are a separate opt-in. Shrink the grace period so the test
   // can first prove default-off, then enable it explicitly.
   await worker.evaluate(async () => {
@@ -771,6 +771,20 @@ test('auto-reports a diagnostic when the anime is recognized but the player is u
     });
   });
   await page.reload();
+  await expect.poll(async () => {
+    const state = await storedTabState(tabId);
+    return state?.match?.status ?? null;
+  }, { timeout: 10_000 }).toBe('ok');
+  await page.waitForTimeout(2_000);
+  expect(await readDiagnostics()).toHaveLength(0);
+
+  // A generic CSS class containing "play" (display-flex) is not playback
+  // intent and must not re-open the noisy pre-play diagnostic path.
+  await page.locator('#unrelated-action').click();
+  await page.waitForTimeout(2_000);
+  expect(await readDiagnostics()).toHaveLength(0);
+
+  await page.frameLocator('#opaque-player').locator('#start-player').click();
   await expect.poll(readDiagnostics, { timeout: 10_000 }).toHaveLength(1);
   const [diagnostic] = await readDiagnostics();
   expect(diagnostic.host).toBe('127.0.0.2');
@@ -783,9 +797,61 @@ test('auto-reports a diagnostic when the anime is recognized but the player is u
   // Repeat visit to the same host must NOT produce a second report (7d dedup).
   const secondPage = await context.newPage();
   await secondPage.goto(`${siteBase}/broken-anime.html`);
+  await secondPage.frameLocator('#opaque-player').locator('#start-player').click();
   await secondPage.waitForTimeout(3_000);
   expect(await readDiagnostics()).toHaveLength(1);
   await secondPage.close();
+});
+
+test('does not report a click-to-load player that becomes readable after interaction', async () => {
+  await worker.evaluate(async () => {
+    const stored = await chrome.storage.local.get('privacy-consent');
+    await chrome.storage.local.set({
+      'diag-grace-ms': 1500,
+      'privacy-consent': { ...stored['privacy-consent'], diagnostics: true },
+    });
+  });
+  const page = await context.newPage();
+  await page.goto(`${siteBase}/click-to-play-anime.html`);
+  const tabId = await extensionTabId(`${siteBase}/click-to-play-anime.html`);
+  const readDiagnostics = () => worker.evaluate(async () =>
+    (await (await fetch('http://127.0.0.1:4178/__test/diagnostics')).json()));
+
+  await expect.poll(async () => (await storedTabState(tabId))?.match?.status ?? null, {
+    timeout: 10_000,
+  }).toBe('ok');
+  await page.waitForTimeout(2_000);
+  expect(await readDiagnostics()).toHaveLength(0);
+  await page.frameLocator('#click-player').locator('#start-player').click();
+  await expect.poll(async () => (await storedTabState(tabId))?.player?.duration ?? 0, {
+    timeout: 10_000,
+  }).toBeGreaterThan(0);
+  await page.waitForTimeout(2_000);
+  expect(await readDiagnostics()).toHaveLength(0);
+  await page.close();
+});
+
+test('does not report an interacted player when catalog recognition is unconfirmed', async () => {
+  await worker.evaluate(async () => {
+    const stored = await chrome.storage.local.get('privacy-consent');
+    await chrome.storage.local.set({
+      'diag-grace-ms': 1500,
+      'privacy-consent': { ...stored['privacy-consent'], diagnostics: true },
+    });
+  });
+  const page = await context.newPage();
+  await page.goto(`${siteBase}/missing-catalog-broken-anime.html`);
+  const tabId = await extensionTabId(`${siteBase}/missing-catalog-broken-anime.html`);
+  await expect.poll(async () => (await storedTabState(tabId))?.match?.status ?? null, {
+    timeout: 10_000,
+  }).toBe('none');
+
+  await page.frameLocator('#opaque-player').locator('#start-player').click();
+  await page.waitForTimeout(3_000);
+  const diagnostics = await worker.evaluate(async () =>
+    (await (await fetch('http://127.0.0.1:4178/__test/diagnostics')).json()));
+  expect(diagnostics).toHaveLength(0);
+  await page.close();
 });
 
 test('tracks a full-length movie without any episode markup', async () => {

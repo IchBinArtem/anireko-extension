@@ -4,6 +4,7 @@
   ]);
   const ALLOWED_TYPES = new Set([
     ...TOP_ONLY, 'detector-handshake', 'voice-change', 'episode-observed', 'player-progress',
+    'player-interaction',
     'frame-visibility',
   ]);
 
@@ -214,6 +215,10 @@
     }
     if (message.type === 'voice-change'
       && (typeof message.voice !== 'string' || message.voice.length < 1 || message.voice.length > 100)) {
+      return { ok: false, reason: 'payload_invalid' };
+    }
+    if (message.type === 'player-interaction'
+      && !['pointer', 'keyboard'].includes(message.interactionKind)) {
       return { ok: false, reason: 'payload_invalid' };
     }
     return {

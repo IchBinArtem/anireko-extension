@@ -176,6 +176,63 @@ test('navigation and tab removal invalidate per-tab action presentation caches',
   assert.equal(actionCalls.icon.length, 3, 'closed tab drops its presentation cache');
 });
 
+test('delayed player interaction cannot cross a same-document navigation epoch', async () => {
+  const { context, storage } = loadServiceWorker({
+    fetchImpl: async () => ({ ok: false, status: 404, json: async () => ({}) }),
+  });
+  context.statusIcon = (size, state) => ({ size, key: context.actionIconRenderKey(state) });
+  const now = Date.now();
+  const sender = { tab: { id: 10 }, frameId: 0, documentId: 'top-doc' };
+  const topContext = {
+    topFrame: true,
+    documentToken: 'top-token',
+    documentId: 'top-doc',
+    topOrigin: 'https://anime.example',
+    origin: 'https://anime.example',
+  };
+
+  await context.updateTabState({
+    type: 'page-observed',
+    url: 'https://anime.example/watch/old',
+    observedAt: now - 2_000,
+  }, sender, topContext);
+  await context.updateTabState({
+    type: 'page-observed',
+    url: 'https://anime.example/watch/new',
+    observedAt: now,
+  }, sender, topContext);
+
+  const frameSender = { tab: { id: 10 }, frameId: 1, documentId: 'player-doc' };
+  const frameContext = {
+    topFrame: false,
+    documentToken: 'player-token',
+    documentId: 'player-doc',
+    topOrigin: 'https://anime.example',
+    origin: 'https://player.example',
+  };
+  await context.updateTabState({
+    type: 'player-interaction',
+    interactionKind: 'pointer',
+    frameUrl: 'https://player.example/embed',
+    observedAt: now,
+  }, frameSender, frameContext);
+
+  let stored = (await storage.session.get('tab:10'))['tab:10'];
+  assert.equal(stored.playerInteractionAt, undefined);
+  assert.equal(stored.lastRejectReason, 'stale_player_interaction');
+
+  await context.updateTabState({
+    type: 'player-interaction',
+    interactionKind: 'pointer',
+    frameUrl: 'https://player.example/embed',
+    observedAt: now + 1,
+  }, frameSender, frameContext);
+  stored = (await storage.session.get('tab:10'))['tab:10'];
+  assert.equal(stored.playerInteractionAt, now + 1);
+  assert.equal(stored.playerInteractionNavigationAt, now);
+  assert.equal(stored.playerInteractionPageUrl, 'https://anime.example/watch/new');
+});
+
 test('failed action icon writes are retried and cached only after success', async () => {
   const { context, chrome, actionCalls } = loadServiceWorker({
     fetchImpl: async () => ({ ok: false, status: 404, json: async () => ({}) }),
