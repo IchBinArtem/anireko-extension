@@ -237,28 +237,39 @@
 
   function renderStats(history) {
     const now = new Date();
-    const today = history?.days?.[dateKey(now)] || { watchedSeconds: 0, episodeKeys: [] };
-    set('today-time', t('minutesShort', String(Math.round(today.watchedSeconds / 60))));
-    set('today-episodes', countLabel('episodeCount', today.episodeKeys.length));
-    const days = [];
-    for (let offset = 6; offset >= 0; offset -= 1) {
-      const date = new Date(now);
-      date.setDate(now.getDate() - offset);
-      const value = history?.days?.[dateKey(date)]?.watchedSeconds || 0;
-      days.push({ date, value, today: offset === 0 });
-    }
-    const max = Math.max(60, ...days.map((day) => day.value));
+    const today = history?.days?.[dateKey(now)];
+    set('today-time', typeof today?.watchedSeconds === 'number' && Number.isFinite(today.watchedSeconds) && today.watchedSeconds >= 0
+      ? t('minutesShort', String(Math.floor(today.watchedSeconds / 60))) : t('activityUnknown'));
+    set('today-episodes', countLabel('episodeCount', Array.isArray(today?.episodeKeys) ? today.episodeKeys.length : 0));
+    document.getElementById('today-episodes').title = t('activityEpisodesDetail');
+    const days = AniRekoActivity.calendar(history, now);
     const chart = document.getElementById('week-chart');
-    chart.replaceChildren(...days.map((day) => {
-      const column = document.createElement('div');
-      column.className = `day-bar${day.today ? ' today' : ''}`;
-      column.title = t('minutesShort', String(Math.round(day.value / 60)));
-      const bar = document.createElement('i');
-      bar.style.height = `${Math.max(2, Math.round(day.value / max * 18))}px`;
-      const label = document.createElement('span');
-      label.textContent = day.date.toLocaleDateString(dateLocale, { weekday: 'short' }).replace('.', '');
-      column.append(bar, label);
-      return column;
+    chart.replaceChildren(...days.map((day, index) => {
+      const cell = document.createElement('button');
+      cell.type = 'button';
+      cell.className = `activity-cell level-${day.level ?? 'unknown'}${day.today ? ' today' : ''}`;
+      const label = `${day.date.toLocaleDateString(dateLocale, { day: 'numeric', month: 'short', year: 'numeric' })} · ${day.seconds === null
+        ? t('activityUnknown') : t('minutesShort', String(Math.floor(day.seconds / 60)))}`;
+      cell.title = label;
+      cell.setAttribute('aria-label', label);
+      cell.tabIndex = day.today ? 0 : -1;
+      const showDetail = () => set('activity-detail', label);
+      cell.addEventListener('focus', () => {
+        for (const item of chart.children) item.tabIndex = item === cell ? 0 : -1;
+        showDetail();
+      });
+      cell.addEventListener('keydown', (event) => {
+        const moves = { ArrowLeft: -7, ArrowRight: 7, ArrowUp: -1, ArrowDown: 1 };
+        const target = event.key === 'Home' ? 0 : event.key === 'End' ? days.length - 1
+          : Object.hasOwn(moves, event.key) ? Math.max(0, Math.min(days.length - 1, index + moves[event.key])) : null;
+        if (target !== null) {
+          event.preventDefault();
+          chart.children[target].focus();
+        }
+      });
+      cell.addEventListener('pointerenter', showDetail);
+      cell.addEventListener('click', showDetail);
+      return cell;
     }));
   }
 

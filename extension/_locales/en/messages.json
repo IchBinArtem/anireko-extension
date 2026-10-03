@@ -184,5 +184,11 @@
   "resetManualMatch": { "message": "Reset binding" },
   "resettingManualMatch": { "message": "Resetting binding…" },
   "chooseAnimeBeforeSync": { "message": "Choose the anime first" },
-  "syncFailed": { "message": "Sync failed" }
+  "syncFailed": { "message": "Sync failed" },
+  "activityHeading": { "message": "Activity · last 12 weeks · this browser" },
+  "activityCalendarAria": { "message": "Daily recorded watch time over the last twelve weeks" },
+  "activityHint": { "message": "Select a square for its date and recorded watch time." },
+  "activityLegend": { "message": "Green: <15 / 15–29 / 30–59 / 60+ min. Striped: no record, not necessarily zero." },
+  "activityUnknown": { "message": "No record" },
+  "activityEpisodesDetail": { "message": "Episodes with recorded activity, not necessarily completed episodes" }
 }

@@ -184,5 +184,11 @@
   "resetManualMatch": { "message": "Сбросить привязку" },
   "resettingManualMatch": { "message": "Сбрасываем привязку…" },
   "chooseAnimeBeforeSync": { "message": "Сначала выберите аниме" },
-  "syncFailed": { "message": "Не удалось синхронизировать" }
+  "syncFailed": { "message": "Не удалось синхронизировать" },
+  "activityHeading": { "message": "Активность · 12 недель · этот браузер" },
+  "activityCalendarAria": { "message": "Записанное время просмотра по дням за последние двенадцать недель" },
+  "activityHint": { "message": "Выберите квадратик: дата и записанное время просмотра." },
+  "activityLegend": { "message": "Зелёный: <15 / 15–29 / 30–59 / 60+ мин. Штриховка: нет записи, не обязательно ноль." },
+  "activityUnknown": { "message": "Нет записи" },
+  "activityEpisodesDetail": { "message": "Серии с записанной активностью, не обязательно досмотренные" }
 }

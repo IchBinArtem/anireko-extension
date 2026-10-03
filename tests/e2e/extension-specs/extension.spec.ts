@@ -4,9 +4,10 @@ import os from 'node:os';
 import path from 'node:path';
 
 const sourceExtensionPath = path.resolve(__dirname, '../../../extension');
-const apiBase = 'http://127.0.0.1:4178';
-const siteBase = 'http://127.0.0.2:4178';
-const playerBase = 'http://localhost:4178';
+const fixturePort = Number(process.env.ANIREKO_EXTENSION_FIXTURE_PORT || 4178);
+const apiBase = `http://127.0.0.1:${fixturePort}`;
+const siteBase = `http://127.0.0.2:${fixturePort}`;
+const playerBase = `http://localhost:${fixturePort}`;
 
 let context: BrowserContext;
 let worker: Worker;
@@ -92,7 +93,7 @@ test.beforeAll(async () => {
   fs.writeFileSync(path.join(extensionPath, 'lib', 'runtime-config.js'), `
 (function initRuntimeConfig(global) {
   global.AniRekoRuntimeConfig = Object.freeze({
-    apiBase: 'http://127.0.0.1:4178',
+    apiBase: '${apiBase}',
     testMode: true,
   });
 })(typeof globalThis !== 'undefined' ? globalThis : self);
@@ -141,12 +142,57 @@ test.afterAll(async () => {
 
 test.beforeEach(async () => {
   await worker.evaluate(async () => {
-    await fetch('http://127.0.0.1:4178/__test/reset');
+    await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/reset');
     (globalThis as any).AniRekoTestHooks.resetVolatileCaches();
     const access = await chrome.storage.local.get(['privacy-consent']);
     await chrome.storage.local.clear();
     await chrome.storage.local.set(access);
   });
+});
+
+test('renders browser-local activity as a calm calendar with honest missing days', async () => {
+  const page = await context.newPage();
+  await page.goto(`${siteBase}/anime.html`);
+  const tabId = await extensionTabId(`${siteBase}/*`);
+  await expect.poll(async () => (await storedTabState(tabId))?.match?.status).toBe('ok');
+  await worker.evaluate(async () => {
+    const now = new Date();
+    const key = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+    const boundaryDays = Object.fromEntries([899, 1799, 3599].map((seconds, index) => {
+      const day = new Date(now);
+      day.setDate(day.getDate() - index - 1);
+      const date = `${day.getFullYear()}-${String(day.getMonth() + 1).padStart(2, '0')}-${String(day.getDate()).padStart(2, '0')}`;
+      return [date, { watchedSeconds: seconds, episodeKeys: [] }];
+    }));
+    await chrome.storage.local.set({ 'watch-history': { records: {}, days: {
+      [key]: { watchedSeconds: 3600, episodeKeys: ['example::1'] },
+      ...boundaryDays,
+      '2025-01-01': { watchedSeconds: 100000, episodeKeys: [] },
+    } } });
+    (globalThis as any).AniRekoTestHooks.resetVolatileCaches();
+  });
+  const popup = await openPopup(tabId);
+  await popup.setViewportSize({ width: 390, height: 900 });
+  expect(await popup.evaluate(async () => Object.keys((await chrome.storage.local.get('watch-history'))['watch-history'].days))).toHaveLength(5);
+  await expect(popup.locator('#week-chart .activity-cell')).toHaveCount(84);
+  await expect(popup.locator('#week-chart .level-unknown')).toHaveCount(80);
+  await expect(popup.locator('.activity-cell.level-1')).toHaveAttribute('aria-label', /14 мин/);
+  await expect(popup.locator('.activity-cell.level-2')).toHaveAttribute('aria-label', /29 мин/);
+  await expect(popup.locator('.activity-cell.level-3')).toHaveAttribute('aria-label', /59 мин/);
+  await expect(popup.locator('.activity-heading')).toContainText('этот браузер');
+  await expect(popup.locator('.activity-cell.today')).toHaveClass(/level-4/);
+  await popup.locator('.activity-cell.today').click();
+  await expect(popup.locator('#activity-detail')).toContainText('60 мин');
+  await expect(popup.locator('#today-episodes')).toHaveAttribute('title', /не обязательно досмотренные/);
+  await expect(popup.locator('.activity-cell.today')).toHaveCSS('background-color', 'rgb(52, 211, 153)');
+  await expect(popup.locator('.activity-cell[tabindex="0"]')).toHaveCount(1);
+  await popup.locator('.activity-cell.today').press('ArrowLeft');
+  await expect(popup.locator('#activity-detail')).toContainText('Нет записи');
+  await popup.locator('.activity-cell.level-unknown').first().focus();
+  await expect(popup.locator('#activity-detail')).toContainText('Нет записи');
+  await popup.screenshot({ path: test.info().outputPath('activity-heatmap.png'), fullPage: true });
+  await popup.close();
+  await page.close();
 });
 
 test('renders the English manifest and popup for an English Chrome UI', async () => {
@@ -238,7 +284,7 @@ test('recognizes anime before playback and confirms player after playback starts
   await expect(popup.locator('#anireko-match')).toHaveText('В каталоге: Расхититель гробниц (2024)');
   await expect(popup.locator('#anime-primary-action')).toHaveText('Открыть в AniReko →');
   await expect(popup.locator('#anime-primary-action'))
-    .toHaveAttribute('href', 'http://127.0.0.1:4178/ru/anime/tomb-raider-4242');
+    .toHaveAttribute('href', `${apiBase}/ru/anime/tomb-raider-4242`);
   await expect(popup.locator('#voice')).toHaveText('AniTime Voice');
   await expect(popup.locator('.local-pill')).toHaveText('локально');
   await expect(popup.locator('#account-label')).toHaveText('Авторизация — через сайт AniReko');
@@ -332,7 +378,7 @@ test('falls back to player URL episode and labeled combobox voice', async () => 
       'auto-mark': true,
       'sync-account': { id: 18, name: 'TestUser' },
     });
-    await fetch('http://127.0.0.1:4178/__test/session?on=1&user=18');
+    await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/session?on=1&user=18');
   });
   const page = await context.newPage();
   await page.goto(`${siteBase}/url-metadata-anime.html`);
@@ -356,7 +402,7 @@ test('falls back to player URL episode and labeled combobox voice', async () => 
   await page.frameLocator('#main-player').locator('#url-video')
     .evaluate((video) => (video as HTMLVideoElement).pause());
   const readProgress = () => worker.evaluate(async () =>
-    (await (await fetch('http://127.0.0.1:4178/__test/progress')).json()));
+    (await (await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/progress')).json()));
   await expect.poll(async () => (await readProgress()).at(-1)?.episode ?? null).toBe(8);
   const urlDerivedProgress = (await readProgress()).at(-1);
   expect(urlDerivedProgress.voice).toBe('AniDUB');
@@ -419,7 +465,7 @@ test('shows only an anime-not-found state and manually reports a recognition mis
   // after beforeEach reset. Clear counters at this test's observation boundary
   // so only requests caused by this generic-page popup are measured.
   await worker.evaluate(async () => {
-    await fetch('http://127.0.0.1:4178/__test/reset');
+    await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/reset');
   });
   const popup = await openPopup(tabId);
   await expect(popup.locator('#anime-check-title')).toHaveText('Аниме не найдено');
@@ -433,13 +479,13 @@ test('shows only an anime-not-found state and manually reports a recognition mis
   }
 
   const before = await worker.evaluate(async () =>
-    (await (await fetch('http://127.0.0.1:4178/__test/request-counts')).json()));
+    (await (await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/request-counts')).json()));
   expect(before).toMatchObject({ search: 0, sessionInfo: 0, diagnostics: 0 });
 
   await popup.locator('#report-anime-miss').click();
   await expect(popup.locator('#report-anime-miss')).toHaveText('Отправлено, спасибо');
   const diagnostics = await worker.evaluate(async () =>
-    (await (await fetch('http://127.0.0.1:4178/__test/diagnostics')).json()));
+    (await (await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/diagnostics')).json()));
   expect(diagnostics).toHaveLength(1);
   expect(diagnostics[0]).toMatchObject({
     report_kind: 'recognition_miss',
@@ -453,7 +499,7 @@ test('shows only an anime-not-found state and manually reports a recognition mis
   expect(serialized).not.toContain('Kimi WebBridge');
 
   const after = await worker.evaluate(async () =>
-    (await (await fetch('http://127.0.0.1:4178/__test/request-counts')).json()));
+    (await (await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/request-counts')).json()));
   expect(after).toMatchObject({ search: 0, sessionInfo: 0, diagnostics: 1 });
   await popup.close();
   await page.close();
@@ -469,7 +515,7 @@ test('detects a disconnected old document despite saved recognition and recovers
   // session recognition remains saved, but the detector no longer responds.
   await worker.evaluate(async (id) => {
     await chrome.tabs.sendMessage(id, { type: 'anireko-disable-detector' }, { frameId: 0 });
-    await fetch('http://127.0.0.1:4178/__test/reset');
+    await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/reset');
   }, tabId);
   let navigations = 0;
   page.on('framenavigated', (frame) => { if (frame === page.mainFrame()) navigations += 1; });
@@ -490,7 +536,7 @@ test('detects a disconnected old document despite saved recognition and recovers
   await cancelDialog;
   expect(navigations).toBe(0);
   const counts = await worker.evaluate(async () =>
-    (await (await fetch('http://127.0.0.1:4178/__test/request-counts')).json()));
+    (await (await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/request-counts')).json()));
   expect(counts.diagnostics).toBe(0);
 
   const navigation = page.waitForEvent('framenavigated', (frame) => frame === page.mainFrame());
@@ -519,14 +565,14 @@ test('does not render old-document recognition when a new detector is connected 
   const oldState = await storedTabState(tabId);
   await worker.evaluate(async () => {
     (globalThis as any).AniRekoTestHooks.resetVolatileCaches();
-    await fetch('http://127.0.0.1:4178/__test/session?on=1&user=18');
-    await fetch('http://127.0.0.1:4178/__test/taste-hold?on=1');
+    await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/session?on=1&user=18');
+    await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/taste-hold?on=1');
   });
   try {
     // A real old-document sensor message blocks on the held taste API response.
     await page.frameLocator('#main-player').locator('#episode-select').selectOption({ label: '12 серия' });
     await expect.poll(() => worker.evaluate(async () =>
-      (await (await fetch('http://127.0.0.1:4178/__test/taste-hold')).json()).pending)).toBeGreaterThan(0);
+      (await (await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/taste-hold')).json()).pending)).toBeGreaterThan(0);
     await page.reload();
     await expect.poll(() => worker.evaluate(async (id) =>
       (await chrome.tabs.sendMessage(id, { type: 'anireko-detector-status' }, { frameId: 0 })).documentToken,
@@ -538,13 +584,13 @@ test('does not render old-document recognition when a new detector is connected 
     await expect(popup.locator('#not-found-report')).toBeHidden();
     await expect(popup.locator('#automark')).toBeHidden();
     await worker.evaluate(async () => {
-      await fetch('http://127.0.0.1:4178/__test/taste-hold?on=0');
+      await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/taste-hold?on=0');
     });
     await expect(popup.locator('#anime-check-title')).toHaveText('Аниме найдено');
     await popup.close();
   } finally {
     await worker.evaluate(async () => {
-      await fetch('http://127.0.0.1:4178/__test/taste-hold?on=0');
+      await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/taste-hold?on=0');
     });
     await page.close();
   }
@@ -592,7 +638,7 @@ test('does not mistake a restricted browser page for an anime recognition miss',
 
 test('requires a choice for duplicate exact matches, stores it locally, and syncs immediately', async () => {
   await worker.evaluate(async () => {
-    await fetch('http://127.0.0.1:4178/__test/session?on=1&user=18');
+    await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/session?on=1&user=18');
     await chrome.storage.local.set({
       'auto-mark': true,
       'sync-account': { id: 18, name: 'TestUser' },
@@ -633,12 +679,12 @@ test('requires a choice for duplicate exact matches, stores it locally, and sync
   )).not.toBe('!');
   await expect.poll(async () => {
     const posts = await worker.evaluate(async () =>
-      (await (await fetch('http://127.0.0.1:4178/__test/progress')).json()));
+      (await (await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/progress')).json()));
     return posts.at(-1)?.anime_id ?? null;
   }).toBe(19119);
   await expect.poll(async () => {
     const posts = await worker.evaluate(async () =>
-      (await (await fetch('http://127.0.0.1:4178/__test/status-posts')).json()));
+      (await (await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/status-posts')).json()));
     return posts.at(-1)?.status ?? null;
   }).toBe('watching');
 
@@ -894,7 +940,7 @@ test('auto-report requires a confirmed anime and a real player interaction', asy
 
   // Auto-report (KAN-2715): exactly one anonymous POST, hostname only.
   const readDiagnostics = () => worker.evaluate(async () =>
-    (await (await fetch('http://127.0.0.1:4178/__test/diagnostics')).json()));
+    (await (await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/diagnostics')).json()));
   await page.waitForTimeout(2_000);
   expect(await readDiagnostics()).toHaveLength(0);
   await worker.evaluate(async () => {
@@ -948,7 +994,7 @@ test('does not report a click-to-load player that becomes readable after interac
   await page.goto(`${siteBase}/click-to-play-anime.html`);
   const tabId = await extensionTabId(`${siteBase}/click-to-play-anime.html`);
   const readDiagnostics = () => worker.evaluate(async () =>
-    (await (await fetch('http://127.0.0.1:4178/__test/diagnostics')).json()));
+    (await (await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/diagnostics')).json()));
 
   await expect.poll(async () => (await storedTabState(tabId))?.match?.status ?? null, {
     timeout: 10_000,
@@ -982,7 +1028,7 @@ test('does not report an interacted player when catalog recognition is unconfirm
   await page.frameLocator('#opaque-player').locator('#start-player').click();
   await page.waitForTimeout(3_000);
   const diagnostics = await worker.evaluate(async () =>
-    (await (await fetch('http://127.0.0.1:4178/__test/diagnostics')).json()));
+    (await (await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/diagnostics')).json()));
   expect(diagnostics).toHaveLength(0);
   await page.close();
 });
@@ -1019,7 +1065,7 @@ test('shows episode and voice from an unstarted proprietary iframe shell', async
       'auto-mark': true,
       'sync-account': { id: 18, name: 'TestUser' },
     });
-    await fetch('http://127.0.0.1:4178/__test/session?on=1&user=18');
+    await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/session?on=1&user=18');
   });
   const page = await context.newPage();
   await page.goto(`${siteBase}/shell-anime.html`);
@@ -1052,7 +1098,7 @@ test('manual sync sends saved terminal progress after reload leaves the player u
       'auto-mark': true,
       'sync-account': { id: 18, name: 'TestUser' },
     });
-    await fetch('http://127.0.0.1:4178/__test/session?on=1&user=18');
+    await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/session?on=1&user=18');
   });
   const page = await context.newPage();
   await page.goto(`${siteBase}/shell-terminal-anime.html`);
@@ -1099,7 +1145,7 @@ test('manual sync sends saved terminal progress after reload leaves the player u
   await syncButton.click();
   await expect(syncButton).toHaveText('✓ обновлено');
   const progress = await worker.evaluate(async () =>
-    (await (await fetch('http://127.0.0.1:4178/__test/progress')).json()));
+    (await (await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/progress')).json()));
   expect(progress.at(-1)).toMatchObject({
     anime_id: 4242,
     episode: 12,
@@ -1108,7 +1154,7 @@ test('manual sync sends saved terminal progress after reload leaves the player u
     expected_user_id: 18,
   });
   const status = await worker.evaluate(async () =>
-    (await (await fetch('http://127.0.0.1:4178/__test/status-posts')).json()));
+    (await (await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/status-posts')).json()));
   expect(status).toEqual([{ anime_id: 4242, status: 'completed', expected_user_id: 18 }]);
   const migratedAnimeId = await worker.evaluate(async () => {
     const history = (await chrome.storage.local.get('watch-history'))['watch-history'];
@@ -1126,8 +1172,8 @@ test('manual sync shows a failure when saved progress exists but the write is re
       'auto-mark': true,
       'sync-account': { id: 18, name: 'TestUser' },
     });
-    await fetch('http://127.0.0.1:4178/__test/session?on=1&user=18');
-    await fetch('http://127.0.0.1:4178/__test/fail-progress-writes?on=1');
+    await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/session?on=1&user=18');
+    await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/fail-progress-writes?on=1');
   });
   const page = await context.newPage();
   await page.goto(`${siteBase}/shell-terminal-anime.html`);
@@ -1166,7 +1212,7 @@ test('manual sync shows a failure when saved progress exists but the write is re
   await syncButton.click();
   await expect(syncButton).toHaveText('Не удалось синхронизировать');
   const progress = await worker.evaluate(async () =>
-    (await (await fetch('http://127.0.0.1:4178/__test/progress')).json()));
+    (await (await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/progress')).json()));
   expect(progress).toEqual([]);
 
   await popup.close();
@@ -1179,7 +1225,7 @@ test('auto-marks watching on a completed episode 2+ even without earlier local h
       'auto-mark': true,
       'sync-account': { id: 18, name: 'TestUser' },
     });
-    await fetch('http://127.0.0.1:4178/__test/session?on=1');
+    await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/session?on=1');
   });
   const page = await context.newPage();
   await page.goto(`${siteBase}/anime.html`);
@@ -1197,7 +1243,7 @@ test('auto-marks watching on a completed episode 2+ even without earlier local h
   await expect.poll(async () => (await storedTabState(tabId))?.player?.watched ?? false)
     .toBe(true);
   const readPosts = () => worker.evaluate(async () =>
-    (await (await fetch('http://127.0.0.1:4178/__test/status-posts')).json()));
+    (await (await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/status-posts')).json()));
   await page.waitForTimeout(2_000);
   expect(await readPosts()).toHaveLength(0);
 
@@ -1255,8 +1301,8 @@ test('promotes watching to completed once on finished episode 12 of 12', async (
         },
       },
     });
-    await fetch('http://127.0.0.1:4178/__test/session?on=1&user=18');
-    await fetch('http://127.0.0.1:4178/__test/watch-status?value=watching');
+    await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/session?on=1&user=18');
+    await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/watch-status?value=watching');
   });
   const page = await context.newPage();
   await page.goto(`${siteBase}/anime.html`);
@@ -1271,18 +1317,18 @@ test('promotes watching to completed once on finished episode 12 of 12', async (
   });
 
   const readPosts = () => worker.evaluate(async () =>
-    (await (await fetch('http://127.0.0.1:4178/__test/status-posts')).json()));
+    (await (await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/status-posts')).json()));
   await expect.poll(readPosts, { timeout: 15_000 })
     .toEqual([{ anime_id: 4242, status: 'completed', expected_user_id: 18 }]);
   const countsAfterTransition = await worker.evaluate(async () =>
-    (await (await fetch('http://127.0.0.1:4178/__test/request-counts')).json()));
+    (await (await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/request-counts')).json()));
   expect(countsAfterTransition.search).toBe(1);
 
   // More watched ticks are folded by the local transition key before the
   // account/session lookup, not merely before the final POST.
   await page.waitForTimeout(6_000);
   const countsAfterMoreTicks = await worker.evaluate(async () =>
-    (await (await fetch('http://127.0.0.1:4178/__test/request-counts')).json()));
+    (await (await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/request-counts')).json()));
   expect(countsAfterMoreTicks.search).toBe(countsAfterTransition.search);
   expect(countsAfterMoreTicks.statusPosts).toBe(countsAfterTransition.statusPosts);
   await page.close();
@@ -1290,7 +1336,7 @@ test('promotes watching to completed once on finished episode 12 of 12', async (
 
 test('scopes taste cache to the live AniReko account', async () => {
   await worker.evaluate(async () => {
-    await fetch('http://127.0.0.1:4178/__test/session?on=1&user=18');
+    await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/session?on=1&user=18');
   });
   const page = await context.newPage();
   await page.goto(`${siteBase}/anime.html`);
@@ -1298,7 +1344,7 @@ test('scopes taste cache to the live AniReko account', async () => {
   await expect.poll(async () => (await storedTabState(tabId))?.taste?.percent ?? null).toBe(87);
 
   await worker.evaluate(async () => {
-    await fetch('http://127.0.0.1:4178/__test/session?on=1&user=953');
+    await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/session?on=1&user=953');
   });
   const accountPopup = await openPopup(tabId);
   await expect(accountPopup.locator('#account-label')).toContainText('Demo YooKassa');
@@ -1321,7 +1367,7 @@ test('syncs resume progress on pause (episode, position, voice — no URL)', asy
       'auto-mark': true,
       'sync-account': { id: 18, name: 'TestUser' },
     });
-    await fetch('http://127.0.0.1:4178/__test/session?on=1&user=18');
+    await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/session?on=1&user=18');
   });
   const page = await context.newPage();
   await page.goto(`${siteBase}/anime.html`);
@@ -1338,7 +1384,7 @@ test('syncs resume progress on pause (episode, position, voice — no URL)', asy
     .evaluate((video) => (video as HTMLVideoElement).pause());
 
   const readProgress = () => worker.evaluate(async () =>
-    (await (await fetch('http://127.0.0.1:4178/__test/progress')).json()));
+    (await (await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/progress')).json()));
   await expect.poll(async () => {
     const progress = await readProgress();
     return progress[progress.length - 1]?.position_sec ?? null;
@@ -1387,9 +1433,9 @@ test('serializes progress writes and restores the final state after a cold worke
       'auto-mark': true,
       'sync-account': { id: 18, name: 'TestUser' },
     });
-    await fetch('http://127.0.0.1:4178/__test/session?on=1&user=18');
+    await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/session?on=1&user=18');
     const state = {
-      sourceOrigin: 'http://127.0.0.2:4178',
+      sourceOrigin: (globalThis as any).AniRekoRuntimeConfig.apiBase.replace('127.0.0.1', '127.0.0.2'),
       match: { status: 'ok', exact: true, animeId: 4242 },
       player: { playbackStarted: true, currentTime: 100, duration: 310, episode: 2, voice: 'AniTime Voice' },
       recognition: { voice: 'AniTime Voice' },
@@ -1401,16 +1447,16 @@ test('serializes progress writes and restores the final state after a cold worke
     await Promise.all([first, second]);
   });
   const counts = await worker.evaluate(async () =>
-    (await (await fetch('http://127.0.0.1:4178/__test/request-counts')).json()));
+    (await (await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/request-counts')).json()));
   expect(counts.maxProgressPostsInFlight).toBe(1);
   const directPosts = await worker.evaluate(async () =>
-    (await (await fetch('http://127.0.0.1:4178/__test/progress')).json()));
+    (await (await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/progress')).json()));
   expect(directPosts.map((post: { position_sec: number }) => post.position_sec)).toEqual([100, 200]);
 
   const coldTabId = 987654;
   await worker.evaluate(async ({ id, key }) => {
     const state = {
-      sourceOrigin: 'http://127.0.0.2:4178',
+      sourceOrigin: (globalThis as any).AniRekoRuntimeConfig.apiBase.replace('127.0.0.1', '127.0.0.2'),
       match: { status: 'ok', exact: true, animeId: 4242 },
       recognition: { voice: 'AniTime Voice' },
       player: {
@@ -1428,7 +1474,7 @@ test('serializes progress writes and restores the final state after a cold worke
   }, { id: coldTabId, key: `tab:${coldTabId}` });
   await expect.poll(async () => {
     const posts = await worker.evaluate(async () =>
-      (await (await fetch('http://127.0.0.1:4178/__test/progress')).json()));
+      (await (await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/progress')).json()));
     return posts.at(-1)?.position_sec ?? null;
   }, { timeout: 10_000 }).toBe(240);
 });
@@ -1439,8 +1485,8 @@ test('pauses sync when the site cookie switches to another account until explici
       'auto-mark': true,
       'sync-account': { id: 18, name: 'TestUser' },
     });
-    await fetch('http://127.0.0.1:4178/__test/session?on=1&user=18');
-    await fetch('http://127.0.0.1:4178/__test/session?on=1&user=953');
+    await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/session?on=1&user=18');
+    await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/session?on=1&user=953');
   });
   const page = await context.newPage();
   await page.goto(`${siteBase}/anime.html`);
@@ -1453,7 +1499,7 @@ test('pauses sync when the site cookie switches to another account until explici
   await expect(popup.locator('#resume-sync')).toBeDisabled();
 
   const before = await worker.evaluate(async () =>
-    (await (await fetch('http://127.0.0.1:4178/__test/progress')).json()).length);
+    (await (await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/progress')).json()).length);
   await worker.evaluate(async () => {
     await eval('maybeSyncProgress')({
       match: { status: 'ok', exact: true, animeId: 4242 },
@@ -1463,7 +1509,7 @@ test('pauses sync when the site cookie switches to another account until explici
   });
   await page.waitForTimeout(300);
   const afterBlocked = await worker.evaluate(async () =>
-    (await (await fetch('http://127.0.0.1:4178/__test/progress')).json()).length);
+    (await (await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/progress')).json()).length);
   expect(afterBlocked).toBe(before);
 
   popup.once('dialog', (dialog) => dialog.accept());
@@ -1475,7 +1521,7 @@ test('pauses sync when the site cookie switches to another account until explici
       'auto-mark': true,
       'sync-account': { id: 18, name: 'TestUser' },
     });
-    await fetch('http://127.0.0.1:4178/__test/session?on=1&user=18');
+    await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/session?on=1&user=18');
   });
   await popup.close();
   await page.close();
@@ -1513,7 +1559,7 @@ test('keeps the visible episodic player active when a hidden short video is also
 });
 
 test('native Chrome host access detects an unseen site and its cross-origin player', async () => {
-  const unseenOrigin = 'http://127.0.0.3:4178';
+  const unseenOrigin = `http://127.0.0.3:${fixturePort}`;
   const page = await context.newPage();
   await page.goto(`${unseenOrigin}/anime.html`);
   const tabId = await extensionTabId(`${unseenOrigin}/*`);

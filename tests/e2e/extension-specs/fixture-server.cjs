@@ -3,6 +3,10 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 let sessionUser = null;
+const fixturePort = Number(process.env.ANIREKO_EXTENSION_FIXTURE_PORT || 4178);
+if (!Number.isInteger(fixturePort) || fixturePort < 1024 || fixturePort > 65535) {
+  throw new Error('invalid_extension_fixture_port');
+}
 let watchStatus = null;
 let sessionInfoRequests = 0;
 let searchRequests = 0;
@@ -700,7 +704,7 @@ const server = http.createServer((request, response) => {
     'content-type': contentType,
     'cache-control': 'no-store',
   });
-  response.end(body);
+  response.end(typeof body === 'string' ? body.replaceAll(':4178', `:${fixturePort}`) : body);
 });
 
 function startFixtureServer() {
@@ -716,7 +720,7 @@ function startFixtureServer() {
     };
     server.once('error', onError);
     server.once('listening', onListening);
-    server.listen(4178, '0.0.0.0');
+    server.listen(fixturePort, '0.0.0.0');
   });
 }
 

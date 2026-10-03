@@ -8,6 +8,7 @@ popup.css
 popup.js
 content/media-detector.js
 lib/api-client.js
+lib/activity.js
 lib/auto-mark.js
 lib/progress.js
 lib/recognition.js

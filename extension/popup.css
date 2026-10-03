@@ -202,11 +202,17 @@ h1 { margin: 0; font-size: 17px; line-height: 1.15; letter-spacing: -.02em; }
 .stats-head { display: flex; align-items: baseline; gap: 6px; color: #cbd5e1; font-size: 10.5px; }
 .stats-head > strong { color: #f8fafc; font-size: 11.5px; }
 .local-pill { margin-left: auto; padding: 3px 6px; border-radius: 999px; background: #263244; color: var(--muted); font-size: 8.5px; }
-.week-chart { display: grid; grid-template-columns: repeat(7, 1fr); align-items: end; gap: 5px; height: 32px; margin-top: 7px; }
-.day-bar { display: grid; grid-template-rows: 19px 9px; align-items: end; gap: 2px; text-align: center; }
-.day-bar i { display: block; min-height: 2px; border-radius: 3px 3px 1px 1px; background: #ff4757; }
-.day-bar.today i { background: #2ed573; }
-.day-bar span { color: #64748b; font-size: 8px; }
+.activity-heading { margin: 9px 0 7px; color: var(--muted); font-size: 10px; }
+.activity-map { display: grid; grid-auto-flow: column; grid-template-rows: repeat(7, 12px); grid-template-columns: repeat(12, 12px); gap: 4px; }
+.activity-cell { width: 12px; height: 12px; min-width: 0; padding: 0; border: 1px solid var(--line); border-radius: 3px; background: var(--card-soft); box-shadow: none; }
+.activity-cell.level-unknown { background: repeating-linear-gradient(135deg, transparent, transparent 2px, var(--line) 2px, var(--line) 3px); }
+.activity-cell.level-1 { background: #164e3d; }
+.activity-cell.level-2 { background: #23785b; }
+.activity-cell.level-3 { background: #2ea97b; }
+.activity-cell.level-4 { background: var(--success); }
+.activity-cell.today { border-color: #f8fafc; }
+.activity-cell:focus-visible { outline: 2px solid #f8fafc; outline-offset: 2px; }
+.activity-detail, .activity-legend { margin: 7px 0 0; color: var(--muted); font-size: 9px; line-height: 1.5; }
 .resume-card { display: grid; gap: 2px; margin-top: 9px; padding: 9px 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--card-soft); }
 .resume-card:not(:has(#resume:not([hidden]))) { display: none; }
 .resume-card > span { color: var(--muted); font-size: 9.5px; }

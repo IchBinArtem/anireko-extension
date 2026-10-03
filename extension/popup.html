@@ -86,7 +86,10 @@
           <strong id="today-episodes" data-i18n="zeroEpisodes"></strong>
           <span class="local-pill" data-i18n="locally"></span>
         </div>
-        <div class="week-chart" id="week-chart" data-i18n-aria-label="lastSevenDaysAria"></div>
+        <p class="activity-heading" data-i18n="activityHeading"></p>
+        <div class="activity-map" id="week-chart" data-i18n-aria-label="activityCalendarAria"></div>
+        <p class="activity-detail" id="activity-detail" aria-live="polite" data-i18n="activityHint"></p>
+        <p class="activity-legend" data-i18n="activityLegend"></p>
       </section>
       <section class="resume-card" id="anime-fields">
         <span id="resume-label" hidden data-i18n="resumeLabel"></span>
@@ -108,6 +111,7 @@
         <button id="delete-local-data" type="button" disabled data-i18n="deleteLocalData"></button>
       </div>
     </main>
+    <script src="lib/activity.js"></script>
     <script src="popup.js"></script>
   </body>
 </html>
