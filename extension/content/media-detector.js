@@ -21,7 +21,11 @@
   const documentToken = globalThis.__anirekoDocumentToken ||= globalThis.crypto?.randomUUID?.()
     || `${Date.now()}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
 
-  chrome.runtime.onMessage.addListener((message) => {
+  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message?.type === 'anireko-detector-status') {
+      if (extensionContextAlive) sendResponse({ ok: true, documentUrl: location.href, documentToken });
+      return;
+    }
     if (message?.type !== 'anireko-disable-detector') return;
     extensionContextAlive = false;
     mediaObserver?.disconnect();

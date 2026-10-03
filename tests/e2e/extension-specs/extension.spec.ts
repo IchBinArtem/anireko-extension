@@ -104,6 +104,7 @@ test.beforeAll(async () => {
     locale: 'ru-RU',
     args: [
       '--lang=ru',
+      '--enable-unsafe-extension-debugging',
       `--disable-extensions-except=${extensionPath}`,
       `--load-extension=${extensionPath}`,
     ],
@@ -174,7 +175,8 @@ test('renders the English manifest and popup for an English Chrome UI', async ()
     await expect(englishPopup.locator('html')).toHaveAttribute('lang', 'en');
     await expect(englishPopup.locator('.brand span')).toHaveText('Anime watch tracker');
     await expect(englishPopup.locator('#privacy-accept')).toHaveText('Got it, enable AniReko');
-    await expect(englishPopup.locator('#anime-check-title')).toHaveText('Anime not found');
+    await expect(englishPopup.locator('#anime-check-title')).toHaveText('Enable AniReko');
+    await expect(englishPopup.locator('#page-recovery')).toBeHidden();
     await expect(englishPopup.locator('#privacy-policy')).toHaveAttribute(
       'href', 'https://anireko.com/en/privacy#browser-extension',
     );
@@ -453,6 +455,137 @@ test('shows only an anime-not-found state and manually reports a recognition mis
   const after = await worker.evaluate(async () =>
     (await (await fetch('http://127.0.0.1:4178/__test/request-counts')).json()));
   expect(after).toMatchObject({ search: 0, sessionInfo: 0, diagnostics: 1 });
+  await popup.close();
+  await page.close();
+});
+
+test('detects a disconnected old document despite saved recognition and recovers only after confirmation', async () => {
+  const page = await context.newPage();
+  await page.goto(`${siteBase}/anime.html`);
+  const tabId = await extensionTabId(`${siteBase}/anime.html`);
+  await expect.poll(async () => (await storedTabState(tabId))?.match?.status).toBe('ok');
+  const savedTitle = (await storedTabState(tabId)).recognition.title;
+  // Use the production shutdown path: its old document remains mounted and
+  // session recognition remains saved, but the detector no longer responds.
+  await worker.evaluate(async (id) => {
+    await chrome.tabs.sendMessage(id, { type: 'anireko-disable-detector' }, { frameId: 0 });
+    await fetch('http://127.0.0.1:4178/__test/reset');
+  }, tabId);
+  let navigations = 0;
+  page.on('framenavigated', (frame) => { if (frame === page.mainFrame()) navigations += 1; });
+  const popup = await openPopup(tabId);
+  await expect(popup.locator('#anime-check-title')).toHaveText('Нет подключения к странице');
+  await expect(popup.locator('#not-found-report')).toBeHidden();
+  await expect(popup.locator('#report-anime-miss')).toBeDisabled();
+  await expect(popup.locator('#automark')).toBeHidden();
+  expect((await storedTabState(tabId)).recognition.title).toBe(savedTitle);
+  expect(navigations).toBe(0);
+
+  const cancelDialog = new Promise<void>((resolve) => popup.once('dialog', async (dialog) => {
+    expect(dialog.message()).toContain('прервёт воспроизведение');
+    await dialog.dismiss();
+    resolve();
+  }));
+  await popup.locator('#reload-page').click();
+  await cancelDialog;
+  expect(navigations).toBe(0);
+  const counts = await worker.evaluate(async () =>
+    (await (await fetch('http://127.0.0.1:4178/__test/request-counts')).json()));
+  expect(counts.diagnostics).toBe(0);
+
+  const navigation = page.waitForEvent('framenavigated', (frame) => frame === page.mainFrame());
+  popup.once('dialog', (dialog) => void dialog.accept());
+  await popup.locator('#reload-page').click();
+  await navigation;
+  await expect.poll(() => worker.evaluate(async (id) => {
+    const reply = await chrome.tabs.sendMessage(id, { type: 'anireko-detector-status' }, { frameId: 0 });
+    return reply?.ok;
+  }, tabId)).toBe(true);
+  await expect.poll(async () => (await storedTabState(tabId))?.match?.status).toBe('ok');
+  const recoveredPopup = await openPopup(tabId);
+  await expect(recoveredPopup.locator('#anime-check-title')).toHaveText('Аниме найдено');
+  await expect(recoveredPopup.locator('#page-recovery')).toBeHidden();
+  await recoveredPopup.close();
+  if (!popup.isClosed()) await popup.close();
+  await page.close();
+});
+
+test('does not render old-document recognition when a new detector is connected at the same URL', async () => {
+  const page = await context.newPage();
+  await page.goto(`${siteBase}/anime.html`);
+  const tabId = await extensionTabId(`${siteBase}/anime.html`);
+  await expect.poll(async () => (await storedTabState(tabId))?.match?.status).toBe('ok');
+  await waitForDetectorReady(tabId);
+  const oldState = await storedTabState(tabId);
+  await worker.evaluate(async () => {
+    (globalThis as any).AniRekoTestHooks.resetVolatileCaches();
+    await fetch('http://127.0.0.1:4178/__test/session?on=1&user=18');
+    await fetch('http://127.0.0.1:4178/__test/taste-hold?on=1');
+  });
+  try {
+    // A real old-document sensor message blocks on the held taste API response.
+    await page.frameLocator('#main-player').locator('#episode-select').selectOption({ label: '12 серия' });
+    await expect.poll(() => worker.evaluate(async () =>
+      (await (await fetch('http://127.0.0.1:4178/__test/taste-hold')).json()).pending)).toBeGreaterThan(0);
+    await page.reload();
+    await expect.poll(() => worker.evaluate(async (id) =>
+      (await chrome.tabs.sendMessage(id, { type: 'anireko-detector-status' }, { frameId: 0 })).documentToken,
+    tabId)).not.toBe(oldState.navigationToken);
+    expect((await storedTabState(tabId)).navigationToken).toBe(oldState.navigationToken);
+    const popup = await openPopup(tabId);
+    await expect(popup.locator('#anime-check-title')).toHaveText('Ищем страницу аниме');
+    await expect(popup.locator('#anime-check .recognized-only')).toBeHidden();
+    await expect(popup.locator('#not-found-report')).toBeHidden();
+    await expect(popup.locator('#automark')).toBeHidden();
+    await worker.evaluate(async () => {
+      await fetch('http://127.0.0.1:4178/__test/taste-hold?on=0');
+    });
+    await expect(popup.locator('#anime-check-title')).toHaveText('Аниме найдено');
+    await popup.close();
+  } finally {
+    await worker.evaluate(async () => {
+      await fetch('http://127.0.0.1:4178/__test/taste-hold?on=0');
+    });
+    await page.close();
+  }
+});
+
+test('detects actual extension reload in an already-open tab and restores on page reload', async () => {
+  const page = await context.newPage();
+  await page.goto(`${siteBase}/anime.html`);
+  const tabId = await extensionTabId(`${siteBase}/anime.html`);
+  await expect.poll(async () => (await storedTabState(tabId))?.match?.status).toBe('ok');
+  const session = await context.browser()!.newBrowserCDPSession();
+  const restarted = context.waitForEvent('serviceworker');
+  // Loading the same unpacked path reloads it through the browser's extension
+  // loader, without uninstalling or clearing the test profile's local data.
+  const loaded = await session.send('Extensions.loadUnpacked', { path: extensionPath });
+  expect(loaded.id).toBe(extensionId);
+  const openingPopup = openPopup(tabId);
+  worker = await restarted;
+  const popup = await openingPopup;
+  await expect(popup.locator('#anime-check-title')).toHaveText('Нет подключения к странице');
+  await expect(popup.locator('#not-found-report')).toBeHidden();
+  await popup.close();
+  await page.reload();
+  await expect.poll(async () => (await storedTabState(tabId))?.match?.status).toBe('ok');
+  const recovered = await openPopup(tabId);
+  await expect(recovered.locator('#anime-check-title')).toHaveText('Аниме найдено');
+  await recovered.close();
+  await page.close();
+});
+
+test('does not mistake a restricted browser page for an anime recognition miss', async () => {
+  const page = await context.newPage();
+  // Without the tabs permission Chrome redacts restricted-page URLs. Capture
+  // the exact ID while the tab is still an authorized HTTP document.
+  await page.goto(`${siteBase}/generic-video.html`);
+  const tabId = await extensionTabId(`${siteBase}/generic-video.html`);
+  await page.goto('about:blank');
+  const popup = await openPopup(tabId);
+  await expect(popup.locator('#anime-check-title')).toHaveText('Эта страница недоступна расширению');
+  await expect(popup.locator('#not-found-report')).toBeHidden();
+  await expect(popup.locator('#page-recovery')).toBeHidden();
   await popup.close();
   await page.close();
 });
@@ -1101,7 +1234,7 @@ test('promotes watching to completed once on finished episode 12 of 12', async (
     await chrome.storage.local.set({
       'auto-mark': true,
       'sync-account': { id: 18, name: 'TestUser' },
-      'search-cache-version': 7,
+      'search-cache-version': 8,
       'search-cache': {
         'расхититель гробниц': {
           match: {

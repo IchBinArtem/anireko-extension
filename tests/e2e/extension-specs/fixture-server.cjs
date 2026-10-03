@@ -13,6 +13,13 @@ let progressPostsInFlight = 0;
 let maxProgressPostsInFlight = 0;
 let resetGeneration = 0;
 let failProgressPosts = false;
+let holdTasteResponses = false;
+const pendingTasteResponses = [];
+
+function releaseTasteResponses() {
+  holdTasteResponses = false;
+  for (const finish of pendingTasteResponses.splice(0)) finish();
+}
 
 const pages = {
   '/health': ['text/plain', 'ok'],
@@ -476,6 +483,14 @@ const server = http.createServer((request, response) => {
     return;
   }
   if (/^\/api\/anime\/\d+\/match/u.test(request.url)) {
+    if (holdTasteResponses) {
+      pendingTasteResponses.push(() => {
+        if (response.destroyed) return;
+        response.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+        response.end(JSON.stringify({ success: true, data: { has_profile: false, reason: 'guest' } }));
+      });
+      return;
+    }
     response.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
     response.end(JSON.stringify(sessionUser
       ? {
@@ -605,7 +620,16 @@ const server = http.createServer((request, response) => {
     response.end(JSON.stringify({ ok: true, failProgressPosts }));
     return;
   }
+  if (request.url.startsWith('/__test/taste-hold')) {
+    const on = new URL(request.url, 'http://localhost').searchParams.get('on');
+    if (on === '1') holdTasteResponses = true;
+    if (on === '0') releaseTasteResponses();
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ pending: pendingTasteResponses.length }));
+    return;
+  }
   if (request.url.startsWith('/__test/reset')) {
+    releaseTasteResponses();
     sessionUser = null;
     watchStatus = null;
     sessionInfoRequests = 0;

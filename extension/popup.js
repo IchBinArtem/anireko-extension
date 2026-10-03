@@ -56,9 +56,27 @@
   const consent = stored[PRIVACY_CONSENT_KEY];
   const consentAccepted = consent?.version === PRIVACY_CONSENT_VERSION
     && Number.isFinite(consent.acceptedAt);
+  // Persisted tab state can outlive the detector after an extension update.
+  // Check the top document itself, not an arbitrary responding player frame.
+  let detectorConnected = false;
+  let detectorDocumentToken = null;
+  const pageSupported = /^https?:\/\//iu.test(tab?.url || '');
+  if (consentAccepted && pageSupported && Number.isInteger(tab?.id)) {
+    try {
+      const reply = await chrome.tabs.sendMessage(tab.id,
+        { type: 'anireko-detector-status' }, { frameId: 0 });
+      detectorConnected = reply?.ok === true && reply.documentUrl === tab.url
+        && typeof reply.documentToken === 'string' && reply.documentToken.length > 0;
+      if (detectorConnected) detectorDocumentToken = reply.documentToken;
+    } catch { /* no receiver, revoked access, or an invalidated old context */ }
+  }
   const sessionStored = key ? await chrome.storage.session.get(key) : {};
   const state = sessionStored[key];
   const displayFingerprint = (value) => JSON.stringify([
+    Boolean(value),
+    Boolean(value?.probe),
+    value?.navigationToken || null,
+    value?.pageUrl || null,
     value?.recognition?.title || null,
     value?.match || null,
     value?.player ? {
@@ -262,6 +280,24 @@
     }
   }
 
+  function renderPageUnavailable(title, detail, canReload = false) {
+    setCheck('anime-check', 'pending', '·', t(title), t(detail));
+    for (const id of animeDetailIds) document.getElementById(id).hidden = true;
+    reportSection.hidden = true;
+    reportButton.disabled = true;
+    const recovery = document.getElementById('page-recovery');
+    recovery.hidden = !canReload;
+    document.getElementById('reload-page').addEventListener('click', async () => {
+      if (!confirm(t('confirmReloadPage'))) return;
+      try {
+        await chrome.tabs.reload(tab.id);
+        window.close();
+      } catch {
+        document.getElementById('page-recovery-detail').textContent = t('reloadPageFailed');
+      }
+    });
+  }
+
   reportButton.addEventListener('click', async () => {
     if (reportButton.disabled || !Number.isInteger(tab?.id)) return;
     reportButton.disabled = true;
@@ -288,14 +324,30 @@
     }
   });
 
-  if (!state) {
-    renderAnimeNotFound(false);
+  if (!consentAccepted) {
+    renderPageUnavailable('consentRequiredTitle', 'syncOffUntilConsent');
+    return;
+  }
+  if (!pageSupported) {
+    renderPageUnavailable('unsupportedPageTitle', 'unsupportedPageDetail');
+    return;
+  }
+  if (!detectorConnected) {
+    renderPageUnavailable('detectorDisconnectedTitle', 'detectorDisconnectedDetail', true);
+    return;
+  }
+  if (!state || state.navigationToken !== detectorDocumentToken || state.pageUrl !== tab.url) {
+    renderPageUnavailable('findingAnimePage', 'checkingPageMetadata');
     return;
   }
   const recognition = state.recognition;
   const player = state.player;
   const players = Object.values(state.players || {});
   const animeFound = Boolean(recognition?.title);
+  if (!animeFound && !state.probe) {
+    renderPageUnavailable('findingAnimePage', 'checkingPageMetadata');
+    return;
+  }
   if (!animeFound) {
     renderAnimeNotFound(Boolean(state.probe && Number.isInteger(tab?.id)));
     return;
