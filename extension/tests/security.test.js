@@ -315,7 +315,7 @@ test('runtime has no duplicate permission manager or provider-specific player or
 
 test('search cache invalidates pre-completion metadata and retries partial matches', () => {
   const worker = fs.readFileSync(path.join(__dirname, '..', 'service-worker.js'), 'utf8');
-  assert.equal(worker.includes('const SEARCH_CACHE_VERSION = 7;'), true);
+  assert.equal(worker.includes('const SEARCH_CACHE_VERSION = 8;'), true);
   assert.equal(worker.includes("['type', 'episodes', 'release_status']"), true);
   assert.equal(worker.includes('match.completionMetadataReady ? SEARCH_TTL_OK_MS : SEARCH_TTL_PARTIAL_MS'), true);
   assert.equal(worker.includes('current.match.completionMetadataReady !== true'), true);

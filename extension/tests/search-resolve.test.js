@@ -292,7 +292,7 @@ async function seedStaleCache({ context, storage }) {
         expiresAt: Date.now() + 24 * 3600 * 1000,
       },
     },
-    'search-cache-version': 7,
+    'search-cache-version': 8,
   });
   return key;
 }
@@ -522,7 +522,7 @@ test('maybeAutoMark completes when the forced refresh returns fresh finished met
         expiresAt: Date.now() + 24 * 3600 * 1000,
       },
     },
-    'search-cache-version': 7,
+    'search-cache-version': 8,
   });
   const state = terminalEpisodeState();
   state.match = { ...staleCompletedMatch(), releaseStatus: 'ONGOING' };
@@ -630,6 +630,49 @@ test('Russian number words make 3000 exact and exclude the 100000 lookalike', as
   );
 });
 
+test('empty explicit-season search resolves and binds the catalog-confirmed season', async () => {
+  const calls = [];
+  const title = 'Монолог фармацевта 3 сезон';
+  const root = { id: 18555, title: 'Монолог фармацевта', subtitle: 'Kusuriya no Hitorigoto', type: 'TV' };
+  const third = { id: 18558, title: 'Монолог фармацевта 3', subtitle: 'Kusuriya no Hitorigoto 3rd Season', type: 'TV', exact_alias_match: true };
+  const second = { id: 18557, title: 'Монолог фармацевта 2', subtitle: 'Kusuriya no Hitorigoto 2nd Season', type: 'TV' };
+  const rows = { [title]: [], [root.title]: [root, third, second], [third.subtitle]: [third] };
+  const { context, storage } = loadServiceWorker({ fetchImpl: async (url) => {
+    const query = new URL(url).searchParams.get('q');
+    calls.push(query);
+    assert.ok(Object.hasOwn(rows, query), `unexpected query: ${query}`);
+    return { ok: true, status: 200, json: async () => ({ data: rows[query] }) };
+  } });
+  await storage.local.set({ 'search-cache-version': 7, 'search-cache': {
+    [context.titleSearchKey(title)]: { match: { status: 'none', query: title }, expiresAt: Date.now() + 86400000 },
+  } });
+  const result = await context.resolveAnimeMatch(title);
+  assert.equal(result.status, 'ok');
+  assert.equal(result.animeId, third.id);
+  assert.equal(result.seasonAlias, true);
+  assert.deepEqual(calls, [title, root.title, third.subtitle]);
+  const search = await context.popupSearchAnime(title);
+  assert.equal(search.payload.candidates[0].animeId, third.id);
+  vm.runInContext(`stateByTab['5'] = { recognition: { title: ${JSON.stringify(title)} } }`, context);
+  const bound = await context.bindPopupAnime({ tabId: 5, animeId: third.id, query: title });
+  assert.equal(bound.ok, true);
+  assert.equal(vm.runInContext("stateByTab['5'].match.animeId", context), third.id);
+});
+
+test('empty season search never confirms the first or a different season without an exact alias', async () => {
+  const root = { id: 1, title: 'Тестовая сага', subtitle: 'Test Saga', type: 'TV' };
+  const other = { id: 2, title: 'Тестовая сага 2', subtitle: 'Test Saga 2nd Season', type: 'TV' };
+  const { context } = loadServiceWorker({ fetchImpl: async (url) => {
+    const query = new URL(url).searchParams.get('q');
+    const rows = query === root.title ? [root, other] : [];
+    return { ok: true, status: 200, json: async () => ({ data: rows }) };
+  } });
+  const result = await context.resolveAnimeMatch('Тестовая сага 3 сезон');
+  assert.equal(result.status, 'ambiguous');
+  assert.equal(context.confirmedAnimeMatch(result), false);
+  assert.equal(result.animeId, undefined);
+});
+
 test('explicit fourth season resolves through a unique catalog alias probe', async () => {
   const calls = [];
   const fourthSeason = {
@@ -695,7 +738,7 @@ test('explicit fourth season resolves through a unique catalog alias probe', asy
   assert.equal(result.seasonAlias, true);
   assert.equal(result.animeId, 13124);
   assert.equal(context.confirmedAnimeMatch(result), true);
-  assert.equal((await storage.local.get('search-cache-version'))['search-cache-version'], 7);
+  assert.equal((await storage.local.get('search-cache-version'))['search-cache-version'], 8);
   assert.equal(calls.length, 2);
   assert.equal(new URL(calls[0]).searchParams.get('limit'), '20');
   assert.equal(new URL(calls[0]).searchParams.get('exact_alias'), '1');
@@ -870,7 +913,7 @@ test('cached sole candidate becomes exact when only an intraword hyphen differs'
   const title = 'Мое анти-божественное оружие';
   const wanted = context.titleSearchKey(title);
   await storage.local.set({
-    'search-cache-version': 7,
+    'search-cache-version': 8,
     'search-cache': {
       [wanted]: {
         match: {

@@ -712,7 +712,7 @@
   set('progress', player?.progress == null ? null : `${(player.progress * 100).toFixed(1)}%`);
   const hint = document.getElementById('hint');
   if (playerReady) hint.hidden = true;
-  else set('hint', animeFound
+  else set('hint', matchConfirmed
     ? t('animeFoundPlayVideo')
-    : t('openAnimeWithPlayer'));
+    : t('catalogMatchNotConfirmed'));
 })();

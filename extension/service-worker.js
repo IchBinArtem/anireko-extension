@@ -30,9 +30,8 @@ function invalidateActionPresentation(tabId) {
 // API is never hammered.
 const SEARCH_CACHE_KEY = 'search-cache';
 const SEARCH_CACHE_MAX = 200;
-// v7 invalidates explicit-season misses cached while the exact-alias backend
-// contract was unavailable. v6 added season matching; v5 normalized numbers.
-const SEARCH_CACHE_VERSION = 7;
+// v8 invalidates explicit-season misses that skipped the base-title search.
+const SEARCH_CACHE_VERSION = 8;
 const SEARCH_TTL_OK_MS = 7 * 24 * 3600 * 1000;
 const SEARCH_TTL_MISS_MS = 24 * 3600 * 1000;
 const SEARCH_TTL_PARTIAL_MS = 5 * 60 * 1000;
@@ -545,11 +544,22 @@ async function resolveSeasonAliasCandidate(title, primaryCandidates) {
   return confirmed.length === 1 ? confirmed[0] : null;
 }
 
+async function searchTitleCandidates(title) {
+  const candidates = await searchCatalogCandidates(title);
+  const season = explicitSeasonRequest(title);
+  // The catalog may index "Title 3" but not "Title 3 сезон". Base-title
+  // results are only candidates; automatic matching still requires the exact
+  // requested-season alias below, never the base title or another season.
+  return candidates.length === 0 && season
+    ? searchCatalogCandidates(season.baseTitle)
+    : candidates;
+}
+
 // KAN-2054 acceptance: map the recognized title to our anime_id via the
 // existing public search API. Only the cleaned title string is sent.
 // KAN-2695: global persistent cache + in-flight dedup + error backoff. Most
-// titles use one search request; an explicit ambiguous season may use one
-// additional bounded alias probe before it is cached.
+// titles use one search request; an explicit season may also need a base-title
+// search and one bounded alias probe before it is cached.
 function resolveAnimeMatch(title, { forceRefresh = false } = {}) {
   const wanted = titleSearchKey(title);
   if (!wanted) return Promise.resolve({ status: 'none', query: title, resolvedAt: Date.now() });
@@ -617,7 +627,7 @@ async function resolveAnimeMatchUncached(title, wanted, forceRefresh = false) {
     return cached?.match || fallback;
   }
   try {
-    const results = await searchCatalogCandidates(title);
+    const results = await searchTitleCandidates(title);
     let match = { status: 'none', query: title, resolvedAt: now };
     let seasonProbeUnavailable = false;
     if (results.length) {
@@ -1858,7 +1868,7 @@ async function popupSearchAnime(query) {
     return { ok: false, status: 400, payload: { error: 'invalid_query' } };
   }
   try {
-    const candidates = await searchCatalogCandidates(cleaned);
+    const candidates = await searchTitleCandidates(cleaned);
     const exact = candidates.filter((candidate) => lexicallyExactTitle(candidate.title, cleaned)
       || lexicallyExactTitle(candidate.subtitle, cleaned));
     const seasonAlias = exact.length === 0
@@ -1895,7 +1905,7 @@ async function bindPopupAnime(message) {
   }
   let candidate;
   try {
-    candidate = (await searchCatalogCandidates(query))
+    candidate = (await searchTitleCandidates(query))
       .find((item) => item.animeId === animeId);
   } catch {
     return { ok: false, status: 503, payload: { error: 'search_unavailable' } };
