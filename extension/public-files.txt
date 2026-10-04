@@ -36,6 +36,7 @@ extension/tests/parsers.test.js
 extension/tests/popup-resume.test.js
 extension/tests/search-resolve.test.js
 extension/tests/security.test.js
+extension/tests/watch-history-client.test.js
 extension/tests/test_build_release.py
 extension/tests/test_cws_publish.py
 extension/tests/test_release_workflow.py

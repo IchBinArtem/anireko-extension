@@ -1,11 +1,15 @@
 {
-  "version": 3,
+  "version": 4,
   "base": "https://anireko.com",
   "rate_limit": {
     "status": 429,
     "retry_after_header": "Retry-After"
   },
   "actions": {
+    "history-read": { "method": "GET", "path": "/api/extension/history.php", "credentials": true, "query": ["anime_id", "expected_user_id", "page"] },
+    "history-initialize": { "method": "POST", "path": "/api/extension/history.php", "credentials": true, "header": { "X-Anireko-Watch-History": "1" }, "body": ["operation", "expected_user_id"] },
+    "history-command": { "method": "POST", "path": "/api/extension/history.php", "credentials": true, "header": { "X-Anireko-Watch-History": "1" }, "body": ["operation", "expected_user_id", "history_id", "anime_id", "expected_effective_anime_id", "expected_foreground_generation", "expected_version", "command_id", "command", "cycle_id", "episode", "position_sec", "duration_sec", "voice"] },
+    "history-select": { "method": "POST", "path": "/api/extension/history.php", "credentials": true, "header": { "X-Anireko-Watch-History": "1" }, "body": ["operation", "expected_user_id", "history_id", "anime_id", "expected_effective_anime_id", "command_id", "cycle_id", "reconciliation_token", "choices"] },
     "session-info": { "method": "GET", "path": "/api/auth/session-info.php", "credentials": true },
     "search": { "method": "GET", "path": "/api/search", "credentials": false, "query": ["q", "limit", "exact_alias"], "response_item": ["id", "title", "subtitle", "slug", "year", "type", "episodes", "release_status", "exact_alias_match"] },
     "taste-match": { "method": "GET", "path": "/api/anime/{anime_id}/match", "credentials": true },

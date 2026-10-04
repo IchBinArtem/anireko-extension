@@ -326,7 +326,7 @@ test('search cache invalidates pre-completion metadata and retries partial match
 test('public API contract and client action allowlist stay aligned', () => {
   const contract = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'api-contract.json'), 'utf8'));
   const client = fs.readFileSync(path.join(__dirname, '..', 'lib', 'api-client.js'), 'utf8');
-  assert.equal(contract.version, 3);
+  assert.equal(contract.version, 4);
   assert.deepEqual(contract.rate_limit, {
     status: 429,
     retry_after_header: 'Retry-After',
@@ -335,7 +335,8 @@ test('public API contract and client action allowlist stay aligned', () => {
     assert.equal(client.includes(`case '${action}'`), true, `missing client action ${action}`);
   }
   assert.deepEqual(Object.keys(contract.actions).sort(), [
-    'diagnostic', 'progress-all', 'progress-write', 'search', 'session-info',
+    'diagnostic', 'history-command', 'history-initialize', 'history-read', 'history-select',
+    'progress-all', 'progress-write', 'search', 'session-info',
     'status-get', 'status-write', 'taste-match',
   ]);
 });
@@ -371,6 +372,7 @@ test('public export contains every source and fixture used by release verificati
     'extension/scripts/cws_publish.py',
     'extension/tests/search-resolve.test.js',
     'extension/tests/popup-resume.test.js',
+    'extension/tests/watch-history-client.test.js',
     'extension/lib/activity.js',
     'extension/tests/activity.test.js',
     'extension/tests/test_build_release.py',
@@ -385,7 +387,7 @@ test('public export contains every source and fixture used by release verificati
     assert.equal(fs.existsSync(path.join(repo, relative)), true, `public source misses ${relative}`);
   }
 
-  assert.equal(listed.size, 53, 'public export allowlist changed without an explicit review');
+  assert.equal(listed.size, 54, 'public export allowlist changed without an explicit review');
   const exactSupportFiles = new Set([
     '.github/dependabot.yml',
     '.github/workflows/extension-release.yml',

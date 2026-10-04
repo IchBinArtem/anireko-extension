@@ -13,6 +13,13 @@ All production requests are built by `lib/api-client.js` from the immutable `htt
 | Recognition-miss report | Hostname and compact structural probe | Explicit click on “Здесь есть аниме” |
 
 Full third-party URLs, paths, queries, iframe URLs, page titles/content, and video content are never sent to AniReko. Search and diagnostic requests omit credentials; account-scoped actions use the AniReko cookie.
+The local watch-history client candidate adds fixed `history-read`, `history-initialize`,
+`history-command` and `history-select` actions. No service-worker/UI producer is wired yet;
+this does not claim that the public server route is available. Reads carry strict integer
+anime/account IDs; writes additionally carry immutable command/history/cycle identities
+and exact state expectations. POST uses JSON and `X-Anireko-Watch-History: 1`, not a
+client-supplied credential. Inputs reject unknown fields/coercion; POST bodies are bounded
+at 64 KiB without truncating selection choices. GET cannot initialize a history.
 Automatic and manual diagnostics contain no anime ID or title; the backend also discards those legacy fields from older clients.
 When automatic catalog matching is not unique, the selected catalog ID and metadata are stored locally against the normalized recognized title. The binding contains no source URL or hostname and is revalidated through catalog search before it can authorize sync.
 An explicit season with an empty initial result may use one base-title search, followed by one catalog-alias search. Automatic selection requires a unique exact alias for the requested season that is also present among the base-title candidates; the first season is never selected merely because its base title matches.
