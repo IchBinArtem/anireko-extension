@@ -594,6 +594,10 @@
 
   async function renderResume(force) {
     if (!animeFound || player?.playing) return;
+    const confirmedAnimeId = match?.status === 'ok'
+      ? (typeof match.animeId === 'number' || typeof match.animeId === 'string' ? Number(match.animeId) : NaN)
+      : null;
+    if (confirmedAnimeId !== null && (!Number.isSafeInteger(confirmedAnimeId) || confirmedAnimeId < 1)) return;
     const fmtTime = (sec) => {
       const s = Math.max(0, Math.round(sec));
       return s >= 3600
@@ -610,9 +614,9 @@
       return new Date(ts).toLocaleDateString(dateLocale);
     };
     let resume = null;
-    if (match?.status === 'ok' && match.animeId) {
+    if (confirmedAnimeId !== null) {
       const bulk = await loadResumeBulk(force);
-      const progress = bulk.byAnime?.[match.animeId] ?? bulk.byAnime?.[String(match.animeId)];
+      const progress = bulk.byAnime?.[confirmedAnimeId];
       if (progress) {
         resume = {
           episode: progress.episode,
@@ -625,7 +629,10 @@
     if (!resume) {
       const titleKey = String(recognition.title).toLocaleLowerCase().replace(/\s+/gu, ' ').trim();
       const records = Object.entries(stored['watch-history']?.records || {})
-        .filter(([recordKey]) => recordKey.startsWith(`${titleKey}::`))
+        .filter(([recordKey, record]) => confirmedAnimeId !== null
+          ? (typeof record?.animeId === 'number' || typeof record?.animeId === 'string')
+            && Number(record.animeId) === confirmedAnimeId
+          : recordKey.startsWith(`${titleKey}::`))
         .map(([, record]) => record)
         .filter((record) => Number.isFinite(record.position) && record.position > 0);
       const last = records.sort((a, b) => (b.lastWatchedAt || 0) - (a.lastWatchedAt || 0))[0];
