@@ -21,5 +21,13 @@ and exact state expectations. POST uses JSON and `X-Anireko-Watch-History: 1`, n
 client-supplied credential. Inputs reject unknown fields/coercion; POST bodies are bounded
 at 64 KiB without truncating selection choices. GET cannot initialize a history.
 Automatic and manual diagnostics contain no anime ID or title; the backend also discards those legacy fields from older clients.
+The unwired `watch-command-journal` foundation stores at most one unresolved immutable
+history command globally (70,000 UTF-8 bytes maximum), without source URLs or cookies.
+Admission uses the actual wire validator synchronously; persistence precedes delivery.
+Retry is explicit, preserves UUID/body/CAS, and never starts on extension startup.
+An acknowledged historical receipt does not release the slot until a fresh authorized
+history read succeeds. Account/navigation invalidation fences callbacks; close drains
+started journal storage operations before removing its own key. This foundation does
+not yet fence other legacy writers, provide a popup, or prove actual Chrome restart.
 When automatic catalog matching is not unique, the selected catalog ID and metadata are stored locally against the normalized recognized title. The binding contains no source URL or hostname and is revalidated through catalog search before it can authorize sync.
 An explicit season with an empty initial result may use one base-title search, followed by one catalog-alias search. Automatic selection requires a unique exact alias for the requested season that is also present among the base-title candidates; the first season is never selected merely because its base title matches.

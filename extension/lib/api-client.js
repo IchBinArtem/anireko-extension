@@ -234,5 +234,15 @@
     return Object.freeze({ base, request });
   }
 
-  global.AniRekoApiClient = { create };
+  // Pure admission uses exactly the wire validator, before any storage/network await.
+  function historyIntent(action, input) {
+    if (!['history-command', 'history-select'].includes(action)) throw new Error('payload_invalid');
+    const payload = historyPayload(action, input);
+    const encoded = JSON.stringify(payload);
+    if (new TextEncoder().encode(encoded).length > 65536) throw new Error('payload_invalid');
+    const copy = JSON.parse(encoded);
+    delete copy.operation;
+    return copy;
+  }
+  global.AniRekoApiClient = { create, historyIntent };
 })(typeof globalThis !== 'undefined' ? globalThis : self);

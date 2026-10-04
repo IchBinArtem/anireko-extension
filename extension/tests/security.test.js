@@ -373,6 +373,8 @@ test('public export contains every source and fixture used by release verificati
     'extension/tests/search-resolve.test.js',
     'extension/tests/popup-resume.test.js',
     'extension/tests/watch-history-client.test.js',
+    'extension/tests/watch-command-journal.test.js',
+    'extension/lib/watch-command-journal.js',
     'extension/lib/activity.js',
     'extension/tests/activity.test.js',
     'extension/tests/test_build_release.py',
@@ -387,7 +389,7 @@ test('public export contains every source and fixture used by release verificati
     assert.equal(fs.existsSync(path.join(repo, relative)), true, `public source misses ${relative}`);
   }
 
-  assert.equal(listed.size, 54, 'public export allowlist changed without an explicit review');
+  assert.equal(listed.size, 56, 'public export allowlist changed without an explicit review');
   const exactSupportFiles = new Set([
     '.github/dependabot.yml',
     '.github/workflows/extension-release.yml',
