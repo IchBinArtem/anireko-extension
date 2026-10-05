@@ -7,6 +7,219 @@ const test = require('node:test');
 const extensionDir = path.join(__dirname, '..');
 const serviceWorkerPath = path.join(extensionDir, 'service-worker.js');
 
+test('actual legacy progress fails closed without an authenticated adoption snapshot', async () => {
+  const posts = [];
+  const { context } = loadServiceWorker({ historyFetchImpl: async () => (
+    { ok: true, status: 200, json: async () => ({}) }
+  ), fetchImpl: async (_url, options) => {
+    if (options.method === 'POST') posts.push(options.body);
+    return { ok: true, status: 200, json: async () => ({}) };
+  } });
+  context.activeSyncAccount = async () => ({ userId: 18 });
+  const state = { sourceOrigin: 'https://source.example', match: { status: 'ok', exact: true, animeId: 101 },
+    player: { playbackStarted: true, episode: 1, currentTime: 10, duration: 1200 } };
+  await context.maybeSyncProgress(state, true);
+  assert.deepEqual(posts, [], 'unsupported history contract must not fall back to a legacy writer');
+});
+
+function adoptionSnapshot(adopted = false) {
+  return { user_id: 18, requested_anime_id: 101, effective_anime_id: 101,
+    history_adopted: adopted, readiness: 'ready',
+    foreground: { anime_id: 101, generation: 0, cycle_id: null } };
+}
+
+function adoptionState() {
+  return { sourceOrigin: 'https://source.example', pageUrl: 'https://source.example/watch',
+    topDocumentId: 'native-document-a', navigationToken: 'navigation-a',
+    recognition: { title: 'Known anime' },
+    match: { status: 'ok', exact: true, animeId: 101, type: 'TV', totalEpisodes: 12,
+      releaseStatus: 'FINISHED', completionMetadataReady: true },
+    player: { watched: true, playbackStarted: true, episode: 2, currentTime: 1000, duration: 1200 } };
+}
+
+test('actual progress and auto-mark require strict owner-bound unadopted history', async () => {
+  for (const [name, snapshot, allowed] of [
+    ['false', adoptionSnapshot(false), true],
+    ['true even with zero totals', { ...adoptionSnapshot(true), totals: { started: 0, completed: 0 } }, false],
+    ['unsupported', {}, false],
+    ['boolean string', adoptionSnapshot('false'), false],
+    ['foreign owner', { ...adoptionSnapshot(false), user_id: 19 }, false],
+    ['foreign target', { ...adoptionSnapshot(false), requested_anime_id: 202 }, false],
+    ['effective ID outside int4', { ...adoptionSnapshot(false), effective_anime_id: 2147483648,
+      foreground: { anime_id: 2147483648, generation: 0, cycle_id: null } }, false],
+    ['reconciliation', { ...adoptionSnapshot(false), readiness: 'reconciliation_required' }, false],
+    ['false with active cycle', { ...adoptionSnapshot(false), foreground: {
+      anime_id: 101, generation: 1, cycle_id: '11111111-1111-4111-8111-111111111111' } }, false],
+  ]) {
+    const posts = []; let reads = 0;
+    const { context } = loadServiceWorker({
+      historyFetchImpl: async () => { reads++; return { ok: true, status: 200, json: async () => snapshot }; },
+      fetchImpl: async (url, options) => {
+        if (options.method === 'POST') posts.push(url);
+        return { ok: true, status: 200, json: async () => ({ success: true, data: { status: null } }) };
+      },
+    });
+    context.activeSyncAccount = async () => ({ userId: 18 });
+    const state = adoptionState();
+    await Promise.all([context.maybeSyncProgress(state, true), context.maybeAutoMark(state)]);
+    assert.equal(reads, 1, `${name}: producers share one exact-binding read`);
+    assert.equal(posts.length, allowed ? 2 : 0, `${name}: actual legacy writers`);
+  }
+});
+
+test('progress conflict fences auto-mark already awaiting the old status read', async () => {
+  let release; let entered;
+  const blocked = new Promise((resolve) => { release = resolve; });
+  const waiting = new Promise((resolve) => { entered = resolve; });
+  const posts = [];
+  const { context } = loadServiceWorker({ fetchImpl: async (url, options) => {
+    if (new URL(url).pathname === '/api/anime/status.php' && options.method !== 'POST') {
+      entered(); await blocked;
+      return { ok: true, status: 200, json: async () => ({ success: true, data: { status: null } }) };
+    }
+    if (options.method === 'POST') posts.push(url);
+    return { ok: false, status: 409, json: async () => ({ error: 'history_adopted' }) };
+  } });
+  context.activeSyncAccount = async () => ({ userId: 18 });
+  const state = adoptionState();
+  const marking = context.maybeAutoMark(state);
+  await waiting;
+  await context.maybeSyncProgress(state, true);
+  release(); await marking;
+  assert.equal(posts.length, 1);
+  assert.ok(posts[0].includes('/progress.php'), 'status POST must not cross the observed adoption fence');
+});
+
+test('actual status conflict cannot be crossed by a queued progress admission continuation', async () => {
+  const violations = [];
+  for (let microtaskDelay = 0; microtaskDelay < 12; microtaskDelay++) {
+    let release; let entered;
+    const blocked = new Promise((resolve) => { release = resolve; });
+    const waiting = new Promise((resolve) => { entered = resolve; });
+    let state; let binding;
+    const { context } = loadServiceWorker({ fetchImpl: async (url, options) => {
+      if (new URL(url).pathname === '/api/anime/status.php') {
+        if (options.method !== 'POST') return {
+          ok: true, status: 200, json: async () => ({ success: true, data: { status: null } }),
+        };
+        entered(); await blocked;
+        return { ok: false, status: 409, json: async () => ({ error: 'history_adopted' }) };
+      }
+      if (options.method === 'POST'
+        && !context.legacyWatchWriteStillAllowed(context.captureProgressEvent(state), binding, 18)) {
+        violations.push(microtaskDelay);
+      }
+      return { ok: true, status: 204, json: async () => null };
+    } });
+    context.activeSyncAccount = async () => ({ userId: 18 });
+    state = adoptionState(); binding = context.captureLocalWrite();
+    await context.readWatchHistory(context.captureProgressEvent(state), binding, 18);
+    const marking = context.maybeAutoMark(state, binding);
+    await waiting;
+    const progress = context.maybeSyncProgress(state, true, binding);
+    const settleAfter = (remaining) => {
+      if (remaining === 0) release();
+      else queueMicrotask(() => settleAfter(remaining - 1));
+    };
+    settleAfter(microtaskDelay);
+    await Promise.all([marking, progress]);
+  }
+  assert.deepEqual(violations, [], 'no actual progress POST after the shared admission has closed');
+});
+
+test('server conflict closes cached false adoption until explicit fresh read', async () => {
+  let reads = 0; let posts = 0;
+  const { context } = loadServiceWorker({
+    historyFetchImpl: async () => { reads++; return { ok: true, status: 200, json: async () => adoptionSnapshot(false) }; },
+    fetchImpl: async (_url, options) => {
+      if (options.method === 'POST') posts++;
+      return { ok: false, status: 409, json: async () => ({ error: 'history_adopted' }) };
+    },
+  });
+  context.activeSyncAccount = async () => ({ userId: 18 });
+  const state = adoptionState();
+  await context.maybeSyncProgress(state, true);
+  state.player.currentTime = 1100;
+  await context.maybeSyncProgress(state, true);
+  assert.equal(posts, 1, 'no next-media-tick retry after adoption conflict');
+  assert.equal(reads, 1, 'no automatic history polling after conflict');
+  const event = context.captureProgressEvent(state);
+  await context.readWatchHistory(event, context.captureLocalWrite(), 18, true);
+  await context.maybeSyncProgress(state, true);
+  assert.equal(reads, 2);
+  assert.equal(posts, 2, 'explicit read is required; actual server fence still decides the write');
+});
+
+test('delayed adoption read cannot authorize a changed document or manual match', async () => {
+  for (const change of ['document', 'match', 'account']) {
+    let release; let entered;
+    const blocked = new Promise((resolve) => { release = resolve; });
+    const reading = new Promise((resolve) => { entered = resolve; });
+    const posts = [];
+    const { context } = loadServiceWorker({
+      historyFetchImpl: async () => { entered(); await blocked;
+        return { ok: true, status: 200, json: async () => adoptionSnapshot(false) }; },
+      fetchImpl: async (_url, options) => { posts.push(options.body);
+        return { ok: true, status: 200, json: async () => ({}) }; },
+    });
+    context.activeSyncAccount = async () => ({ userId: 18 });
+    const state = adoptionState();
+    const pending = context.maybeSyncProgress(state, true);
+    await reading;
+    if (change === 'document') state.topDocumentId = 'same-url-new-document';
+    if (change === 'match') state.match = { status: 'ok', exact: true, animeId: 202 };
+    if (change === 'account') vm.runInContext('localWriteRevision = crypto.randomUUID(); localWriteBarrier.invalidate();', context);
+    release(); await pending;
+    assert.deepEqual(posts, [], change);
+  }
+});
+
+test('popup history listener is readonly and rejects persisted-only document state', async () => {
+  let reads = 0; const posts = [];
+  const { context, chrome } = loadServiceWorker({
+    historyFetchImpl: async () => { reads++; return { ok: true, status: 200, json: async () => adoptionSnapshot(true) }; },
+    fetchImpl: async (_url, options) => { posts.push(options.body); throw new Error('unexpected_write'); },
+  });
+  context.activeSyncAccount = async () => ({ userId: 18 });
+  const state = { ...adoptionState(), tabId: 71 };
+  context.testHistoryState = state;
+  vm.runInContext('stateByTab[71] = testHistoryState;', context);
+  const revision = (await context.handlePopupRequest({ type: 'popup-runtime-info' })).payload.localWriteRevision;
+  const send = (tabId) => new Promise((resolve) => {
+    chrome.runtime.onMessage.listener({ type: 'popup-watch-history', tabId, expectedRevision: revision },
+      { id: chrome.runtime.id, url: `chrome-extension://${chrome.runtime.id}/popup.html` }, resolve);
+  });
+  const result = await send(71);
+  assert.equal(result.status, 200); assert.equal(result.payload.snapshot.history_adopted, true);
+  assert.equal((await send(72)).status, 409);
+  assert.equal(reads, 1); assert.deepEqual(posts, [], 'open/read never initializes or starts a cycle');
+});
+
+test('adopted history blocks actual popup manual sync and final tab-close producers', async () => {
+  for (const producer of ['popup', 'tab-close']) {
+    const posts = [];
+    const { context, storage } = loadServiceWorker({
+      historyFetchImpl: async () => ({ ok: true, status: 200, json: async () => adoptionSnapshot(true) }),
+      fetchImpl: async (url, options) => { if (options.method === 'POST') posts.push(url);
+        return { ok: true, status: 200, json: async () => ({ success: true, data: { status: null } }) }; },
+    });
+    context.activeSyncAccount = async () => ({ userId: 18 });
+    const state = { ...adoptionState(), tabId: 71 };
+    if (producer === 'popup') {
+      context.testHistoryState = state;
+      vm.runInContext('stateByTab[71] = testHistoryState;', context);
+      const response = await context.syncPopupCurrent({ tabId: 71, expectedUserId: 18 });
+      assert.equal(response.payload.progressSynced, false);
+      assert.equal(response.payload.statusSynced, false);
+    } else {
+      await storage.session.set({ 'tab:71': state });
+      await context.finalizeRemovedTab(71);
+      assert.equal((await storage.session.get('tab:71'))['tab:71'], undefined);
+    }
+    assert.deepEqual(posts, [], producer);
+  }
+});
+
 function makeStorage() {
   const data = new Map();
   return {
@@ -34,7 +247,7 @@ function makeStorage() {
   };
 }
 
-function loadServiceWorker({ fetchImpl } = {}) {
+function loadServiceWorker({ fetchImpl, historyFetchImpl } = {}) {
   const local = makeStorage();
   const session = makeStorage();
   const actionCalls = {
@@ -82,10 +295,27 @@ function loadServiceWorker({ fetchImpl } = {}) {
     console,
     crypto: require('node:crypto').webcrypto,
     URL,
+    URLSearchParams,
+    TextEncoder,
     globalThis: undefined,
     AbortSignal,
     setTimeout,
-    fetch: fetchImpl,
+    // Existing legacy tests model a supported, explicitly unadopted account.
+    // Adoption regressions supply their own history transport, not a bypass of
+    // the actual controller/validator or writer admission.
+    fetch: async (url, options) => {
+      if (new URL(url).pathname === '/api/extension/history.php') {
+        if (historyFetchImpl) return historyFetchImpl(url, options);
+        const query = new URL(url).searchParams;
+        const animeId = Number(query.get('anime_id'));
+        return { ok: true, status: 200, json: async () => ({
+          user_id: Number(query.get('expected_user_id')), requested_anime_id: animeId,
+          effective_anime_id: animeId, history_adopted: false, readiness: 'ready',
+          foreground: { anime_id: animeId, generation: 0, cycle_id: null },
+        }) };
+      }
+      return fetchImpl(url, options);
+    },
     chrome,
   });
   context.globalThis = context;

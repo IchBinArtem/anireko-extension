@@ -18,6 +18,10 @@ const actionIconRenderKeyByTab = new Map();
 const actionBadgeRenderKeyByTab = new Map();
 let historyQueue = Promise.resolve();
 const progressSyncQueues = new WeakMap();
+// Volatile, exact-source snapshots only. Unknown is never legacy permission.
+// One read per binding; an unavailable read/conflict stays closed until an
+// explicit refresh. No timeupdate polling or persisted false classification.
+const watchHistoryReads = new WeakMap();
 let localWriteBarrier = AniRekoWatchWriteBarrier.create();
 let localWriteRevision = crypto.randomUUID();
 let localControlInFlight = null;
@@ -1102,6 +1106,74 @@ async function trustedWriteContext(state) {
   return { ok: true, origin };
 }
 
+function watchHistoryBindingCurrent(entry, event, writeBinding, userId) {
+  return entry?.userId === userId && entry.animeId === event.match.animeId
+    && entry.revision === writeBinding.revision && entry.pageUrl === event.pageUrl
+    && entry.documentId === event.topDocumentId && entry.navigationToken === event.navigationToken
+    && entry.sourceOrigin === event.sourceOrigin
+    && localWriteCurrent(writeBinding);
+}
+
+function validWatchHistorySnapshot(value, userId, animeId) {
+  const positive = (number) => Number.isSafeInteger(number) && number > 0 && number <= 2147483647;
+  return value?.user_id === userId && value.requested_anime_id === animeId
+    && typeof value.history_adopted === 'boolean' && positive(value.effective_anime_id)
+    && ['ready', 'reconciliation_required'].includes(value.readiness)
+    && value.foreground?.anime_id === value.effective_anime_id
+    && Number.isSafeInteger(value.foreground.generation) && value.foreground.generation >= 0
+    && (value.foreground.cycle_id === null || (typeof value.foreground.cycle_id === 'string'
+      && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value.foreground.cycle_id)))
+    && (value.history_adopted !== false || value.foreground.cycle_id === null);
+}
+
+async function readWatchHistory(event, writeBinding, userId, refresh = false) {
+  if (!progressEventCurrent(event, writeBinding)) return null;
+  let entry = watchHistoryReads.get(event.liveState);
+  if (refresh || !watchHistoryBindingCurrent(entry, event, writeBinding, userId)) {
+    entry = { userId, animeId: event.match.animeId, revision: writeBinding.revision,
+      pageUrl: event.pageUrl, documentId: event.topDocumentId, navigationToken: event.navigationToken,
+      sourceOrigin: event.sourceOrigin,
+      snapshot: null, blocked: false, pending: null };
+    watchHistoryReads.set(event.liveState, entry);
+    entry.pending = (async () => {
+      try {
+        const response = await apiClient.request('history-read', {
+          anime_id: entry.animeId, expected_user_id: userId,
+        });
+        if (watchHistoryReads.get(event.liveState) !== entry || !localWriteCurrent(writeBinding)) return;
+        if (response?.ok === true && response.status === 200
+          && validWatchHistorySnapshot(response.payload, userId, entry.animeId)) {
+          // Copy to prevent an async consumer or popup from changing admission.
+          entry.snapshot = JSON.parse(JSON.stringify(response.payload));
+        }
+      } catch { /* unavailable remains unknown, not an implicit legacy fallback */ }
+    })();
+  }
+  await entry.pending;
+  if (!progressEventCurrent(event, writeBinding) || watchHistoryReads.get(event.liveState) !== entry
+    || !watchHistoryBindingCurrent(entry, event, writeBinding, userId) || entry.blocked) return null;
+  return entry.snapshot;
+}
+
+async function legacyWatchWriteAllowed(event, writeBinding, userId) {
+  await readWatchHistory(event, writeBinding, userId);
+  return legacyWatchWriteStillAllowed(event, writeBinding, userId);
+}
+
+function legacyWatchWriteStillAllowed(event, writeBinding, userId) {
+  const entry = watchHistoryReads.get(event.liveState);
+  return progressEventCurrent(event, writeBinding)
+    && watchHistoryBindingCurrent(entry, event, writeBinding, userId) && !entry.blocked
+    && entry.snapshot?.history_adopted === false && entry.snapshot.readiness === 'ready';
+}
+
+function blockLegacyWatchWrites(event, writeBinding, userId) {
+  const entry = watchHistoryReads.get(event.liveState);
+  if (watchHistoryBindingCurrent(entry, event, writeBinding, userId)) {
+    entry.blocked = true; entry.snapshot = null;
+  }
+}
+
 async function maybeAutoMark(state, writeBinding = captureLocalWrite(), liveState = state) {
   const event = captureProgressEvent(state, liveState);
   let match = event.match;
@@ -1171,6 +1243,8 @@ async function maybeAutoMark(state, writeBinding = captureLocalWrite(), liveStat
       autoMarkRetryAt[markKey] = now + 120_000;
       return;
     }
+    if (!await legacyWatchWriteAllowed(event, writeBinding, syncAccount.userId)) return;
+    if (!progressEventCurrent(event, writeBinding)) return;
     const statusResult = await apiClient.request('status-get', { animeId: match.animeId });
     requireLocalWrite(writeBinding);
     if (!progressEventCurrent(event, writeBinding)) return;
@@ -1185,11 +1259,13 @@ async function maybeAutoMark(state, writeBinding = captureLocalWrite(), liveStat
       autoMarkedInSession.add(markKey);
       return;
     }
+    if (!legacyWatchWriteStillAllowed(event, writeBinding, syncAccount.userId)) return;
     const postResult = await apiClient.request('status-write', {
       animeId: match.animeId,
       status: nextStatus,
       expectedUserId: syncAccount.userId,
     });
+    if (postResult.status === 409) blockLegacyWatchWrites(event, writeBinding, syncAccount.userId);
     requireLocalWrite(writeBinding);
     if (!progressEventCurrent(event, writeBinding)) return;
     if (postResult.ok && postResult.payload?.success) {
@@ -1286,6 +1362,10 @@ async function syncProgressOnce(state, urgent, writeBinding = captureLocalWrite(
   requireLocalWrite(writeBinding);
   if (!progressEventCurrent(event, writeBinding)) return;
   if (!syncAccount) return;
+  if (!await legacyWatchWriteAllowed(event, writeBinding, syncAccount.userId)) return;
+  // An awaited admission result can become stale in its caller's microtask.
+  // Recheck synchronously before reserving progress and immediately entering POST.
+  if (!legacyWatchWriteStillAllowed(event, writeBinding, syncAccount.userId)) return;
   state.progressSync = { key, at: now, position };
   const payload = {
     anime_id: match.animeId,
@@ -1304,6 +1384,7 @@ async function syncProgressOnce(state, urgent, writeBinding = captureLocalWrite(
       voice: payload.voice,
       expectedUserId: payload.expected_user_id,
     });
+    if (result.status === 409) blockLegacyWatchWrites(event, writeBinding, syncAccount.userId);
     if (!progressEventCurrent(event, writeBinding)) return;
     if (!result.ok && result.status !== 204) {
       state.progressSync = sync;
@@ -2202,6 +2283,25 @@ async function handlePopupRequest(message, writeBinding = captureLocalWrite()) {
       return unbindPopupAnime(message, writeBinding);
     case 'popup-sync-current':
       return syncPopupCurrent(message, writeBinding);
+    case 'popup-watch-history': {
+      if (message.expectedRevision !== localWriteRevision || !Number.isInteger(message.tabId)) {
+        return { ok: false, status: 409, payload: { error: 'write_binding_changed' } };
+      }
+      // Read only live sensor state: persisted state is not a document capability.
+      const state = stateByTab[String(message.tabId)];
+      if (!state || !confirmedAnimeMatch(state.match) || !state.topDocumentId || !state.navigationToken) {
+        return { ok: false, status: 409, payload: { error: 'current_document_required' } };
+      }
+      const event = captureProgressEvent(state);
+      const syncAccount = await activeSyncAccount(writeBinding);
+      if (!syncAccount || !progressEventCurrent(event, writeBinding)) {
+        return { ok: false, status: 409, payload: { error: 'sync_account_mismatch' } };
+      }
+      const snapshot = await readWatchHistory(event, writeBinding, syncAccount.userId, true);
+      return snapshot
+        ? { ok: true, status: 200, payload: { snapshot } }
+        : { ok: false, status: 503, payload: { error: 'history_snapshot_unavailable' } };
+    }
     case 'popup-progress-all': {
       const expectedUserId = Number(message.expectedUserId);
       const syncAccount = await activeSyncAccount(writeBinding);
