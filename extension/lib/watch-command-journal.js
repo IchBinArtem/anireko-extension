@@ -130,6 +130,7 @@
           const value = response?.payload;
           if (response?.ok !== true || response.status !== 200 || value?.user_id !== userId
             || value.requested_anime_id !== record.request.anime_id
+            || typeof value.history_adopted !== 'boolean'
             || !id(value.effective_anime_id) || !foreground(value.foreground)
             || !['ready', 'reconciliation_required'].includes(value.readiness)) {
             return { refreshed: false, response };

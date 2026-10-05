@@ -10,6 +10,41 @@ const binding = { document_id: 'document-1', navigation_token: 'navigation-1', r
 const ack = { history_id: uuid, anime_id: 10, foreground: { anime_id: 10, generation: 1, cycle_id: uuid }, state: { anime_id: 10, version: 1 } };
 const freshCycle = '22345678-1234-4234-8234-123456789abc';
 const copy = (value) => structuredClone(value);
+test('fresh read without authoritative boolean adoption retains acknowledged intent', async () => {
+  for (const adoption of [undefined, null, 'false', 0, {}, []]) {
+    const data = {};
+    const { journal, key } = fixture({ data, fetchImpl: async (_url, init) => ({
+      ok: true, status: 200, json: async () => init.method === 'POST' ? ack : {
+        user_id: 1, requested_anime_id: 10, effective_anime_id: 10,
+        readiness: 'ready', foreground: ack.foreground,
+        ...(adoption === undefined ? {} : { history_adopted: adoption }),
+      },
+    }) });
+    await journal.admit(journal.capture('history-command', request, binding));
+    assert.equal((await journal.deliver(1)).acknowledged, true);
+    assert.equal((await journal.refresh(1)).refreshed, false,
+      'missing/unsupported adoption is unknown, not permission to release pending');
+    assert.equal(data[key].acknowledged, true);
+    assert.equal(data[key].request.command_id, uuid);
+  }
+});
+test('fresh read accepts both authoritative boolean adoption values without inference', async () => {
+  for (const adopted of [false, true]) {
+    const data = {};
+    const { journal, key } = fixture({ data, fetchImpl: async (_url, init) => ({
+      ok: true, status: 200, json: async () => init.method === 'POST' ? ack : {
+        user_id: 1, requested_anime_id: 10, effective_anime_id: 10,
+        readiness: 'ready', foreground: ack.foreground, history_adopted: adopted,
+      },
+    }) });
+    await journal.admit(journal.capture('history-command', request, binding));
+    await journal.deliver(1);
+    const result = await journal.refresh(1);
+    assert.equal(result.refreshed, true);
+    assert.equal(result.snapshot.history_adopted, adopted);
+    assert.equal(data[key], undefined);
+  }
+});
 function deferred() { let resolve; const promise = new Promise((done) => { resolve = done; }); return { promise, resolve }; }
 function fixture({ data = {}, fetchImpl, authorize = async () => true, setImpl } = {}) {
   const calls = [];
@@ -26,7 +61,7 @@ function fixture({ data = {}, fetchImpl, authorize = async () => true, setImpl }
     if (fetchImpl) return fetchImpl(url, init);
     const payload = init.method === 'POST'
       ? ack
-      : { user_id: 1, requested_anime_id: 10, effective_anime_id: 10, readiness: 'ready', foreground: { anime_id: 10, generation: 2, cycle_id: freshCycle } };
+      : { user_id: 1, requested_anime_id: 10, effective_anime_id: 10, history_adopted: true, readiness: 'ready', foreground: { anime_id: 10, generation: 2, cycle_id: freshCycle } };
     return { ok: true, status: 200, json: async () => payload };
   } });
   const factory = context.AniRekoWatchCommandJournal;
@@ -153,7 +188,7 @@ test('start accepts actual resolved canonical or preserved alias receipt without
     const receipt = { ...ack, anime_id: resultId, state: { anime_id: resultId, version: 1 } };
     const { journal, calls } = fixture({ fetchImpl: async (_url, init) => ({ ok: true, status: 200,
       json: async () => init.method === 'POST' ? receipt : {
-        user_id: 1, requested_anime_id: 20, effective_anime_id: 10, readiness: 'ready', foreground: ack.foreground,
+        user_id: 1, requested_anime_id: 20, effective_anime_id: 10, history_adopted: true, readiness: 'ready', foreground: ack.foreground,
       } }) });
     await journal.admit(journal.capture('history-command', original, binding));
     assert.equal((await journal.deliver(1)).acknowledged, true);
