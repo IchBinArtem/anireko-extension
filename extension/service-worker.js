@@ -2,7 +2,8 @@ importScripts(
   'lib/runtime-config.js',
   'lib/api-client.js',
   'lib/trust.js',
-  'lib/auto-mark.js'
+  'lib/auto-mark.js',
+  'lib/watch-write-barrier.js'
 );
 
 const apiClient = AniRekoApiClient.create({
@@ -17,6 +18,74 @@ const actionIconRenderKeyByTab = new Map();
 const actionBadgeRenderKeyByTab = new Map();
 let historyQueue = Promise.resolve();
 const progressSyncQueues = new WeakMap();
+let localWriteBarrier = AniRekoWatchWriteBarrier.create();
+let localWriteRevision = crypto.randomUUID();
+let localControlInFlight = null;
+
+function captureLocalWrite() {
+  return Object.freeze({ barrier: localWriteBarrier, token: localWriteBarrier.capture(), revision: localWriteRevision });
+}
+
+function localWriteCurrent(binding) {
+  return binding?.barrier === localWriteBarrier && binding.revision === localWriteRevision
+    && binding.barrier.current(binding.token);
+}
+
+function requireLocalWrite(binding) {
+  if (!localWriteCurrent(binding)) throw new Error('write_binding_changed');
+}
+
+function writeOperationInFlight(operations, key) {
+  return localWriteCurrent(operations.get(key)?.binding);
+}
+
+function reserveWriteOperation(operations, key, binding) {
+  requireLocalWrite(binding);
+  if (writeOperationInFlight(operations, key)) return null;
+  const reservation = Object.freeze({ binding });
+  operations.set(key, reservation);
+  return reservation;
+}
+
+function releaseWriteOperation(operations, key, reservation) {
+  if (operations.get(key) === reservation) operations.delete(key);
+}
+
+function setLocal(binding, items) {
+  requireLocalWrite(binding);
+  return binding.barrier.write(binding.token, () => chrome.storage.local.set(items));
+}
+
+function removeLocal(binding, keys) {
+  requireLocalWrite(binding);
+  return binding.barrier.write(binding.token, () => chrome.storage.local.remove(keys));
+}
+
+function setSession(binding, items) {
+  requireLocalWrite(binding);
+  return binding.barrier.write(binding.token, () => chrome.storage.session.set(items));
+}
+
+function removeSession(binding, keys) {
+  requireLocalWrite(binding);
+  return binding.barrier.write(binding.token, () => chrome.storage.session.remove(keys));
+}
+
+function exclusiveLocalControl(operation) {
+  // Never let a distinct control operation borrow another operation's ACK.
+  if (localControlInFlight) return Promise.reject(new Error('local_control_busy'));
+  const previous = localWriteBarrier;
+  localWriteRevision = crypto.randomUUID();
+  // Close before the first await. Reopening uses a new instance, so callbacks
+  // holding the old instance cannot become valid after control completes.
+  const pending = previous.closeAndClear(operation).then(() => {
+    localWriteBarrier = AniRekoWatchWriteBarrier.create();
+  });
+  localControlInFlight = pending;
+  pending.then(() => { if (localControlInFlight === pending) localControlInFlight = null; },
+    () => { if (localControlInFlight === pending) localControlInFlight = null; });
+  return pending;
+}
 
 function invalidateActionPresentation(tabId) {
   const key = String(tabId);
@@ -46,10 +115,10 @@ let historyCache = null;
 let historyLastFlushAt = 0;
 
 const autoMarkedInSession = new Set();
-const autoMarkInFlight = new Set();
+const autoMarkInFlight = new Map();
 const autoMarkRetryAt = {};
 const completionMetadataRefreshedInSession = new Set();
-const completionMetadataRefreshInFlight = new Set();
+const completionMetadataRefreshInFlight = new Map();
 const completionMetadataRefreshRetryAt = {};
 const SYNC_ACCOUNT_KEY = 'sync-account';
 const PRIVACY_CONSENT_KEY = 'privacy-consent';
@@ -65,13 +134,13 @@ async function privacyConsentAccepted() {
   return consent?.version === PRIVACY_CONSENT_VERSION && Number.isFinite(consent.acceptedAt);
 }
 
-async function disableTab(tabId) {
+async function disableTab(tabId, writeBinding = captureLocalWrite()) {
   try { await chrome.tabs.sendMessage(tabId, { type: 'anireko-disable-detector' }); } catch { /* no script */ }
   delete stateByTab[String(tabId)];
   delete tabQueues[String(tabId)];
   delete tabStateFlushAt[String(tabId)];
   invalidateActionPresentation(tabId);
-  await chrome.storage.session.remove(`tab:${tabId}`);
+  if (writeBinding !== false) await removeSession(writeBinding, `tab:${tabId}`);
 }
 
 async function authorizedDocument(messageContext) {
@@ -107,6 +176,11 @@ function noteSessionIdentity(result) {
   sessionInfoCache = result;
   sessionInfoExpiresAt = Date.now() + SESSION_INFO_TTL_MS;
   if (previousKey !== null && previousKey !== nextKey) {
+    // An observed cookie-account transition is a new write epoch. Pending
+    // responses keep their original binding and cannot publish into it.
+    localWriteRevision = crypto.randomUUID();
+    localWriteBarrier.invalidate();
+    resetAccountSyncGates();
     tasteCache.clear();
     tasteInFlight.clear();
     for (const state of Object.values(stateByTab)) {
@@ -116,17 +190,27 @@ function noteSessionIdentity(result) {
   return result;
 }
 
-async function currentSessionInfo(force = false) {
-  if (!force && sessionInfoCache && Date.now() < sessionInfoExpiresAt) return sessionInfoCache;
-  if (sessionInfoInFlight) return sessionInfoInFlight;
-  sessionInfoInFlight = apiClient.request('session-info')
-    .then(noteSessionIdentity)
-    .catch(() => noteSessionIdentity({ ok: false, status: 503, payload: null }))
-    .finally(() => { sessionInfoInFlight = null; });
-  return sessionInfoInFlight;
+function resetAccountSyncGates() {
+  autoMarkedInSession.clear();
+  for (const key of Object.keys(autoMarkRetryAt)) delete autoMarkRetryAt[key];
 }
 
-async function activeSyncAccount() {
+async function currentSessionInfo(force = false, writeBinding = captureLocalWrite()) {
+  requireLocalWrite(writeBinding);
+  if (!force && sessionInfoCache && Date.now() < sessionInfoExpiresAt) return sessionInfoCache;
+  if (sessionInfoInFlight) return sessionInfoInFlight;
+  const pending = apiClient.request('session-info')
+    .then((result) => { requireLocalWrite(writeBinding); return noteSessionIdentity(result); })
+    .catch((error) => {
+      requireLocalWrite(writeBinding);
+      return noteSessionIdentity({ ok: false, status: 503, payload: null });
+    })
+    .finally(() => { if (sessionInfoInFlight === pending) sessionInfoInFlight = null; });
+  sessionInfoInFlight = pending;
+  return pending;
+}
+
+async function activeSyncAccount(writeBinding = captureLocalWrite()) {
   if (!await privacyConsentAccepted()) return null;
   const stored = await chrome.storage.local.get(['auto-mark', SYNC_ACCOUNT_KEY]);
   const bound = stored[SYNC_ACCOUNT_KEY];
@@ -135,7 +219,8 @@ async function activeSyncAccount() {
     return null;
   }
   try {
-    const { ok, payload } = await currentSessionInfo(true);
+    const { ok, payload } = await currentSessionInfo(true, writeBinding);
+    requireLocalWrite(writeBinding);
     const currentUserId = Number(payload?.user?.id);
     if (!ok || !payload?.success || currentUserId !== expectedUserId) return null;
     return { userId: expectedUserId };
@@ -471,7 +556,7 @@ async function manualMatchBinding(wanted) {
   return candidate;
 }
 
-async function saveManualMatchBinding(wanted, candidate) {
+async function saveManualMatchBinding(wanted, candidate, _ignoredLegacyQuery, writeBinding = captureLocalWrite()) {
   const mutation = manualMatchBindingsQueue.catch(() => {}).then(async () => {
     const stored = await chrome.storage.local.get(MANUAL_MATCH_BINDINGS_KEY);
     const current = stored[MANUAL_MATCH_BINDINGS_KEY];
@@ -485,7 +570,7 @@ async function saveManualMatchBinding(wanted, candidate) {
     const ordered = Object.entries(items)
       .sort(([, left], [, right]) => Number(right.boundAt || 0) - Number(left.boundAt || 0))
       .slice(0, MANUAL_MATCH_BINDINGS_MAX);
-    await chrome.storage.local.set({
+    await setLocal(writeBinding, {
       [MANUAL_MATCH_BINDINGS_KEY]: {
         version: MANUAL_MATCH_BINDINGS_VERSION,
         items: Object.fromEntries(ordered),
@@ -496,14 +581,14 @@ async function saveManualMatchBinding(wanted, candidate) {
   return mutation;
 }
 
-async function removeManualMatchBinding(wanted) {
+async function removeManualMatchBinding(wanted, writeBinding = captureLocalWrite()) {
   const mutation = manualMatchBindingsQueue.catch(() => {}).then(async () => {
     const stored = await chrome.storage.local.get(MANUAL_MATCH_BINDINGS_KEY);
     const current = stored[MANUAL_MATCH_BINDINGS_KEY];
     if (current?.version !== MANUAL_MATCH_BINDINGS_VERSION || !current.items?.[wanted]) return;
     const items = { ...current.items };
     delete items[wanted];
-    await chrome.storage.local.set({
+    await setLocal(writeBinding, {
       [MANUAL_MATCH_BINDINGS_KEY]: { version: MANUAL_MATCH_BINDINGS_VERSION, items },
     });
   });
@@ -560,22 +645,24 @@ async function searchTitleCandidates(title) {
 // KAN-2695: global persistent cache + in-flight dedup + error backoff. Most
 // titles use one search request; an explicit season may also need a base-title
 // search and one bounded alias probe before it is cached.
-function resolveAnimeMatch(title, { forceRefresh = false } = {}) {
+function resolveAnimeMatch(title, { forceRefresh = false, writeBinding = captureLocalWrite() } = {}) {
+  requireLocalWrite(writeBinding);
   const wanted = titleSearchKey(title);
   if (!wanted) return Promise.resolve({ status: 'none', query: title, resolvedAt: Date.now() });
-  const requestKey = `${wanted}:${forceRefresh ? 'fresh' : 'cached'}`;
+  const requestKey = `${writeBinding.revision}:${wanted}:${forceRefresh ? 'fresh' : 'cached'}`;
   let pending = searchInFlight.get(requestKey);
   if (!pending) {
-    pending = resolveAnimeMatchWithBinding(title, wanted, forceRefresh)
+    pending = resolveAnimeMatchWithBinding(title, wanted, forceRefresh, writeBinding)
       .finally(() => searchInFlight.delete(requestKey));
     searchInFlight.set(requestKey, pending);
   }
   return pending;
 }
 
-async function resolveAnimeMatchWithBinding(title, wanted, forceRefresh) {
+async function resolveAnimeMatchWithBinding(title, wanted, forceRefresh, writeBinding = captureLocalWrite()) {
   const binding = await manualMatchBinding(wanted);
-  if (!binding) return resolveAnimeMatchUncached(title, wanted, forceRefresh);
+  requireLocalWrite(writeBinding);
+  if (!binding) return resolveAnimeMatchUncached(title, wanted, forceRefresh, writeBinding);
   if (!forceRefresh) {
     return { status: 'ok', query: title, ...binding, exact: false, manual: true, resolvedAt: Date.now() };
   }
@@ -585,14 +672,14 @@ async function resolveAnimeMatchWithBinding(title, wanted, forceRefresh) {
     if (!refreshed) {
       return { status: 'error', query: title, error: 'manual match not found', resolvedAt: Date.now() };
     }
-    await saveManualMatchBinding(wanted, refreshed);
+    await saveManualMatchBinding(wanted, refreshed, undefined, writeBinding);
     return { status: 'ok', query: title, ...refreshed, exact: false, manual: true, resolvedAt: Date.now() };
   } catch (error) {
     return { status: 'error', query: title, error: String(error), resolvedAt: Date.now() };
   }
 }
 
-async function resolveAnimeMatchUncached(title, wanted, forceRefresh = false) {
+async function resolveAnimeMatchUncached(title, wanted, forceRefresh = false, writeBinding = captureLocalWrite()) {
   const now = Date.now();
   const stored = await chrome.storage.local.get([SEARCH_CACHE_KEY, 'search-cache-version']);
   const cacheVersion = SEARCH_CACHE_VERSION;
@@ -613,7 +700,7 @@ async function resolveAnimeMatchUncached(title, wanted, forceRefresh = false) {
         seasonAlias: false, resolvedAt: now,
       };
       cache[wanted] = { match: promoted, expiresAt: now + SEARCH_TTL_PARTIAL_MS };
-      await chrome.storage.local.set({
+      await setLocal(writeBinding, {
         [SEARCH_CACHE_KEY]: cache,
         'search-cache-version': cacheVersion,
       });
@@ -650,6 +737,7 @@ async function resolveAnimeMatchUncached(title, wanted, forceRefresh = false) {
         }
         : { status: 'ambiguous', query: title, candidates: exact.length ? exact : results, resolvedAt: now };
     }
+    requireLocalWrite(writeBinding);
     searchFailCount = 0;
     searchBackoffUntil = 0;
     const retryAmbiguousSeason = match.status === 'ambiguous'
@@ -667,12 +755,13 @@ async function resolveAnimeMatchUncached(title, wanted, forceRefresh = false) {
         .slice(0, keys.length - SEARCH_CACHE_MAX)
         .forEach((key) => delete cache[key]);
     }
-    await chrome.storage.local.set({
+    await setLocal(writeBinding, {
       [SEARCH_CACHE_KEY]: cache,
       'search-cache-version': cacheVersion,
     });
     return match;
   } catch (error) {
+    requireLocalWrite(writeBinding);
     searchFailCount += 1;
     searchBackoffUntil = now + Math.min(30 * 60_000, 30_000 * 2 ** (searchFailCount - 1));
     const fallback = { status: 'error', query: title, error: String(error), resolvedAt: now };
@@ -683,23 +772,25 @@ async function resolveAnimeMatchUncached(title, wanted, forceRefresh = false) {
 
 // Taste match% for the recognized anime (KAN-2697). Uses the shared cookie
 // session; guests get {status:'guest'} and no badge.
-function resolveTasteMatch(animeId, userKey) {
+function resolveTasteMatch(animeId, userKey, writeBinding = captureLocalWrite()) {
+  requireLocalWrite(writeBinding);
   const cacheKey = `${userKey}:${animeId}`;
   const cached = tasteCache.get(cacheKey);
   if (cached && Date.now() < cached.expiresAt) return Promise.resolve(cached.taste);
   let pending = tasteInFlight.get(cacheKey);
   if (!pending) {
-    pending = resolveTasteMatchUncached(animeId, userKey, cacheKey)
-      .finally(() => tasteInFlight.delete(cacheKey));
+    pending = resolveTasteMatchUncached(animeId, userKey, cacheKey, writeBinding)
+      .finally(() => { if (tasteInFlight.get(cacheKey) === pending) tasteInFlight.delete(cacheKey); });
     tasteInFlight.set(cacheKey, pending);
   }
   return pending;
 }
 
-async function resolveTasteMatchUncached(animeId, userKey, cacheKey) {
+async function resolveTasteMatchUncached(animeId, userKey, cacheKey, writeBinding = captureLocalWrite()) {
   const now = Date.now();
   try {
     const { ok, status, payload } = await apiClient.request('taste-match', { animeId });
+    requireLocalWrite(writeBinding);
     if (!ok) throw new Error(`HTTP ${status}`);
     const data = payload?.data || {};
     let taste;
@@ -729,6 +820,7 @@ async function resolveTasteMatchUncached(animeId, userKey, cacheKey) {
     }
     return taste;
   } catch (error) {
+    requireLocalWrite(writeBinding);
     return { status: 'error', animeId, userKey, error: String(error), resolvedAt: now };
   }
 }
@@ -809,17 +901,18 @@ function diagnosticProbe(probe) {
 // One delayed check per tab: fires after the grace period so late-initializing
 // players (click-to-load) don't produce false reports. If the service worker
 // dies before the timer fires, the report simply happens on a later visit.
-function scheduleDiagTimer(tabId, delay, attempt, retryMs) {
+function scheduleDiagTimer(tabId, delay, attempt, retryMs, writeBinding = captureLocalWrite()) {
   diagTimers.add(tabId);
   setTimeout(async () => {
     diagTimers.delete(tabId);
+    if (!localWriteCurrent(writeBinding)) return;
     const latest = stateByTab[tabId];
     if (!latest || latest.diagSentAt || latest.diagDone) return;
-    await maybeSendDiagnostic(latest).catch(() => {});
+    await maybeSendDiagnostic(latest, writeBinding).catch(() => {});
     // Проба могла дозреть позже грейса (медленный SPA) — ограниченные
     // ретраи вместо пересоздания таймера на каждом сообщении.
     if (!latest.diagSentAt && !latest.diagDone && attempt < 3) {
-      scheduleDiagTimer(tabId, retryMs, attempt + 1, retryMs);
+      scheduleDiagTimer(tabId, retryMs, attempt + 1, retryMs, writeBinding);
     }
   }, delay);
 }
@@ -828,7 +921,7 @@ function scheduleDiagTimer(tabId, delay, attempt, retryMs) {
 // начать цикл заново — diagSentAt/diagDone в состоянии защищают от дублей.
 const diagCycles = new Set();
 
-async function maybeScheduleDiagnostic(tabId) {
+async function maybeScheduleDiagnostic(tabId, writeBinding = captureLocalWrite()) {
   const current = stateByTab[tabId];
   if (!current?.recognition?.title || !confirmedAnimeMatch(current.match)
     || !Number.isFinite(current.playerInteractionAt)
@@ -837,6 +930,7 @@ async function maybeScheduleDiagnostic(tabId) {
     || current.diagSentAt || current.diagDone
     || diagTimers.has(tabId)) return;
   const stored = await chrome.storage.local.get(['diag-grace-ms', PRIVACY_CONSENT_KEY]);
+  requireLocalWrite(writeBinding);
   if (stored[PRIVACY_CONSENT_KEY]?.diagnostics !== true) return;
   const cycleKey = `${tabId}:${current.pageUrl || current.recognition.url}`;
   if (diagCycles.has(cycleKey)) return;
@@ -845,10 +939,10 @@ async function maybeScheduleDiagnostic(tabId) {
   const graceMs = Number.isFinite(stored['diag-grace-ms']) ? stored['diag-grace-ms'] : 15000;
   const signalAt = Math.max(current.recognition.observedAt, current.playerInteractionAt);
   const delay = Math.max(500, signalAt + graceMs + 250 - Date.now());
-  scheduleDiagTimer(tabId, delay, 1, Math.max(graceMs, 5000));
+  scheduleDiagTimer(tabId, delay, 1, Math.max(graceMs, 5000), writeBinding);
 }
 
-async function maybeSendDiagnostic(current) {
+async function maybeSendDiagnostic(current, writeBinding = captureLocalWrite()) {
   const recognition = current.recognition;
   const probe = current.probe;
   if (!recognition?.title || !probe || !confirmedAnimeMatch(current.match)
@@ -894,11 +988,12 @@ async function maybeSendDiagnostic(current) {
       },
     });
     if (ok || status === 204) {
+      requireLocalWrite(writeBinding);
       current.diagSentAt = Date.now();
       const pruned = Object.fromEntries(Object.entries({ ...sent, [host]: Date.now() })
         .sort(([, left], [, right]) => right - left)
         .slice(0, 50));
-      await chrome.storage.local.set({ 'diag-sent': pruned });
+      await setLocal(writeBinding, { 'diag-sent': pruned });
     }
   } catch { /* transient — retried on a later visit */ } finally {
     diagInFlight.delete(inFlightKey);
@@ -910,7 +1005,7 @@ async function maybeSendDiagnostic(current) {
 // the per-report consent. The worker derives the host from trusted tab state and
 // sends the same structural allowlist — never the URL, path, page title/content,
 // cookies, account identity, or watch history.
-async function reportRecognitionMiss(tabId) {
+async function reportRecognitionMiss(tabId, writeBinding = captureLocalWrite()) {
   if (!Number.isInteger(tabId) || tabId <= 0) {
     return { ok: false, status: 400, payload: { error: 'invalid_tab' } };
   }
@@ -962,7 +1057,7 @@ async function reportRecognitionMiss(tabId) {
     const pruned = Object.fromEntries(Object.entries({ ...sent, [host]: Date.now() })
       .sort(([, left], [, right]) => right - left)
       .slice(0, 50));
-    await chrome.storage.local.set({ [storageKey]: pruned });
+    await setLocal(writeBinding, { [storageKey]: pruned });
     return { ok: true, status: 204, payload: { duplicate: false } };
   } finally {
     diagInFlight.delete(inFlightKey);
@@ -1007,13 +1102,17 @@ async function trustedWriteContext(state) {
   return { ok: true, origin };
 }
 
-async function maybeAutoMark(state) {
-  let match = state.match;
-  const player = state.player;
+async function maybeAutoMark(state, writeBinding = captureLocalWrite(), liveState = state) {
+  const event = captureProgressEvent(state, liveState);
+  let match = event.match;
+  const player = event.player;
+  if (!progressEventCurrent(event, writeBinding)) return;
   if (!player?.watched || !confirmedAnimeMatch(match)) return;
-  const history = await loadHistory();
+  const history = await loadHistory(writeBinding);
+  requireLocalWrite(writeBinding);
+  if (!progressEventCurrent(event, writeBinding)) return;
   const { episodes, fullWatch } = countWatchedForTitle(
-    history, historyTitleKey(state.recognition?.title), match.animeId
+    history, historyTitleKey(event.recognition?.title), match.animeId
   );
   const currentEpisode = Number(player.episode);
   const reachedLaterEpisode = Number.isInteger(currentEpisode) && currentEpisode >= 2;
@@ -1021,12 +1120,15 @@ async function maybeAutoMark(state) {
   if (AniRekoAutoMark.needsMetadataRefresh(match, player.episode)) {
     const refreshKey = `${match.animeId}:${player.episode ?? 'unknown'}`;
     const now = Date.now();
-    if (completionMetadataRefreshInFlight.has(refreshKey)
+    if (writeOperationInFlight(completionMetadataRefreshInFlight, refreshKey)
       || (completionMetadataRefreshRetryAt[refreshKey] || 0) > now) return;
     if (!completionMetadataRefreshedInSession.has(refreshKey)) {
-      completionMetadataRefreshInFlight.add(refreshKey);
+      const reservation = reserveWriteOperation(completionMetadataRefreshInFlight, refreshKey, writeBinding);
+      if (!reservation) return;
       try {
-        const refreshed = await resolveAnimeMatch(state.recognition?.title, { forceRefresh: true });
+        const refreshed = await resolveAnimeMatch(event.recognition?.title, { forceRefresh: true, writeBinding });
+        requireLocalWrite(writeBinding);
+        if (!progressEventCurrent(event, writeBinding)) return;
         if (!confirmedAnimeMatch(refreshed)
           || Number(refreshed.animeId) !== Number(match.animeId)) {
           completionMetadataRefreshRetryAt[refreshKey] = now + 120_000;
@@ -1037,10 +1139,10 @@ async function maybeAutoMark(state) {
         completionMetadataRefreshedInSession.add(refreshKey);
         delete completionMetadataRefreshRetryAt[refreshKey];
       } catch {
-        completionMetadataRefreshRetryAt[refreshKey] = now + 120_000;
+        if (progressEventCurrent(event, writeBinding)) completionMetadataRefreshRetryAt[refreshKey] = now + 120_000;
         return;
       } finally {
-        completionMetadataRefreshInFlight.delete(refreshKey);
+        releaseWriteOperation(completionMetadataRefreshInFlight, refreshKey, reservation);
       }
     }
   }
@@ -1050,22 +1152,28 @@ async function maybeAutoMark(state) {
   // This cheap local gate intentionally precedes activeSyncAccount(), whose
   // live-cookie verification performs /session-info. Watched timeupdate ticks
   // must collapse into a single transition attempt.
-  if (autoMarkedInSession.has(markKey) || autoMarkInFlight.has(markKey)
+  if (autoMarkedInSession.has(markKey) || writeOperationInFlight(autoMarkInFlight, markKey)
     || (autoMarkRetryAt[markKey] || 0) > now) return;
-  const trust = await trustedWriteContext(state);
+  const trust = await trustedWriteContext(event);
+  if (!progressEventCurrent(event, writeBinding)) return;
   if (!trust.ok) {
     state.syncDeniedReason = trust.reason;
     return;
   }
   state.syncDeniedReason = null;
-  autoMarkInFlight.add(markKey);
+  const reservation = reserveWriteOperation(autoMarkInFlight, markKey, writeBinding);
+  if (!reservation) return;
   try {
-    const syncAccount = await activeSyncAccount();
+    const syncAccount = await activeSyncAccount(writeBinding);
+    requireLocalWrite(writeBinding);
+    if (!progressEventCurrent(event, writeBinding)) return;
     if (!syncAccount) {
       autoMarkRetryAt[markKey] = now + 120_000;
       return;
     }
     const statusResult = await apiClient.request('status-get', { animeId: match.animeId });
+    requireLocalWrite(writeBinding);
+    if (!progressEventCurrent(event, writeBinding)) return;
     if (!statusResult.ok || !statusResult.payload?.success) {
       state.syncWriteFailed = true;
       autoMarkRetryAt[markKey] = now + (statusResult.status >= 500 ? 120_000 : 6 * 3600_000);
@@ -1082,6 +1190,8 @@ async function maybeAutoMark(state) {
       status: nextStatus,
       expectedUserId: syncAccount.userId,
     });
+    requireLocalWrite(writeBinding);
+    if (!progressEventCurrent(event, writeBinding)) return;
     if (postResult.ok && postResult.payload?.success) {
       autoMarkedInSession.add(markKey);
       state.autoMark = {
@@ -1095,10 +1205,12 @@ async function maybeAutoMark(state) {
       autoMarkRetryAt[markKey] = now + (postResult.status >= 500 ? 120_000 : 6 * 3600_000);
     }
   } catch {
-    state.syncWriteFailed = true;
-    autoMarkRetryAt[markKey] = now + 120_000;
+    if (progressEventCurrent(event, writeBinding)) {
+      state.syncWriteFailed = true;
+      autoMarkRetryAt[markKey] = now + 120_000;
+    }
   } finally {
-    autoMarkInFlight.delete(markKey);
+    releaseWriteOperation(autoMarkInFlight, markKey, reservation);
   }
 }
 
@@ -1114,7 +1226,7 @@ const PROGRESS_MIN_INTERVAL_MS = 300_000;
 // и (б) нашими же POST-ами — после них серверный GET не нужен вовсе.
 const RESUME_BULK_KEY = 'resume-bulk';
 
-async function updateResumeCache(userId, animeId, progress) {
+async function updateResumeCache(userId, animeId, progress, writeBinding = captureLocalWrite()) {
   try {
     const stored = await chrome.storage.local.get(RESUME_BULK_KEY);
     const cached = stored[RESUME_BULK_KEY];
@@ -1122,13 +1234,37 @@ async function updateResumeCache(userId, animeId, progress) {
       ? cached
       : { userId, byAnime: {}, fetchedAt: 0 };
     bulk.byAnime[animeId] = progress;
-    await chrome.storage.local.set({ [RESUME_BULK_KEY]: bulk });
+    await setLocal(writeBinding, { [RESUME_BULK_KEY]: bulk });
   } catch { /* кэш — best effort */ }
 }
 
-async function syncProgressOnce(state, urgent) {
-  const match = state.match;
-  const player = state.player;
+function captureProgressEvent(state, liveState = state) {
+  return Object.freeze({
+    match: Object.freeze({ ...(state.match || {}) }),
+    player: Object.freeze({ ...(state.player || {}) }),
+    recognition: Object.freeze({ ...(state.recognition || {}) }),
+    sourceOrigin: state.sourceOrigin, topVoice: state.topVoice,
+    pageUrl: liveState.pageUrl, navigationToken: liveState.navigationToken,
+    topDocumentId: liveState.topDocumentId, tabId: liveState.tabId, liveState,
+    playerReference: liveState.player,
+  });
+}
+
+function progressEventCurrent(event, writeBinding, allowUnpublished = false) {
+  const live = event.liveState;
+  return localWriteCurrent(writeBinding)
+    && (!Number.isInteger(event.tabId) || stateByTab[String(event.tabId)] === live
+      || (allowUnpublished && stateByTab[String(event.tabId)] === undefined))
+    && live.pageUrl === event.pageUrl && live.navigationToken === event.navigationToken
+    && live.topDocumentId === event.topDocumentId && live.sourceOrigin === event.sourceOrigin
+    && live.player === event.playerReference
+    && Object.is(Number(live.match?.animeId), Number(event.match.animeId));
+}
+
+async function syncProgressOnce(state, urgent, writeBinding = captureLocalWrite(), event = captureProgressEvent(state)) {
+  if (!progressEventCurrent(event, writeBinding)) return;
+  const match = event.match;
+  const player = event.player;
   if (!confirmedAnimeMatch(match)) return;
   if (!player?.playbackStarted || !Number.isFinite(player.currentTime)
     || !Number.isFinite(player.duration) || player.duration < 300) return;
@@ -1139,13 +1275,16 @@ async function syncProgressOnce(state, urgent) {
   const position = Math.round(player.currentTime);
   // Дребезг pause/seeked с той же позицией — не дублировать.
   if (sync.key === key && sync.position === position && now - (sync.at || 0) < 10_000) return;
-  const trust = await trustedWriteContext(state);
+  const trust = await trustedWriteContext(event);
+  if (!progressEventCurrent(event, writeBinding)) return;
   if (!trust.ok) {
     state.syncDeniedReason = trust.reason;
     return;
   }
   state.syncDeniedReason = null;
-  const syncAccount = await activeSyncAccount();
+  const syncAccount = await activeSyncAccount(writeBinding);
+  requireLocalWrite(writeBinding);
+  if (!progressEventCurrent(event, writeBinding)) return;
   if (!syncAccount) return;
   state.progressSync = { key, at: now, position };
   const payload = {
@@ -1153,7 +1292,7 @@ async function syncProgressOnce(state, urgent) {
     episode: player.episode ?? null,
     position_sec: position,
     duration_sec: Math.round(player.duration),
-    voice: player.voice || state.topVoice || state.recognition?.voice || '',
+    voice: player.voice || event.topVoice || event.recognition.voice || '',
     expected_user_id: syncAccount.userId,
   };
   try {
@@ -1165,31 +1304,36 @@ async function syncProgressOnce(state, urgent) {
       voice: payload.voice,
       expectedUserId: payload.expected_user_id,
     });
+    if (!progressEventCurrent(event, writeBinding)) return;
     if (!result.ok && result.status !== 204) {
       state.progressSync = sync;
       state.syncWriteFailed = true;
       return;
     }
     // Мы сами — источник правды на этом девайсе: попап читает кэш, не сервер.
+    requireLocalWrite(writeBinding);
     await updateResumeCache(syncAccount.userId, match.animeId, {
       episode: payload.episode,
       position_sec: payload.position_sec,
       duration_sec: payload.duration_sec,
       voice: payload.voice,
       watched_at: new Date(now).toISOString(),
-    });
+    }, writeBinding);
   } catch {
-    state.progressSync = sync; // транзиент — уйдёт со следующим триггером
-    state.syncWriteFailed = true;
+    if (progressEventCurrent(event, writeBinding)) {
+      state.progressSync = sync; // транзиент — уйдёт со следующим триггером
+      state.syncWriteFailed = true;
+    }
   }
 }
 
-function maybeSyncProgress(state, urgent) {
+function maybeSyncProgress(state, urgent, writeBinding = captureLocalWrite(), liveState = state) {
+  const event = captureProgressEvent(state, liveState);
   const previous = progressSyncQueues.get(state) || Promise.resolve();
   let queued;
   queued = previous
     .catch(() => {})
-    .then(() => syncProgressOnce(state, urgent))
+    .then(() => { requireLocalWrite(writeBinding); return syncProgressOnce(state, urgent, writeBinding, event); })
     .finally(() => {
       if (progressSyncQueues.get(state) === queued) progressSyncQueues.delete(state);
     });
@@ -1351,9 +1495,11 @@ function localDateKey(timestamp) {
   return `${year}-${month}-${day}`;
 }
 
-async function loadHistory() {
+async function loadHistory(writeBinding = captureLocalWrite()) {
+  requireLocalWrite(writeBinding);
   if (!historyCache) {
     const stored = await chrome.storage.local.get('watch-history');
+    requireLocalWrite(writeBinding);
     historyCache = stored['watch-history'] || { records: {}, days: {} };
     for (const record of Object.values(historyCache.records || {})) {
       delete record.mediaSeconds;
@@ -1378,12 +1524,12 @@ function legacyCurrentHistoryRecord(state, history) {
   return record;
 }
 
-async function bindLegacyCurrentHistoryRecord(state, history, record) {
+async function bindLegacyCurrentHistoryRecord(state, history, record, writeBinding = captureLocalWrite()) {
   // A separate popup confirmation names the resolved catalog anime before a
   // legacy title-only record is upgraded. Background writes never guess.
   record.animeId = Number(state.match.animeId);
   history.updatedAt = Date.now();
-  await chrome.storage.local.set({ 'watch-history': history });
+  await setLocal(writeBinding, { 'watch-history': history });
 }
 
 function historyPlayerForManualSync(state, history) {
@@ -1440,9 +1586,10 @@ function historyPlayerForManualSync(state, history) {
   };
 }
 
-async function syncCurrentOrHistoryFromPopup(state, options = {}) {
+async function syncCurrentOrHistoryFromPopup(state, options = {}, writeBinding = captureLocalWrite()) {
   state.syncWriteFailed = false;
-  const history = await loadHistory();
+  const history = await loadHistory(writeBinding);
+  requireLocalWrite(writeBinding);
   const livePlayer = state.player;
   const liveUsable = Boolean(livePlayer?.playbackStarted)
     && Number.isFinite(livePlayer.currentTime)
@@ -1457,13 +1604,15 @@ async function syncCurrentOrHistoryFromPopup(state, options = {}) {
         animeTitle: state.match.title || state.recognition?.title || '',
       };
     }
-    if (legacyRecord) await bindLegacyCurrentHistoryRecord(state, history, legacyRecord);
+    if (legacyRecord) await bindLegacyCurrentHistoryRecord(state, history, legacyRecord, writeBinding);
   }
   const historyPlayer = historyPlayerForManualSync(state, history);
   const player = liveUsable ? livePlayer : historyPlayer;
   const syncState = player && player !== livePlayer ? { ...state, player } : state;
-  await maybeSyncProgress(syncState, true);
-  if (syncState.player?.watched) await maybeAutoMark(syncState);
+  await maybeSyncProgress(syncState, true, writeBinding, state);
+  requireLocalWrite(writeBinding);
+  if (syncState.player?.watched) await maybeAutoMark(syncState, writeBinding, state);
+  requireLocalWrite(writeBinding);
   if (syncState !== state) {
     state.match = syncState.match;
     state.progressSync = syncState.progressSync;
@@ -1478,7 +1627,8 @@ async function syncCurrentOrHistoryFromPopup(state, options = {}) {
 // write happens at most every 15s. Meaningful events (pause/ended/seeked/
 // watched transition) flush immediately, so at most ~15s of counters are at
 // risk if the service worker dies mid-session.
-async function flushHistory(player, watchedTransition = false) {
+async function flushHistory(player, watchedTransition = false, writeBinding = captureLocalWrite()) {
+  requireLocalWrite(writeBinding);
   const now = Date.now();
   // Только ПЕРЕХОД через 80% форсирует flush; устоявшееся watched-состояние
   // (тики после порога до конца серии) живёт под обычным 15с-дебаунсом.
@@ -1495,11 +1645,14 @@ async function flushHistory(player, watchedTransition = false) {
     .sort(([left], [right]) => right.localeCompare(left))
     .slice(0, 90));
   history.updatedAt = now;
-  await chrome.storage.local.set({ 'watch-history': history });
+  await setLocal(writeBinding, { 'watch-history': history });
 }
 
-function queueHistoryUpdate(state, player, previousPlayer) {
-  const recognition = state.recognition;
+function queueHistoryUpdate(state, player, previousPlayer, writeBinding = captureLocalWrite()) {
+  const event = captureProgressEvent(state);
+  const recognition = event.recognition;
+  player = Object.freeze({ ...(player || {}) });
+  previousPlayer = previousPlayer ? Object.freeze({ ...previousPlayer }) : null;
   if (!recognition?.title || !Number.isFinite(player?.currentTime)) {
     return Promise.resolve();
   }
@@ -1510,7 +1663,11 @@ function queueHistoryUpdate(state, player, previousPlayer) {
     return Promise.resolve();
   }
   historyQueue = historyQueue.catch(() => {}).then(async () => {
-    const history = await loadHistory();
+    requireLocalWrite(writeBinding);
+    if (!progressEventCurrent(event, writeBinding, true)) return;
+    const history = await loadHistory(writeBinding);
+    requireLocalWrite(writeBinding);
+    if (!progressEventCurrent(event, writeBinding, true)) return;
     const titleKey = historyTitleKey(recognition.title);
     const recordKey = `${titleKey}::${player.episode ?? 'full'}`;
     const previousObservedAt = Number(previousPlayer?.observedAt);
@@ -1523,7 +1680,7 @@ function queueHistoryUpdate(state, player, previousPlayer) {
       && mediaDelta > 0 && mediaDelta <= 20
       ? Math.min(wallDelta, mediaDelta)
       : 0;
-    const matchedAnimeId = confirmedAnimeMatch(state.match) ? Number(state.match.animeId) : null;
+    const matchedAnimeId = confirmedAnimeMatch(event.match) ? Number(event.match.animeId) : null;
     const storedRecord = history.records[recordKey];
     if (storedRecord?.animeId && matchedAnimeId == null) return;
     const existing = storedRecord?.animeId && Number(storedRecord.animeId) !== matchedAnimeId
@@ -1545,7 +1702,7 @@ function queueHistoryUpdate(state, player, previousPlayer) {
       title: recognition.title,
       episode: player.episode,
       animeId: matchedAnimeId,
-      voice: player.voice || state.topVoice || recognition.voice || existing.voice || null,
+      voice: player.voice || event.topVoice || recognition.voice || existing.voice || null,
       watchedSeconds: Math.round((existing.watchedSeconds + watchedDelta) * 10) / 10,
       position: player.currentTime,
       duration: player.duration,
@@ -1559,20 +1716,23 @@ function queueHistoryUpdate(state, player, previousPlayer) {
     if (!day.episodeKeys.includes(recordKey)) day.episodeKeys.push(recordKey);
     history.days[dateKey] = day;
 
-    await flushHistory(player, watchedTransition);
+    await flushHistory(player, watchedTransition, writeBinding);
   });
   return historyQueue;
 }
 
-async function updateTabState(message, sender, messageContext) {
+async function updateTabState(message, sender, messageContext, writeBinding = captureLocalWrite()) {
+  requireLocalWrite(writeBinding);
   const tabId = String(sender.tab.id);
   const storageKey = `tab:${tabId}`;
   let current = stateByTab[tabId];
   if (!current) {
     const stored = await chrome.storage.session.get(storageKey);
+    requireLocalWrite(writeBinding);
     current = stored[storageKey] || { players: {}, frames: [], frameReports: {} };
   }
   current.documents ||= {};
+  current.tabId = Number(tabId);
   if (messageContext.topFrame) {
     const changedDocument = current.navigationToken
       && current.navigationToken !== messageContext.documentToken;
@@ -1638,7 +1798,8 @@ async function updateTabState(message, sender, messageContext) {
     current.recognition = message;
     current.pageUrl = message.url;
     if (titleSearchKey(current.match?.query) !== titleSearchKey(message.title)) {
-      current.match = await resolveAnimeMatch(message.title);
+      current.match = await resolveAnimeMatch(message.title, { writeBinding });
+      requireLocalWrite(writeBinding);
     }
   }
   if (message.type === 'player-interaction') {
@@ -1755,20 +1916,26 @@ async function updateTabState(message, sender, messageContext) {
     && current.match.completionMetadataReady !== true
     && matchAge > SEARCH_TTL_PARTIAL_MS;
   if (current.recognition?.title && (retryMatch || retryCompletionMetadata)) {
-    current.match = await resolveAnimeMatch(current.recognition.title);
+    current.match = await resolveAnimeMatch(current.recognition.title, { writeBinding });
+    requireLocalWrite(writeBinding);
   }
   // Taste match% for the badge/popup. Guest/error answers re-checked every
   // 5 min (login can happen anytime); ok/no-data served from cache (15 min).
   if (current.match?.status === 'ok' && current.match.animeId) {
     const now = Date.now();
-    const userKey = sessionIdentityKey(await currentSessionInfo());
+    const userKey = sessionIdentityKey(await currentSessionInfo(false, writeBinding));
+    requireLocalWrite(writeBinding);
     const taste = current.taste;
     const stale = !taste
       || taste.animeId !== current.match.animeId
       || taste.userKey !== userKey
       || (taste.status === 'ok' && now - taste.resolvedAt > TASTE_TTL_MS)
       || (taste.status !== 'ok' && now - taste.resolvedAt > 5 * 60_000);
-    if (stale) current.taste = await resolveTasteMatch(current.match.animeId, userKey);
+    if (stale) {
+      const freshTaste = await resolveTasteMatch(current.match.animeId, userKey, writeBinding);
+      requireLocalWrite(writeBinding);
+      current.taste = freshTaste;
+    }
   } else {
     current.taste = null;
   }
@@ -1782,16 +1949,17 @@ async function updateTabState(message, sender, messageContext) {
     || current.recognition?.voice
     || null;
   if (updatedPlayerKey && current.player === current.players[updatedPlayerKey]) {
-    await queueHistoryUpdate(current, current.player, previousPlayer);
+    await queueHistoryUpdate(current, current.player, previousPlayer, writeBinding);
     // Fire-and-forget: не блокируем очередь сообщений таба.
     const urgentSync = message.reason === 'pause' || message.reason === 'ended'
       || Boolean(message.watched && !previousPlayer?.watched)
       || (previousPlayer?.episode != null && message.episode != null
         && message.episode !== previousPlayer.episode);
-    maybeSyncProgress(current, urgentSync).catch(() => {});
+    maybeSyncProgress(current, urgentSync, writeBinding).catch(() => {});
   }
   // Fire-and-forget: auto-mark must never block the per-tab message queue.
-  if (current.player?.watched) maybeAutoMark(current).catch(() => {});
+  if (current.player?.watched) maybeAutoMark(current, writeBinding).catch(() => {});
+  requireLocalWrite(writeBinding);
   const now = Date.now();
   current.updatedAt = now;
   stateByTab[tabId] = current;
@@ -1804,9 +1972,9 @@ async function updateTabState(message, sender, messageContext) {
     && !(message.watched && !previousPlayer?.watched);
   if (!routineTick || now - (tabStateFlushAt[tabId] || 0) >= 10000) {
     tabStateFlushAt[tabId] = now;
-    await chrome.storage.session.set({ [storageKey]: current });
+    await setSession(writeBinding, { [storageKey]: current });
   }
-  maybeScheduleDiagnostic(tabId).catch(() => {});
+  maybeScheduleDiagnostic(tabId, writeBinding).catch(() => {});
   await Promise.all([
     updateActionIcon(sender.tab.id, current),
     updateMatchBadge(sender.tab.id, current),
@@ -1825,13 +1993,22 @@ function isPopupSender(sender) {
   }
 }
 
-async function popupTabState(tabId) {
+async function popupTabState(tabId, writeBinding = captureLocalWrite()) {
+  requireLocalWrite(writeBinding);
   if (!Number.isInteger(tabId) || tabId < 1) return null;
   const memoryState = stateByTab[String(tabId)];
   if (memoryState) return memoryState;
   const storageKey = `tab:${tabId}`;
   const stored = await chrome.storage.session.get(storageKey);
-  return stored[storageKey] || null;
+  requireLocalWrite(writeBinding);
+  // Native/session recovery cannot replace a newer sensor publication. Admit
+  // the exact persisted predecessor before sync captures its live ownership.
+  if (stateByTab[String(tabId)]) return stateByTab[String(tabId)];
+  const state = stored[storageKey];
+  if (!state || (state.tabId !== undefined && state.tabId !== tabId)) return null;
+  state.tabId = tabId;
+  stateByTab[String(tabId)] = state;
+  return state;
 }
 
 async function popupTabExists(tabId) {
@@ -1842,16 +2019,17 @@ async function popupTabExists(tabId) {
   }
 }
 
-async function persistPopupTabState(tabId, state) {
+async function persistPopupTabState(tabId, state, writeBinding = captureLocalWrite()) {
   if (!await popupTabExists(tabId)) {
     delete stateByTab[String(tabId)];
     invalidateActionPresentation(tabId);
-    await chrome.storage.session.remove(`tab:${tabId}`);
+    await removeSession(writeBinding, `tab:${tabId}`);
     return false;
   }
+  requireLocalWrite(writeBinding);
   state.updatedAt = Date.now();
   stateByTab[String(tabId)] = state;
-  await chrome.storage.session.set({ [`tab:${tabId}`]: state });
+  await setSession(writeBinding, { [`tab:${tabId}`]: state });
   await Promise.all([
     updateActionIcon(tabId, state),
     updateMatchBadge(tabId, state),
@@ -1883,7 +2061,7 @@ async function popupSearchAnime(query) {
   }
 }
 
-async function bindPopupAnime(message) {
+async function bindPopupAnime(message, writeBinding = captureLocalWrite()) {
   const tabId = Number(message.tabId);
   const animeId = Number(message.animeId);
   const query = String(message.query || '').trim();
@@ -1894,7 +2072,7 @@ async function bindPopupAnime(message) {
   if (!await privacyConsentAccepted()) {
     return { ok: false, status: 403, payload: { error: 'privacy_consent_required' } };
   }
-  const state = await popupTabState(tabId);
+  const state = await popupTabState(tabId, writeBinding);
   const recognizedTitle = String(state?.recognition?.title || '').trim();
   const wanted = titleSearchKey(recognizedTitle);
   if (!state || !wanted) {
@@ -1916,7 +2094,8 @@ async function bindPopupAnime(message) {
   if (!await popupTabExists(tabId)) {
     return { ok: false, status: 404, payload: { error: 'tab_not_found' } };
   }
-  await saveManualMatchBinding(wanted, candidate);
+  await saveManualMatchBinding(wanted, candidate, undefined, writeBinding);
+  requireLocalWrite(writeBinding);
   state.match = {
     status: 'ok',
     query: recognizedTitle,
@@ -1925,18 +2104,20 @@ async function bindPopupAnime(message) {
     manual: true,
     resolvedAt: Date.now(),
   };
-  const userKey = sessionIdentityKey(await currentSessionInfo());
-  state.taste = await resolveTasteMatch(candidate.animeId, userKey);
+  const userKey = sessionIdentityKey(await currentSessionInfo(false, writeBinding));
+  const freshTaste = await resolveTasteMatch(candidate.animeId, userKey, writeBinding);
+  requireLocalWrite(writeBinding);
+  state.taste = freshTaste;
   if (await popupTabExists(tabId)) {
-    await syncCurrentOrHistoryFromPopup(state, { confirmLegacyHistory: true });
+    await syncCurrentOrHistoryFromPopup(state, { confirmLegacyHistory: true }, writeBinding);
   }
-  await persistPopupTabState(tabId, state);
+  await persistPopupTabState(tabId, state, writeBinding);
   return { ok: true, status: 200, payload: { match: state.match } };
 }
 
-async function unbindPopupAnime(message) {
+async function unbindPopupAnime(message, writeBinding = captureLocalWrite()) {
   const tabId = Number(message.tabId);
-  const state = await popupTabState(tabId);
+  const state = await popupTabState(tabId, writeBinding);
   const recognizedTitle = String(state?.recognition?.title || '').trim();
   const wanted = titleSearchKey(recognizedTitle);
   if (!state || !wanted) {
@@ -1948,19 +2129,20 @@ async function unbindPopupAnime(message) {
   if (!await popupTabExists(tabId)) {
     return { ok: false, status: 404, payload: { error: 'tab_not_found' } };
   }
-  await removeManualMatchBinding(wanted);
-  state.match = await resolveAnimeMatch(recognizedTitle, { forceRefresh: true });
+  await removeManualMatchBinding(wanted, writeBinding);
+  state.match = await resolveAnimeMatch(recognizedTitle, { forceRefresh: true, writeBinding });
+  requireLocalWrite(writeBinding);
   state.taste = confirmedAnimeMatch(state.match)
-    ? await resolveTasteMatch(state.match.animeId, sessionIdentityKey(await currentSessionInfo()))
+    ? await resolveTasteMatch(state.match.animeId, sessionIdentityKey(await currentSessionInfo(false, writeBinding)), writeBinding)
     : null;
-  await persistPopupTabState(tabId, state);
+  await persistPopupTabState(tabId, state, writeBinding);
   return { ok: true, status: 200, payload: { match: state.match } };
 }
 
-async function syncPopupCurrent(message) {
+async function syncPopupCurrent(message, writeBinding = captureLocalWrite()) {
   const tabId = Number(message.tabId);
   const expectedUserId = Number(message.expectedUserId);
-  const state = await popupTabState(tabId);
+  const state = await popupTabState(tabId, writeBinding);
   if (!state) return { ok: false, status: 404, payload: { error: 'tab_state_not_found' } };
   if (!await popupTabExists(tabId)) {
     return { ok: false, status: 404, payload: { error: 'tab_not_found' } };
@@ -1968,7 +2150,7 @@ async function syncPopupCurrent(message) {
   if (!confirmedAnimeMatch(state.match)) {
     return { ok: false, status: 409, payload: { error: 'anime_match_required' } };
   }
-  const syncAccount = await activeSyncAccount();
+  const syncAccount = await activeSyncAccount(writeBinding);
   if (!syncAccount || syncAccount.userId !== expectedUserId) {
     return { ok: false, status: 409, payload: { error: 'sync_account_mismatch' } };
   }
@@ -1976,8 +2158,8 @@ async function syncPopupCurrent(message) {
   const autoMarkAt = Number(state.autoMark?.at || 0);
   const syncOutcome = await syncCurrentOrHistoryFromPopup(state, {
     confirmLegacyHistory: message.confirmLegacyHistory === true,
-  });
-  await persistPopupTabState(tabId, state);
+  }, writeBinding);
+  await persistPopupTabState(tabId, state, writeBinding);
   return {
     ok: true,
     status: 200,
@@ -1991,37 +2173,106 @@ async function syncPopupCurrent(message) {
   };
 }
 
-async function handlePopupRequest(message) {
+async function handlePopupRequest(message, writeBinding = captureLocalWrite()) {
+  if (message?.expectedRevision !== undefined && message.expectedRevision !== localWriteRevision) {
+    return { ok: false, status: 409, payload: { error: 'write_binding_changed' } };
+  }
   switch (message?.type) {
     case 'popup-runtime-info':
       return {
         ok: true,
         status: 200,
-        payload: { siteBase: apiClient.base, testMode: AniRekoRuntimeConfig.testMode === true },
+        payload: { siteBase: apiClient.base, testMode: AniRekoRuntimeConfig.testMode === true,
+          localWriteRevision },
       };
-    case 'popup-session-info':
-      return currentSessionInfo(true);
+    case 'popup-session-info': {
+      const session = await currentSessionInfo(true, writeBinding);
+      // The read itself may observe an account transition. Pair exactly this
+      // rendered account with a fresh capability, never rebind an old command.
+      if (sessionInfoCache !== session) throw new Error('write_binding_changed');
+      const freshBinding = captureLocalWrite();
+      requireLocalWrite(freshBinding);
+      return { ...session, payload: { ...(session.payload || {}), localWriteRevision: freshBinding.revision } };
+    }
     case 'popup-search-anime':
       return popupSearchAnime(message.query);
     case 'popup-bind-anime':
-      return bindPopupAnime(message);
+      return bindPopupAnime(message, writeBinding);
     case 'popup-unbind-anime':
-      return unbindPopupAnime(message);
+      return unbindPopupAnime(message, writeBinding);
     case 'popup-sync-current':
-      return syncPopupCurrent(message);
+      return syncPopupCurrent(message, writeBinding);
     case 'popup-progress-all': {
       const expectedUserId = Number(message.expectedUserId);
-      const syncAccount = await activeSyncAccount();
+      const syncAccount = await activeSyncAccount(writeBinding);
       if (!syncAccount || syncAccount.userId !== expectedUserId) {
         return { ok: false, status: 409, payload: { error: 'sync_account_mismatch' } };
       }
-      return apiClient.request('progress-all', { expectedUserId });
+      requireLocalWrite(writeBinding);
+      const response = await apiClient.request('progress-all', { expectedUserId });
+      requireLocalWrite(writeBinding);
+      if (response.ok) {
+        const bulk = { userId: expectedUserId, byAnime: response.payload?.progress_all || {}, fetchedAt: Date.now() };
+        await setLocal(writeBinding, { [RESUME_BULK_KEY]: bulk });
+      }
+      return response;
+    }
+    case 'popup-update-preferences': {
+      if (message.expectedRevision !== localWriteRevision) {
+        return { ok: false, status: 409, payload: { error: 'write_binding_changed' } };
+      }
+      let items;
+      let clearResume = false;
+      switch (message.operation) {
+        case 'accept-consent':
+          if (typeof message.diagnostics !== 'boolean') return { ok: false, status: 400, payload: null };
+          items = { [PRIVACY_CONSENT_KEY]: { version: PRIVACY_CONSENT_VERSION,
+            acceptedAt: Date.now(), diagnostics: message.diagnostics } };
+          break;
+        case 'decline-consent':
+          items = { [PRIVACY_CONSENT_KEY]: { version: PRIVACY_CONSENT_VERSION, declinedAt: Date.now() } };
+          break;
+        case 'disable-sync':
+          items = { 'auto-mark': false };
+          break;
+        case 'enable-sync': {
+          const session = await currentSessionInfo(true, writeBinding);
+          requireLocalWrite(writeBinding);
+          const user = session?.payload?.user;
+          if (!await privacyConsentAccepted() || !session.ok || !session.payload?.success
+            || !Number.isSafeInteger(user?.id) || user.id !== message.expectedUserId) {
+            return { ok: false, status: 409, payload: { error: 'sync_account_mismatch' } };
+          }
+          items = { 'auto-mark': true, [SYNC_ACCOUNT_KEY]: { id: user.id, name: String(user.name || '') } };
+          clearResume = true;
+          break;
+        }
+        case 'mark-resume-sync':
+          if ((await activeSyncAccount(writeBinding))?.userId !== message.expectedUserId) {
+            return { ok: false, status: 409, payload: { error: 'sync_account_mismatch' } };
+          }
+          await setLocal(writeBinding, { 'resume-sync-at': Date.now() });
+          return { ok: true, status: 200, payload: { localWriteRevision } };
+        default:
+          return { ok: false, status: 400, payload: { error: 'request_not_allowed' } };
+      }
+      requireLocalWrite(writeBinding);
+      await exclusiveLocalControl(async () => {
+        await chrome.storage.local.set(items);
+        if (clearResume) await chrome.storage.local.remove([RESUME_BULK_KEY, 'resume-sync-at']);
+        sessionInfoCache = null;
+        sessionInfoExpiresAt = 0;
+        sessionInfoInFlight = null;
+        resetAccountSyncGates();
+      });
+      return { ok: true, status: 200, payload: { localWriteRevision } };
     }
     case 'popup-report-recognition-miss':
-      return reportRecognitionMiss(Number(message.tabId));
+      return reportRecognitionMiss(Number(message.tabId), writeBinding);
     case 'popup-delete-local-data': {
+      await exclusiveLocalControl(async () => {
       const tabIds = Object.keys(stateByTab).map(Number);
-      await Promise.all(tabIds.map(disableTab));
+      await Promise.all(tabIds.map((tabId) => disableTab(tabId, false)));
       await chrome.storage.session.clear();
       await chrome.storage.local.clear();
       historyCache = null;
@@ -2034,6 +2285,7 @@ async function handlePopupRequest(message) {
       sessionInfoInFlight = null;
       autoMarkedInSession.clear();
       autoMarkInFlight.clear();
+      });
       return { ok: true, status: 200, payload: null };
     }
     default:
@@ -2041,13 +2293,13 @@ async function handlePopupRequest(message) {
   }
 }
 
-function queueSensorMessage(message, sender, messageContext) {
+function queueSensorMessage(message, sender, messageContext, writeBinding = captureLocalWrite()) {
   const tabId = String(sender.tab.id);
   const previous = tabQueues[tabId] || Promise.resolve();
   let queue;
   queue = previous
     .catch(() => {})
-    .then(() => updateTabState(message, sender, messageContext))
+    .then(() => { requireLocalWrite(writeBinding); return updateTabState(message, sender, messageContext, writeBinding); })
     .catch((error) => console.error('[AniReko] state update failed', error))
     .finally(() => {
       if (tabQueues[tabId] === queue) delete tabQueues[tabId];
@@ -2064,12 +2316,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   const messageContext = AniRekoTrust.validateSensorMessage(message, sender, chrome.runtime.id);
   if (!messageContext.ok) return;
+  let writeBinding;
+  try { writeBinding = captureLocalWrite(); } catch { return; }
   authorizedDocument(messageContext)
-    .then((allowed) => { if (allowed) queueSensorMessage(message, sender, messageContext); })
+    .then((allowed) => { if (allowed && localWriteCurrent(writeBinding)) queueSensorMessage(message, sender, messageContext, writeBinding); })
     .catch(() => {});
 });
 
-async function finalizeRemovedTab(tabId) {
+async function finalizeRemovedTab(tabId, writeBinding = captureLocalWrite()) {
   const id = String(tabId);
   const storageKey = `tab:${tabId}`;
   try {
@@ -2077,16 +2331,24 @@ async function finalizeRemovedTab(tabId) {
     let state = stateByTab[id];
     if (!state) {
       const stored = await chrome.storage.session.get(storageKey);
-      state = stored[storageKey];
+      requireLocalWrite(writeBinding);
+      // Admit only the exact browser tab's persisted predecessor. A concurrently
+      // published state wins; an inconsistent embedded tab ID cannot be adopted.
+      state = stateByTab[id] || stored[storageKey];
+      if (state && state.tabId !== undefined && state.tabId !== tabId) state = null;
+      if (state && !stateByTab[id]) {
+        state.tabId = tabId;
+        stateByTab[id] = state;
+      }
     }
   // Закрыл вкладку посреди серии — финальная точка прогресса.
-    if (state?.player?.playbackStarted) await maybeSyncProgress(state, true);
+    if (state?.player?.playbackStarted) await maybeSyncProgress(state, true, writeBinding);
   } finally {
     delete stateByTab[id];
     delete tabQueues[id];
     delete tabStateFlushAt[id];
     invalidateActionPresentation(tabId);
-    await chrome.storage.session.remove(storageKey);
+    if (localWriteCurrent(writeBinding)) await removeSession(writeBinding, storageKey);
   }
 }
 

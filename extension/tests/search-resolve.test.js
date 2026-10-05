@@ -51,7 +51,7 @@ function loadServiceWorker({ fetchImpl } = {}) {
     runtime: {
       id: 'test-extension-id',
       getManifest: () => ({ version: '0.0.0' }),
-      onMessage: { addListener() {} },
+      onMessage: { addListener(listener) { this.listener = listener; } },
     },
     storage: {
       local,
@@ -80,6 +80,7 @@ function loadServiceWorker({ fetchImpl } = {}) {
 
   const context = vm.createContext({
     console,
+    crypto: require('node:crypto').webcrypto,
     URL,
     globalThis: undefined,
     AbortSignal,
@@ -97,6 +98,429 @@ function loadServiceWorker({ fetchImpl } = {}) {
   vm.runInContext(fs.readFileSync(serviceWorkerPath, 'utf8'), context);
   return { context, storage: { local, session }, chrome, actionCalls };
 }
+
+test('actual popup clear drains a started history writer before reporting success', async () => {
+  const { context, storage, chrome } = loadServiceWorker({
+    fetchImpl: async () => { throw new Error('unexpected_network'); },
+  });
+  vm.runInContext("historyCache = { records: { episode: { animeId: 101, lastWatchedAt: 1 } }, days: {} };", context);
+  const originalSet = storage.local.set;
+  let releaseWrite;
+  const blocked = new Promise((resolve) => { releaseWrite = resolve; });
+  let enteredWrite;
+  const entered = new Promise((resolve) => { enteredWrite = resolve; });
+  storage.local.set = async (items) => {
+    if (Object.hasOwn(items, 'watch-history')) {
+      // Chrome storage captures values independently of later in-memory edits.
+      const captured = JSON.parse(JSON.stringify(items));
+      enteredWrite();
+      await blocked;
+      return originalSet(captured);
+    }
+    return originalSet(items);
+  };
+  const writer = context.flushHistory({ reason: 'pause' });
+  await entered;
+  let replied = false;
+  const response = new Promise((resolve) => {
+    const retained = chrome.runtime.onMessage.listener(
+      { type: 'popup-delete-local-data' },
+      { id: chrome.runtime.id, url: `chrome-extension://${chrome.runtime.id}/popup.html` },
+      (value) => { replied = true; resolve(value); },
+    );
+    assert.equal(retained, true);
+  });
+  try {
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(replied, false, 'clear must not acknowledge while an entered writer can restore data');
+  } finally {
+    releaseWrite();
+    await writer;
+    await response;
+  }
+  assert.equal((await response).status, 200);
+  assert.deepEqual(await storage.local.get(null), {});
+});
+
+test('queued progress cannot substitute a replacement anime and player', async () => {
+  const sent = [];
+  const { context } = loadServiceWorker({ fetchImpl: async (_url, options) => {
+    sent.push(JSON.parse(options.body));
+    return { ok: true, status: 200, json: async () => ({}) };
+  } });
+  context.activeSyncAccount = async () => ({ userId: 18 });
+  const state = { sourceOrigin: 'https://source.example', match: { status: 'ok', exact: true, animeId: 101 },
+    player: { playbackStarted: true, episode: 1, currentTime: 10, duration: 1200 } };
+  const queued = context.maybeSyncProgress(state, true);
+  state.match = { status: 'ok', exact: true, animeId: 202 };
+  state.player = { playbackStarted: true, episode: 2, currentTime: 250, duration: 1200 };
+  await queued;
+  assert.deepEqual(sent, []);
+});
+
+test('stable queued identity uses the event media values captured before the queue', async () => {
+  const sent = [];
+  const { context } = loadServiceWorker({ fetchImpl: async (_url, options) => {
+    sent.push(JSON.parse(options.body));
+    return { ok: true, status: 200, json: async () => ({}) };
+  } });
+  context.activeSyncAccount = async () => ({ userId: 18 });
+  const state = { sourceOrigin: 'https://source.example', match: { status: 'ok', exact: true, animeId: 101 },
+    player: { playbackStarted: true, episode: 1, currentTime: 10, duration: 1200, voice: 'Original' } };
+  const queued = context.maybeSyncProgress(state, true);
+  state.player.currentTime = 250;
+  state.player.voice = 'Later';
+  await queued;
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].position_sec, 10);
+  assert.equal(sent[0].voice, 'Original');
+});
+
+test('late progress ACK after actual clear cannot recreate resume cache', async () => {
+  let resolvePost;
+  const response = new Promise((resolve) => { resolvePost = resolve; });
+  let enteredPost;
+  const entered = new Promise((resolve) => { enteredPost = resolve; });
+  const { context, storage } = loadServiceWorker({ fetchImpl: async () => {
+    enteredPost();
+    return response;
+  } });
+  context.activeSyncAccount = async () => ({ userId: 18 });
+  const state = { sourceOrigin: 'https://source.example', match: { status: 'ok', exact: true, animeId: 101 },
+    player: { playbackStarted: true, episode: 1, currentTime: 10, duration: 1200 } };
+  const queued = context.maybeSyncProgress(state, true);
+  await entered;
+  assert.equal((await context.handlePopupRequest({ type: 'popup-delete-local-data' })).status, 200);
+  resolvePost({ ok: true, status: 200, json: async () => ({}) });
+  await queued;
+  assert.deepEqual(await storage.local.get(null), {});
+});
+
+test('old popup preference capability cannot restore consent after clear', async () => {
+  const { context, storage } = loadServiceWorker({ fetchImpl: async () => { throw Error('unexpected_network'); } });
+  const original = await context.handlePopupRequest({ type: 'popup-runtime-info' });
+  await context.handlePopupRequest({ type: 'popup-delete-local-data' });
+  const response = await context.handlePopupRequest({ type: 'popup-update-preferences',
+    operation: 'accept-consent', diagnostics: false, expectedRevision: original.payload.localWriteRevision });
+  assert.equal(response.status, 409);
+  assert.deepEqual(await storage.local.get(null), {});
+  const fresh = await context.handlePopupRequest({ type: 'popup-runtime-info' });
+  const accepted = await context.handlePopupRequest({ type: 'popup-update-preferences',
+    operation: 'accept-consent', diagnostics: false, expectedRevision: fresh.payload.localWriteRevision });
+  assert.equal(accepted.status, 200);
+  assert.equal((await storage.local.get('privacy-consent'))['privacy-consent'].diagnostics, false);
+});
+
+test('local history queue captures media and match before its asynchronous turn', async () => {
+  const { context, storage } = loadServiceWorker({ fetchImpl: async () => { throw Error('unexpected_network'); } });
+  const state = { recognition: { title: 'Captured Anime', voice: 'Original' },
+    match: { status: 'ok', exact: true, animeId: 101 }, topVoice: 'Original',
+    player: { episode: 1, currentTime: 10, duration: 1200, progress: 0.01,
+      observedAt: 1000, reason: 'pause', watched: false } };
+  const queued = context.queueHistoryUpdate(state, state.player, null);
+  state.player.currentTime = 250;
+  state.topVoice = 'Later';
+  await queued;
+  const record = (await storage.local.get('watch-history'))['watch-history'].records['captured anime::1'];
+  assert.equal(record.position, 10);
+  assert.equal(record.voice, 'Original');
+  assert.equal(record.animeId, 101);
+});
+
+test('local history queue rejects a replacement page or anime before writing', async () => {
+  const { context, storage } = loadServiceWorker({ fetchImpl: async () => { throw Error('unexpected_network'); } });
+  const state = { recognition: { title: 'Old Anime' }, navigationToken: 'old-document',
+    match: { status: 'ok', exact: true, animeId: 101 },
+    player: { episode: 1, currentTime: 10, duration: 1200, observedAt: 1000, reason: 'pause' } };
+  const queued = context.queueHistoryUpdate(state, state.player, null);
+  state.navigationToken = 'new-document';
+  state.match = { status: 'ok', exact: true, animeId: 202 };
+  await queued;
+  assert.equal((await storage.local.get('watch-history'))['watch-history'], undefined);
+});
+
+test('unmatched first-page history remains local without inventing an anime ID', async () => {
+  const { context, storage } = loadServiceWorker({ fetchImpl: async () => { throw Error('unexpected_network'); } });
+  const state = { tabId: 5, recognition: { title: 'Unresolved Anime' }, match: { status: 'none' },
+    player: { episode: 1, currentTime: 10, duration: 1200, observedAt: 1000, reason: 'pause' } };
+  await context.queueHistoryUpdate(state, state.player, null);
+  const record = (await storage.local.get('watch-history'))['watch-history']?.records['unresolved anime::1'];
+  assert.equal(record?.animeId, null);
+  assert.equal(record?.position, 10);
+});
+
+test('metadata response for a replaced player cannot publish or write completion', async () => {
+  const { context } = loadServiceWorker({ fetchImpl: async () => { throw Error('unexpected_network'); } });
+  let enteredResolve;
+  const entered = new Promise((resolve) => { enteredResolve = resolve; });
+  let releaseResolve;
+  const delayed = new Promise((resolve) => { releaseResolve = resolve; });
+  context.resolveAnimeMatch = async () => { enteredResolve(); return delayed; };
+  const state = { recognition: { title: 'Old Anime' }, sourceOrigin: 'https://anime.example',
+    match: { status: 'ok', exact: true, animeId: 101, completionMetadataReady: false },
+    player: { episode: 12, watched: true, currentTime: 1200, duration: 1200 } };
+  const originalMatch = state.match;
+  const pending = context.maybeAutoMark(state);
+  await entered;
+  state.player = { episode: 1, watched: false, currentTime: 10, duration: 1200 };
+  releaseResolve({ status: 'ok', exact: true, animeId: 101, completionMetadataReady: true,
+    releaseStatus: 'FINISHED', totalEpisodes: 12 });
+  await pending;
+  assert.equal(state.match, originalMatch);
+  assert.equal(state.autoMark, undefined);
+  assert.equal(vm.runInContext("completionMetadataRefreshedInSession.has('101:12')", context), false);
+});
+
+test('observed account replacement invalidates a late progress ACK', async () => {
+  let releasePost;
+  const delayed = new Promise((resolve) => { releasePost = resolve; });
+  let enteredPost;
+  const entered = new Promise((resolve) => { enteredPost = resolve; });
+  const { context, storage } = loadServiceWorker({ fetchImpl: async () => { enteredPost(); return delayed; } });
+  const session = (id) => ({ ok: true, payload: { success: true, user: { id } } });
+  context.noteSessionIdentity(session(18));
+  context.activeSyncAccount = async () => ({ userId: 18 });
+  const state = { sourceOrigin: 'https://anime.example', match: { status: 'ok', exact: true, animeId: 101 },
+    player: { playbackStarted: true, episode: 1, currentTime: 10, duration: 1200 } };
+  const pending = context.maybeSyncProgress(state, true);
+  await entered;
+  context.noteSessionIdentity(session(19));
+  releasePost({ ok: true, status: 204, json: async () => null });
+  await pending;
+  assert.equal((await storage.local.get('resume-bulk'))['resume-bulk'], undefined);
+});
+
+test('late taste response cannot repopulate a cache after clear', async () => {
+  let releaseTaste;
+  const delayed = new Promise((resolve) => { releaseTaste = resolve; });
+  const { context } = loadServiceWorker({ fetchImpl: async () => delayed });
+  const pending = context.resolveTasteMatch(101, 'user:18');
+  const observed = assert.rejects(pending, /write_binding_changed/);
+  await context.handlePopupRequest({ type: 'popup-delete-local-data' });
+  releaseTaste({ ok: true, status: 200, json: async () => ({ data: {
+    has_profile: true, match_percent: 90, label_key: 'very_likely', confidence_label_key: 'high' } }) });
+  await observed;
+  assert.equal(vm.runInContext('tasteCache.size', context), 0);
+});
+
+test('a distinct concurrent control cannot borrow the first control success', async () => {
+  const { context } = loadServiceWorker({ fetchImpl: async () => { throw Error('unexpected_network'); } });
+  let release;
+  const delayed = new Promise((resolve) => { release = resolve; });
+  let secondRan = false;
+  const first = context.exclusiveLocalControl(async () => delayed);
+  try {
+    await assert.rejects(context.exclusiveLocalControl(async () => { secondRan = true; }), /local_control_busy/);
+  } finally { release(); await first; }
+  assert.equal(secondRan, false);
+});
+
+test('same-key auto mark can continue after an invalidated operation settles', async () => {
+  const sent = [];
+  const { context } = loadServiceWorker({ fetchImpl: async (_url, options) => {
+    sent.push(options?.method || 'GET');
+    return { ok: true, status: 200, json: async () => ({ success: true, data: { status: null } }) };
+  } });
+  let enter;
+  const entered = new Promise((resolve) => { enter = resolve; });
+  let release;
+  const delayed = new Promise((resolve) => { release = resolve; });
+  let accounts = 0;
+  context.activeSyncAccount = async () => { accounts++; if (accounts === 1) { enter(); await delayed; } return { userId: 18 }; };
+  context.noteSessionIdentity({ ok: true, payload: { success: true, user: { id: 18 } } });
+  const state = { recognition: { title: 'Retry Anime' }, sourceOrigin: 'https://anime.example',
+    match: { status: 'ok', exact: true, animeId: 101, type: 'TV', totalEpisodes: 12,
+      releaseStatus: 'FINISHED', completionMetadataReady: true }, player: { episode: 2, watched: true } };
+  const old = context.maybeAutoMark(state);
+  await entered;
+  context.noteSessionIdentity({ ok: true, payload: { success: true, user: { id: 19 } } });
+  release(); await old;
+  context.noteSessionIdentity({ ok: true, payload: { success: true, user: { id: 18 } } });
+  await context.maybeAutoMark(state);
+  assert.equal(accounts, 2);
+  assert.deepEqual(sent, ['GET', 'POST']);
+});
+
+test('old metadata cleanup cannot release a new same-key reservation', async () => {
+  const { context } = loadServiceWorker({ fetchImpl: async () => { throw Error('unexpected_network'); } });
+  const releases = [];
+  const entered = [];
+  context.resolveAnimeMatch = async () => new Promise((resolve) => { releases.push(resolve); entered.shift()?.(); });
+  const state = { recognition: { title: 'Reserved Anime' }, sourceOrigin: 'https://anime.example',
+    match: { status: 'ok', exact: true, animeId: 101, completionMetadataReady: false },
+    player: { episode: 12, watched: true } };
+  const waitForEntry = () => new Promise((resolve) => entered.push(resolve));
+  const firstEntered = waitForEntry();
+  const first = context.maybeAutoMark(state); await firstEntered;
+  await context.handlePopupRequest({ type: 'popup-delete-local-data' });
+  const secondEntered = waitForEntry();
+  const second = context.maybeAutoMark(state);
+  // One queued turn is enough to inspect admission: no timeout is the oracle.
+  await new Promise((resolve) => setImmediate(resolve));
+  try {
+    assert.equal(releases.length, 2, 'new epoch must admit the same metadata key');
+    await secondEntered;
+    const reservation = vm.runInContext("completionMetadataRefreshInFlight.get('101:12')", context);
+    releases[0]({ status: 'error' }); await first;
+    assert.equal(vm.runInContext("completionMetadataRefreshInFlight.get('101:12')", context), reservation);
+    await context.maybeAutoMark(state);
+    assert.equal(releases.length, 2, 'concurrent current-epoch attempt must collapse');
+  } finally {
+    releases.forEach((release) => release({ status: 'error' }));
+    await Promise.all([first, second]);
+  }
+  assert.equal(vm.runInContext('completionMetadataRefreshInFlight.size', context), 0);
+});
+
+test('tab close restores its own persisted state after a worker restart', async () => {
+  const sent = [];
+  const { context, storage } = loadServiceWorker({ fetchImpl: async (_url, options) => {
+    sent.push(JSON.parse(options.body)); return { ok: true, status: 204, json: async () => null };
+  } });
+  context.activeSyncAccount = async () => ({ userId: 18 });
+  await storage.session.set({ 'tab:5': { tabId: 5, navigationToken: 'stored-document',
+    pageUrl: 'https://anime.example/watch', sourceOrigin: 'https://anime.example',
+    match: { status: 'ok', exact: true, animeId: 101 },
+    player: { playbackStarted: true, episode: 1, currentTime: 10, duration: 1200 } } });
+  await context.finalizeRemovedTab(5);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].anime_id, 101);
+  assert.equal(sent[0].position_sec, 10);
+  assert.equal((await storage.session.get('tab:5'))['tab:5'], undefined);
+});
+
+test('tab close cannot adopt another tab ID stored under its key', async () => {
+  const { context, storage } = loadServiceWorker({ fetchImpl: async () => { throw Error('unexpected_network'); } });
+  let authorizations = 0;
+  context.activeSyncAccount = async () => { authorizations++; return { userId: 18 }; };
+  await storage.session.set({ 'tab:5': { tabId: 6, sourceOrigin: 'https://anime.example',
+    match: { status: 'ok', exact: true, animeId: 101 },
+    player: { playbackStarted: true, episode: 1, currentTime: 10, duration: 1200 } } });
+  await context.finalizeRemovedTab(5);
+  assert.equal(authorizations, 0);
+});
+
+test('concurrent same-key auto-mark attempts keep a single current reservation', async () => {
+  const { context } = loadServiceWorker({ fetchImpl: async () => ({ ok: true, status: 200,
+    json: async () => ({ success: true, data: { status: 'watching' } }) }) });
+  let authorizations = 0;
+  context.activeSyncAccount = async () => { authorizations++; return { userId: 18 }; };
+  const state = { recognition: { title: 'Concurrent Anime' }, sourceOrigin: 'https://anime.example',
+    match: { status: 'ok', exact: true, animeId: 101, type: 'TV', totalEpisodes: 12,
+      releaseStatus: 'FINISHED', completionMetadataReady: true }, player: { episode: 2, watched: true } };
+  await Promise.all([context.maybeAutoMark(state), context.maybeAutoMark(state)]);
+  assert.equal(authorizations, 1);
+  assert.equal(vm.runInContext('autoMarkInFlight.size', context), 0);
+});
+
+test('a successful old-account mark cannot suppress the new account same-key check', async () => {
+  let reads = 0;
+  const { context } = loadServiceWorker({ fetchImpl: async (_url, options) => {
+    if (options?.method !== 'POST') reads++;
+    return { ok: true, status: 200, json: async () => ({ success: true, data: { status: 'watching' } }) };
+  } });
+  let userId = 18;
+  context.activeSyncAccount = async () => ({ userId });
+  context.noteSessionIdentity({ ok: true, payload: { success: true, user: { id: userId } } });
+  const state = { recognition: { title: 'Account Anime' }, sourceOrigin: 'https://anime.example',
+    match: { status: 'ok', exact: true, animeId: 101, type: 'TV', totalEpisodes: 12,
+      releaseStatus: 'FINISHED', completionMetadataReady: true }, player: { episode: 2, watched: true } };
+  await context.maybeAutoMark(state);
+  userId = 19;
+  context.noteSessionIdentity({ ok: true, payload: { success: true, user: { id: userId } } });
+  await context.maybeAutoMark(state);
+  assert.equal(reads, 2);
+});
+
+test('session response binds the newly shown account to a fresh popup capability', async () => {
+  const { context } = loadServiceWorker({ fetchImpl: async () => ({ ok: true, status: 200,
+    json: async () => ({ success: true, user: { id: 19 } }) }) });
+  context.noteSessionIdentity({ ok: true, payload: { success: true, user: { id: 18 } } });
+  const runtime = await context.handlePopupRequest({ type: 'popup-runtime-info' });
+  const session = await context.handlePopupRequest({ type: 'popup-session-info',
+    expectedRevision: runtime.payload.localWriteRevision });
+  assert.equal(session.payload.user.id, 19);
+  assert.equal(typeof session.payload.localWriteRevision, 'string');
+  assert.notEqual(session.payload.localWriteRevision, runtime.payload.localWriteRevision);
+  const result = await context.handlePopupRequest({ type: 'popup-update-preferences', operation: 'disable-sync',
+    expectedRevision: session.payload.localWriteRevision });
+  assert.equal(result.status, 200);
+});
+
+test('guest session refresh keeps local clear available in the actual popup account renderer', async () => {
+  const { context, storage } = loadServiceWorker({ fetchImpl: async () => ({ ok: false, status: 401,
+    json: async () => ({ success: false, error: 'unauthorized' }) }) });
+  context.noteSessionIdentity({ ok: true, payload: { success: true, user: { id: 18 } } });
+  const runtime = await context.handlePopupRequest({ type: 'popup-runtime-info' });
+  await storage.local.set({ sentinel: 'must-clear' });
+  const elements = new Map();
+  const popup = vm.createContext({
+    document: { getElementById(id) { if (!elements.has(id)) elements.set(id, {}); return elements.get(id); } },
+    siteBase: 'https://anireko.com', siteLocale: 'ru', stored: {}, SYNC_ACCOUNT_KEY: 'sync-account',
+    autoMarkToggle: {}, syncAccountActive: false, currentUserId: null, t: (key) => key,
+    localWriteRevision: runtime.payload.localWriteRevision,
+    requestBackground: (type) => context.handlePopupRequest({ type, expectedRevision: popup.localWriteRevision }),
+  });
+  const source = fs.readFileSync(path.join(extensionDir, 'popup.js'), 'utf8');
+  const start = source.indexOf('  async function renderAccount() {');
+  const end = source.indexOf('  function setCheck(', start);
+  assert.ok(start >= 0 && end > start, 'extract the unchanged production account renderer');
+  vm.runInContext(source.slice(start, end), popup);
+  await popup.renderAccount();
+  assert.notEqual(popup.localWriteRevision, runtime.payload.localWriteRevision);
+  assert.equal(popup.autoMarkToggle.disabled, true, 'guest must not gain account sync');
+  const result = await popup.requestBackground('popup-delete-local-data');
+  assert.equal(result.status, 200);
+  assert.equal((await storage.local.get('sentinel')).sentinel, undefined);
+});
+
+test('first manual sync after worker restart admits production-shaped persisted tab state', async () => {
+  const sent = [];
+  const { context, storage } = loadServiceWorker({ fetchImpl: async (_url, options) => {
+    sent.push(JSON.parse(options.body)); return { ok: true, status: 204, json: async () => null };
+  } });
+  context.activeSyncAccount = async () => ({ userId: 18 });
+  await storage.session.set({ 'tab:5': { tabId: 5, navigationToken: 'stored-document',
+    recognition: { title: 'Restored Anime' }, pageUrl: 'https://anime.example/watch',
+    sourceOrigin: 'https://anime.example', match: { status: 'ok', exact: true, animeId: 101 },
+    player: { playbackStarted: true, episode: 1, currentTime: 10, duration: 1200 } } });
+  const response = await context.syncPopupCurrent({ tabId: 5, expectedUserId: 18 });
+  assert.equal(response.status, 200);
+  assert.equal(response.payload.progressSynced, true);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].anime_id, 101);
+  assert.equal(sent[0].position_sec, 10);
+});
+
+test('popup recovery rejects a persisted state belonging to a different native tab', async () => {
+  const { context, storage } = loadServiceWorker({ fetchImpl: async () => { throw Error('unexpected_network'); } });
+  await storage.session.set({ 'tab:5': { tabId: 6 } });
+  assert.equal(await context.popupTabState(5), null);
+  assert.equal(vm.runInContext("stateByTab['5']", context), undefined);
+});
+
+test('popup recovery preserves a sensor publication that wins during the session read', async () => {
+  const { context, storage } = loadServiceWorker({ fetchImpl: async () => { throw Error('unexpected_network'); } });
+  let releaseRead;
+  storage.session.get = async () => new Promise((resolve) => { releaseRead = resolve; });
+  const pending = context.popupTabState(5);
+  vm.runInContext("stateByTab['5'] = { tabId: 5, navigationToken: 'new-document' };", context);
+  const winner = vm.runInContext("stateByTab['5']", context);
+  releaseRead({ 'tab:5': { tabId: 5, navigationToken: 'old-document' } });
+  assert.equal(await pending, winner);
+  assert.equal(vm.runInContext("stateByTab['5']", context), winner);
+});
+
+test('popup recovery cannot admit a late persisted state after account invalidation', async () => {
+  const { context, storage } = loadServiceWorker({ fetchImpl: async () => { throw Error('unexpected_network'); } });
+  let releaseRead;
+  storage.session.get = async () => new Promise((resolve) => { releaseRead = resolve; });
+  const pending = context.popupTabState(5);
+  vm.runInContext('localWriteBarrier.invalidate();', context);
+  releaseRead({ 'tab:5': { tabId: 5 } });
+  await assert.rejects(pending, /write_binding_changed/);
+  assert.equal(vm.runInContext("stateByTab['5']", context), undefined);
+});
 
 test('routine progress ticks do not redraw the action icon without a semantic transition', async () => {
   const { context, actionCalls } = loadServiceWorker({
@@ -1212,6 +1636,7 @@ test('manual sync uses completed local history when a reloaded player is waiting
     },
   });
   vm.runInContext(`stateByTab['5'] = {
+    tabId: 5,
     recognition: { title: 'Three Thousand Years of Qi Practice' },
     sourceOrigin: 'https://anime.example',
     match: {

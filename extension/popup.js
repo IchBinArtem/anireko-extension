@@ -1,5 +1,14 @@
 (async function renderPopup() {
-  const requestBackground = (type, input = {}) => chrome.runtime.sendMessage({ type, ...input });
+  let localWriteRevision = null;
+  const requestBackground = (type, input = {}) => chrome.runtime.sendMessage({
+    type, ...input, ...(localWriteRevision ? { expectedRevision: localWriteRevision } : {}),
+  });
+  async function updatePreferences(operation, input = {}) {
+    const response = await requestBackground('popup-update-preferences', { operation, ...input });
+    if (!response?.ok || !response.payload?.localWriteRevision) throw new Error('write_binding_changed');
+    localWriteRevision = response.payload.localWriteRevision;
+    return response;
+  }
   const t = (key, substitutions) => chrome.i18n.getMessage(key, substitutions) || key;
   const uiLanguage = chrome.i18n.getUILanguage?.() || navigator.language || 'en';
   const siteLocale = /^ru(?:-|$)/iu.test(uiLanguage) ? 'ru' : 'en';
@@ -30,6 +39,7 @@
     const runtimeInfo = await requestBackground('popup-runtime-info');
     if (runtimeInfo?.ok && runtimeInfo.payload?.siteBase) {
       siteBase = runtimeInfo.payload.siteBase;
+      localWriteRevision = runtimeInfo.payload.localWriteRevision || null;
     }
   } catch { /* keep the fixed production link if the worker is restarting */ }
   const requestedTabId = Number(new URLSearchParams(location.search).get('tabId'));
@@ -118,28 +128,31 @@
   disclosure.hidden = consentAccepted;
   document.getElementById('diagnostics-consent').checked = consent?.diagnostics === true;
   document.getElementById('privacy-accept').addEventListener('click', async () => {
-    await chrome.storage.local.set({
-      [PRIVACY_CONSENT_KEY]: {
-        version: PRIVACY_CONSENT_VERSION,
-        acceptedAt: Date.now(),
-        diagnostics: document.getElementById('diagnostics-consent').checked,
-      },
-    });
-    if (Number.isInteger(tab?.id)) await chrome.tabs.reload(tab.id).catch(() => {});
-    window.close();
+    try {
+      await updatePreferences('accept-consent', { diagnostics: document.getElementById('diagnostics-consent').checked });
+      if (Number.isInteger(tab?.id)) await chrome.tabs.reload(tab.id).catch(() => {});
+      window.close();
+    } catch { document.getElementById('privacy-accept').textContent = t('syncFailed'); }
   });
   document.getElementById('privacy-decline').addEventListener('click', async () => {
-    await chrome.storage.local.set({
-      [PRIVACY_CONSENT_KEY]: { version: PRIVACY_CONSENT_VERSION, declinedAt: Date.now() },
-    });
-    window.close();
+    try {
+      await updatePreferences('decline-consent');
+      window.close();
+    } catch { document.getElementById('privacy-decline').textContent = t('syncFailed'); }
   });
 
   const deleteLocalDataButton = document.getElementById('delete-local-data');
   deleteLocalDataButton.addEventListener('click', async () => {
     if (!confirm(t('confirmDeleteLocalData'))) return;
-    await requestBackground('popup-delete-local-data');
-    location.reload();
+    deleteLocalDataButton.disabled = true;
+    try {
+      const response = await requestBackground('popup-delete-local-data');
+      if (!response?.ok) throw new Error('local_clear_failed');
+      location.reload();
+    } catch {
+      deleteLocalDataButton.textContent = t('syncFailed');
+      deleteLocalDataButton.disabled = false;
+    }
   });
   deleteLocalDataButton.dataset.ready = 'true';
   deleteLocalDataButton.disabled = false;
@@ -162,6 +175,11 @@
     try {
       const response = await requestBackground('popup-session-info');
       const payload = response?.payload;
+      // This background-owned capability also covers local controls for guests;
+      // a 401 account response must not strand clear behind the old account epoch.
+      if (typeof payload?.localWriteRevision === 'string') {
+        localWriteRevision = payload.localWriteRevision;
+      }
       if (response?.ok && payload?.success && payload.user) {
         currentUserId = Number(payload.user.id);
         const bound = stored[SYNC_ACCOUNT_KEY];
@@ -186,8 +204,11 @@
           syncButton.disabled = true;
         }
         autoMarkToggle.addEventListener('change', async () => {
+          const previouslyActive = syncAccountActive;
+          autoMarkToggle.disabled = true;
+          try {
           if (!autoMarkToggle.checked) {
-            await chrome.storage.local.set({ 'auto-mark': false });
+            await updatePreferences('disable-sync');
             syncAccountActive = false;
             syncButton.disabled = true;
             return;
@@ -201,12 +222,13 @@
               return;
             }
           }
-          await chrome.storage.local.set({
-            'auto-mark': true,
-            [SYNC_ACCOUNT_KEY]: { id: currentUserId, name: payload.user.name || '' },
-          });
-          await chrome.storage.local.remove(['resume-bulk', 'resume-sync-at']);
+          await updatePreferences('enable-sync', { expectedUserId: currentUserId });
           location.reload();
+          } catch {
+            autoMarkToggle.checked = previouslyActive;
+            warning.hidden = false;
+            warning.textContent = t('syncFailed');
+          } finally { autoMarkToggle.disabled = false; }
         });
         return;
       }
@@ -587,7 +609,7 @@
         // Гость: помечаем «спрошено», чтобы не долбить 401 на каждый попап.
         bulk.fetchedAt = Date.now();
       }
-      chrome.storage.local.set({ 'resume-bulk': bulk });
+      // The SW owns cache persistence and fences late network callbacks.
     } catch { /* offline — живём на локальной истории */ }
     return bulk;
   }
@@ -742,7 +764,7 @@
           resumeSessionReload();
           return;
         }
-        await chrome.storage.local.set({ 'resume-sync-at': Date.now() });
+        await updatePreferences('mark-resume-sync', { expectedUserId: currentUserId });
         try {
           await loadResumeBulk(true);
           await renderResume(false);

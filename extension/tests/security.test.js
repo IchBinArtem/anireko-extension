@@ -294,7 +294,8 @@ test('only the background allowlist owns network egress', () => {
   assert.equal(worker.includes("fetch.bind(globalThis)"), true);
   assert.equal(worker.includes("'api-base'"), false);
   assert.equal(/storage\.local\.(?:get|set|remove)\([^\n]*tab:/u.test(worker), false);
-  assert.equal(worker.includes('chrome.storage.session.set({ [storageKey]: current })'), true);
+  assert.equal(worker.includes('setSession(writeBinding, { [storageKey]: current })'), true);
+  assert.equal(/chrome\.storage\.local\.(?:set|remove|clear)\s*\(/u.test(popup), false);
   assert.equal(worker.includes('mediaSeconds: Math.round'), false);
   assert.equal(worker.includes('skips,'), false);
 });
@@ -319,7 +320,7 @@ test('search cache invalidates pre-completion metadata and retries partial match
   assert.equal(worker.includes("['type', 'episodes', 'release_status']"), true);
   assert.equal(worker.includes('match.completionMetadataReady ? SEARCH_TTL_OK_MS : SEARCH_TTL_PARTIAL_MS'), true);
   assert.equal(worker.includes('current.match.completionMetadataReady !== true'), true);
-  assert.equal(worker.includes("{ forceRefresh: true }"), true);
+  assert.equal(worker.includes("{ forceRefresh: true, writeBinding }"), true);
   assert.equal(worker.includes('completionMetadataRefreshedInSession.add(refreshKey)'), true);
 });
 
@@ -375,6 +376,8 @@ test('public export contains every source and fixture used by release verificati
     'extension/tests/watch-history-client.test.js',
     'extension/tests/watch-command-journal.test.js',
     'extension/lib/watch-command-journal.js',
+    'extension/lib/watch-write-barrier.js',
+    'extension/tests/watch-write-barrier.test.js',
     'extension/lib/activity.js',
     'extension/tests/activity.test.js',
     'extension/tests/test_build_release.py',
@@ -389,7 +392,7 @@ test('public export contains every source and fixture used by release verificati
     assert.equal(fs.existsSync(path.join(repo, relative)), true, `public source misses ${relative}`);
   }
 
-  assert.equal(listed.size, 56, 'public export allowlist changed without an explicit review');
+  assert.equal(listed.size, 58, 'public export allowlist changed without an explicit review');
   const exactSupportFiles = new Set([
     '.github/dependabot.yml',
     '.github/workflows/extension-release.yml',

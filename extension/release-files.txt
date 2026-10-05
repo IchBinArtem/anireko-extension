@@ -14,3 +14,4 @@ lib/progress.js
 lib/recognition.js
 lib/runtime-config.js
 lib/trust.js
+lib/watch-write-barrier.js

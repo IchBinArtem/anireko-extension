@@ -20,6 +20,7 @@ extension/lib/recognition.js
 extension/lib/runtime-config.js
 extension/lib/trust.js
 extension/lib/watch-command-journal.js
+extension/lib/watch-write-barrier.js
 extension/manifest.json
 extension/popup.css
 extension/popup.html
@@ -39,6 +40,7 @@ extension/tests/search-resolve.test.js
 extension/tests/security.test.js
 extension/tests/watch-history-client.test.js
 extension/tests/watch-command-journal.test.js
+extension/tests/watch-write-barrier.test.js
 extension/tests/test_build_release.py
 extension/tests/test_cws_publish.py
 extension/tests/test_release_workflow.py
