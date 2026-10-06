@@ -214,7 +214,7 @@ h1 { margin: 0; font-size: 17px; line-height: 1.15; letter-spacing: -.02em; }
 .activity-cell:focus-visible { outline: 2px solid #f8fafc; outline-offset: 2px; }
 .activity-detail, .activity-legend { margin: 7px 0 0; color: var(--muted); font-size: 9px; line-height: 1.5; }
 .resume-card { display: grid; gap: 2px; margin-top: 9px; padding: 9px 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--card-soft); }
-.resume-card:not(:has(#resume:not([hidden]))) { display: none; }
+#anime-fields:not(:has(#resume:not([hidden]))) { display: none; }
 .resume-card > span { color: var(--muted); font-size: 9.5px; }
 .resume-card > strong { color: #e2e8f0; font-size: 11px; line-height: 1.35; }
 .ok { color: #34d399; }
@@ -285,3 +285,10 @@ h1 { margin: 0; font-size: 17px; line-height: 1.15; letter-spacing: -.02em; }
 }
 .privacy-controls button { border: 0; background: none; color: #9ca3af; font: inherit; cursor: pointer; }
 .privacy-controls button:hover { color: #ff6b81; }
+#watch-cycle-card { margin-top: 12px; }
+#watch-completion { color: #8bd5b2; }
+#watch-current, #watch-feedback { font-size: 12px; line-height: 1.45; color: #b8c3d0; }
+#watch-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+#watch-actions button { padding: 6px 9px; border: 1px solid #475569; border-radius: 7px; background: #1e293b; color: #e2e8f0; cursor: pointer; }
+#watch-actions button:disabled { opacity: .5; cursor: default; }
+#watch-actions button:focus-visible { outline: 2px solid #8bd5b2; outline-offset: 2px; }

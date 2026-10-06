@@ -10,6 +10,7 @@ if (!Number.isInteger(fixturePort) || fixturePort < 1024 || fixturePort > 65535)
 let watchStatus = null;
 let sessionInfoRequests = 0;
 let searchRequests = 0;
+const searchQueries = [];
 const statusPosts = [];
 const diagnosticPosts = [];
 const progressPosts = [];
@@ -19,6 +20,24 @@ let resetGeneration = 0;
 let failProgressPosts = false;
 let holdTasteResponses = false;
 const pendingTasteResponses = [];
+let cycleHistoryEnabled = false;
+let cycleCurrent = null;
+let cycleVersion = 0;
+let cycleGeneration = 0;
+const cyclePosts = [];
+const cycleHistoryId = '22222222-2222-4222-8222-222222222222';
+const cycleId = '33333333-3333-4333-8333-333333333333';
+function cycleSnapshot(animeId) {
+  const state = { anime_id: animeId, version: cycleVersion, current: cycleCurrent,
+    previously_completed: true, history_before_tracking_unknown: false,
+    lifetime_completed_count: 1, tracked_completed_count: 1, completed_count_lower_bound: 1 };
+  return { user_id: sessionUser.id, requested_anime_id: animeId, effective_anime_id: animeId,
+    history_adopted: cycleHistoryEnabled, readiness: 'ready',
+    foreground: { anime_id: animeId, generation: cycleGeneration, cycle_id: cycleCurrent?.status === 'active' ? cycleId : null },
+    ...(cycleHistoryEnabled ? { primary_history_id: cycleHistoryId, start_anime_id: animeId,
+      start_state: state, previously_completed: true, reconciliation_token: 'a'.repeat(64),
+      origins: cycleCurrent ? [{ history_id: cycleHistoryId, anime_id: animeId, state }] : [] } : {}) };
+}
 
 function releaseTasteResponses() {
   holdTasteResponses = false;
@@ -352,9 +371,56 @@ pages['/lazy-iframeCVH.html?episode=2'] = ['text/html; charset=utf-8', `<!doctyp
   </body></html>`];
 
 const server = http.createServer((request, response) => {
+  if (request.url.startsWith('/__test/cycle-history')) {
+    cycleHistoryEnabled = true;
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ posts: cyclePosts }));
+    return;
+  }
+  if (request.url.startsWith('/api/extension/history.php')) {
+    const query = new URL(request.url, 'http://localhost').searchParams;
+    if (request.method === 'GET') {
+      if (!sessionUser || Number(query.get('expected_user_id')) !== sessionUser.id) {
+        response.writeHead(409, { 'content-type': 'application/json' }); response.end('{}'); return;
+      }
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify(cycleSnapshot(Number(query.get('anime_id')))));
+      return;
+    }
+    let body = '';
+    request.on('data', (chunk) => { body += chunk; });
+    request.on('end', () => {
+      const payload = JSON.parse(body);
+      if (!sessionUser || payload.expected_user_id !== sessionUser.id || !cycleHistoryEnabled
+        || payload.history_id !== cycleHistoryId || payload.expected_version !== cycleVersion
+        || payload.expected_foreground_generation !== cycleGeneration) {
+        response.writeHead(409, { 'content-type': 'application/json' }); response.end('{}'); return;
+      }
+      cyclePosts.push(payload);
+      if (payload.command === 'start' && cycleCurrent === null) {
+        cycleCurrent = { cycle_id: cycleId, status: 'active', kind: 'rewatching', tracked_start_ordinal: 2,
+          episode: null, position_sec: 0, duration_sec: null, voice: null };
+        cycleGeneration++;
+      } else if (payload.command === 'pause' && cycleCurrent?.status === 'active') {
+        cycleCurrent = { ...cycleCurrent, status: 'paused' }; cycleGeneration++;
+      } else if (payload.command === 'progress' && cycleCurrent?.status === 'active') {
+        cycleCurrent = { ...cycleCurrent, episode: payload.episode, position_sec: payload.position_sec,
+          duration_sec: payload.duration_sec, voice: payload.voice };
+      } else {
+        response.writeHead(409, { 'content-type': 'application/json' }); response.end('{}'); return;
+      }
+      cycleVersion++;
+      const snapshot = cycleSnapshot(payload.anime_id);
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ history_id: cycleHistoryId, anime_id: payload.anime_id,
+        foreground: snapshot.foreground, state: snapshot.start_state }));
+    });
+    return;
+  }
   if (request.url.startsWith('/api/search')) {
     searchRequests += 1;
     const query = new URL(request.url, 'http://localhost').searchParams.get('q') || '';
+    searchQueries.push(query);
     const bookwormFourth = {
       id: 13124,
       title: 'Власть книжного червя: Приёмная дочь лорда',
@@ -633,11 +699,13 @@ const server = http.createServer((request, response) => {
     return;
   }
   if (request.url.startsWith('/__test/reset')) {
+    cycleHistoryEnabled = false; cycleCurrent = null; cycleVersion = 0; cycleGeneration = 0; cyclePosts.length = 0;
     releaseTasteResponses();
     sessionUser = null;
     watchStatus = null;
     sessionInfoRequests = 0;
     searchRequests = 0;
+    searchQueries.length = 0;
     statusPosts.length = 0;
     diagnosticPosts.length = 0;
     progressPosts.length = 0;
@@ -665,6 +733,7 @@ const server = http.createServer((request, response) => {
     response.writeHead(200, { 'content-type': 'application/json' });
     response.end(JSON.stringify({
       search: searchRequests,
+      searchQueries,
       sessionInfo: sessionInfoRequests,
       statusPosts: statusPosts.length,
       diagnostics: diagnosticPosts.length,

@@ -586,6 +586,107 @@
   // кулдауном 60с (кейс: только что смотрел с другого устройства).
   const RESUME_BULK_TTL_MS = 30 * 60 * 1000;
   const SYNC_COOLDOWN_MS = 60 * 1000;
+  // Unknown/adopted history must never borrow a previous cycle's legacy resume.
+  let watchProjection = null;
+  const watchCard = document.getElementById('watch-cycle-card');
+  const watchFeedback = document.getElementById('watch-feedback');
+  const watchActions = document.getElementById('watch-actions');
+  async function renderWatchCycle() {
+    if (!matchConfirmed || !syncAccountActive) return;
+    watchCard.hidden = false;
+    watchActions.replaceChildren();
+    try {
+      const response = await requestBackground('popup-watch-history', { tabId: tab?.id });
+      if (!response?.ok || !response.payload?.snapshot) throw new Error('history_unavailable');
+      watchProjection = response.payload;
+      const snapshot = watchProjection.snapshot;
+      if (snapshot.history_adopted !== false) {
+        document.getElementById('resume-label').hidden = true;
+        const legacyResume = document.getElementById('resume');
+        legacyResume.hidden = true;
+        legacyResume.textContent = '';
+      }
+      const state = snapshot.start_state;
+      const origins = [...(snapshot.origins || []), ...(snapshot.selected_origin ? [snapshot.selected_origin] : [])];
+      const currentOrigin = origins.find((origin) => origin.state?.current?.cycle_id === snapshot.foreground?.cycle_id);
+      const countState = currentOrigin?.state || state;
+      let completion = snapshot.previously_completed ? t('watchPreviouslyCompleted') : t('watchNotCompleted');
+      const count = countState?.lifetime_completed_count ?? countState?.completed_count_lower_bound;
+      if (Number.isSafeInteger(count) && count >= 0) {
+        // Scope is a ledger (history + anime), not an account namespace or visible page.
+        completion += ` · ${t(currentOrigin ? 'watchCurrentHistoryCount' : 'watchStartHistoryCount')}`;
+        completion += ` · ${t(countState?.lifetime_completed_count == null
+          ? 'watchCompletedLowerBound' : 'watchCompletedCount', String(count))}`;
+      }
+      set('watch-completion', completion);
+      const current = currentOrigin?.state?.current;
+      const parts = [];
+      if (snapshot.readiness !== 'ready') parts.push(t('watchReconciliation'));
+      else if (current) {
+        parts.push(t(current.kind === 'rewatching' ? 'watchRewatching' : 'statusWatching'));
+        // Ordinals describe tracked starts, never an invented lifetime count.
+        parts.push(t('watchTrackedCycle', String(current.tracked_start_ordinal)));
+        if (current.episode != null) parts.push(t('episodeLabel', String(current.episode)));
+        if (currentOrigin.anime_id !== snapshot.requested_anime_id) parts.push(t('watchOtherTitle'));
+      } else {
+        parts.push(t('watchNoActiveCycle'));
+        const paused = origins.filter((origin) => origin.state?.current?.status === 'paused');
+        const seenPaused = new Set();
+        for (const origin of paused) {
+          const cycle = origin.state.current;
+          if (seenPaused.has(cycle.cycle_id)) continue;
+          seenPaused.add(cycle.cycle_id);
+          parts.push(`${t('watchPaused')} · ${t('watchTrackedCycle', String(cycle.tracked_start_ordinal))}`
+            + (cycle.episode == null ? '' : ` · ${t('episodeLabel', String(cycle.episode))}`));
+        }
+      }
+      if (countState?.history_before_tracking_unknown) parts.push(t('watchEarlierCountUnknown'));
+      set('watch-current', parts.join(' · '));
+      const run = async (type, input) => {
+        for (const button of watchActions.querySelectorAll('button')) button.disabled = true;
+        pauseSessionStateReload = true;
+        watchFeedback.textContent = t('syncUpdating');
+        try {
+          const result = await requestBackground(type, input);
+          if (!result?.ok) throw new Error('command_unresolved');
+          watchFeedback.textContent = '';
+        } catch { watchFeedback.textContent = t('watchCommandUnresolved'); }
+        finally {
+          await renderWatchCycle();
+          pauseSessionStateReload = false;
+        }
+      };
+      const addButton = (label, type, input) => {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.textContent = label;
+        button.addEventListener('click', () => run(type, input));
+        watchActions.append(button);
+      };
+      if (watchProjection.pending) {
+        watchFeedback.textContent = t('watchCommandUnresolved');
+        const original = watchProjection.pendingIntent;
+        if (original) {
+          watchFeedback.textContent += ` · ${t('watchOriginalTarget', String(original.animeId))} · ${t(`watchAction_${original.action}`)}`;
+          addButton(t('watchRetryOriginal'), 'popup-watch-retry', { commandId: original.commandId });
+        } else watchFeedback.textContent += ` · ${t('watchPendingOtherAccount')}`;
+      } else {
+        for (const action of watchProjection.actions || []) {
+          const label = t(`watchAction_${action.command}`);
+          const suffix = action.ordinal == null ? '' : ` · ${t('watchTrackedCycle', String(action.ordinal))}`;
+          addButton(label + suffix, 'popup-watch-command', { capabilityId: action.capabilityId });
+        }
+      }
+    } catch {
+      watchProjection = null;
+      document.getElementById('resume-label').hidden = true;
+      document.getElementById('resume').hidden = true;
+      document.getElementById('resume').textContent = '';
+      set('watch-completion', t('watchHistoryUnavailable'));
+      set('watch-current', t('watchNoLegacyFallback'));
+    }
+  }
+  await renderWatchCycle();
 
   async function loadResumeBulk(force) {
     if (!syncAccountActive || !Number.isInteger(currentUserId)) {
@@ -615,7 +716,11 @@
   }
 
   async function renderResume(force) {
+    document.getElementById('resume-label').hidden = true;
+    document.getElementById('resume').hidden = true;
+    document.getElementById('resume').textContent = '';
     if (!animeFound || player?.playing) return;
+    if (syncAccountActive && watchProjection?.snapshot?.history_adopted !== false) return;
     const confirmedAnimeId = match?.status === 'ok'
       ? (typeof match.animeId === 'number' || typeof match.animeId === 'string' ? Number(match.animeId) : NaN)
       : null;
@@ -667,6 +772,8 @@
         };
       }
     }
+    // A Start/adoption read can finish while the older bulk read awaits.
+    if (syncAccountActive && watchProjection?.snapshot?.history_adopted !== false) return;
     if (!resume) return;
     const parts = [];
     if (resume.episode != null) parts.push(t('episodeLabel', String(resume.episode)));

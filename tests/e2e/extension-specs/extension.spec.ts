@@ -28,6 +28,7 @@ async function setSyntheticPlayback(
         try {
           media.muted = true;
           if (!next.paused) await media.play();
+          else media.pause();
           if (Math.abs(media.currentTime - next.currentTime) > 0.05) {
             await new Promise<void>((seeked) => {
               media.addEventListener('seeked', () => seeked(), { once: true });
@@ -150,6 +151,48 @@ test.beforeEach(async () => {
   });
 });
 
+test('cycle popup keeps previous completion and starts only after explicit action', async ({}, testInfo) => {
+  await worker.evaluate(async () => {
+    await chrome.storage.local.set({ 'auto-mark': true, 'sync-account': { id: 18, name: 'TestUser' } });
+    const base = (globalThis as any).AniRekoRuntimeConfig.apiBase;
+    await fetch(base + '/__test/session?on=1&user=18');
+    await fetch(base + '/__test/cycle-history');
+  });
+  const page = await context.newPage();
+  let popup: Page | null = null;
+  try {
+    await page.goto(`${siteBase}/anime.html`);
+    const tabId = await extensionTabId(`${siteBase}/*`);
+    await expect.poll(async () => (await storedTabState(tabId))?.match?.status).toBe('ok');
+    popup = await openPopup(tabId);
+    await expect(popup.locator('#watch-cycle-card')).toBeVisible();
+    await expect(popup.locator('#watch-completion')).toHaveText('Уже просмотрено — завершение сохранено · В истории для нового просмотра · Завершено 1 раз');
+    await expect(popup.locator('#watch-current')).toContainText('Сейчас нет активного просмотра');
+    const commands = () => worker.evaluate(async () => {
+      const response = await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/cycle-history');
+      return (await response.json()).posts;
+    });
+    expect(await commands()).toEqual([]);
+    await popup.getByRole('button', { name: 'Начать новый просмотр', exact: true }).click();
+    await expect(popup.locator('#watch-current')).toContainText('Пересматриваю');
+    await expect(popup.locator('#watch-current')).toContainText('Цикл 2 с начала учёта');
+    await expect(popup.locator('#watch-completion')).toHaveText('Уже просмотрено — завершение сохранено · В текущей истории просмотра · Завершено 1 раз');
+    expect((await commands()).map((command: any) => command.command)).toEqual(['start']);
+    const screenshotPath = testInfo.outputPath('watch-cycle-popup.png');
+    await popup.screenshot({ path: screenshotPath, fullPage: true });
+    await testInfo.attach('watch-cycle-popup', { path: screenshotPath, contentType: 'image/png' });
+    await popup.getByRole('button', { name: /Приостановить просмотр/ }).click();
+    await expect(popup.getByRole('button', { name: /Продолжить просмотр/ })).toBeVisible();
+    await expect(popup.locator('#watch-completion')).toHaveText('Уже просмотрено — завершение сохранено · В истории для нового просмотра · Завершено 1 раз');
+    await expect(popup.locator('#watch-current')).toContainText('Просмотр на паузе');
+    expect((await commands()).map((command: any) => command.command)).toEqual(['start', 'pause']);
+    await expect(popup.locator('#resume')).toBeHidden();
+  } finally {
+    await popup?.close();
+    await page.close();
+  }
+});
+
 test('renders browser-local activity as a calm calendar with honest missing days', async () => {
   const page = await context.newPage();
   await page.goto(`${siteBase}/anime.html`);
@@ -252,9 +295,14 @@ test('recognizes anime before playback and confirms player after playback starts
 
   await setSyntheticPlayback(page.frameLocator('#main-player'), '#main-video', {
     currentTime: 60,
+    paused: true,
+  });
+  // Assert exact seek while the real media clock is stationary, then start it.
+  await waitForPlayerProgress(tabId, 60 / 310);
+  await setSyntheticPlayback(page.frameLocator('#main-player'), '#main-video', {
+    currentTime: 60,
     paused: false,
   });
-  await waitForPlayerProgress(tabId, 60 / 310);
   await expect.poll(async () => {
     const history = await worker.evaluate(async () => (await chrome.storage.local.get('watch-history'))['watch-history']);
     const record = Object.values(history?.records || {})[0] as { watchedSeconds?: number } | undefined;
@@ -1311,6 +1359,9 @@ test('promotes watching to completed once on finished episode 12 of 12', async (
     .selectOption({ label: '12 серия' });
   await expect.poll(async () => (await storedTabState(tabId))?.player?.episode ?? null)
     .toBe(12);
+  const countsBeforePlayback = await worker.evaluate(async () =>
+    (await (await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/request-counts')).json()));
+  expect(countsBeforePlayback.search, 'seeded partial cache should serve recognition without a search').toBe(0);
   await setSyntheticPlayback(page.frameLocator('#main-player'), '#main-video', {
     currentTime: 260,
     paused: false,
@@ -1322,7 +1373,7 @@ test('promotes watching to completed once on finished episode 12 of 12', async (
     .toEqual([{ anime_id: 4242, status: 'completed', expected_user_id: 18 }]);
   const countsAfterTransition = await worker.evaluate(async () =>
     (await (await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/request-counts')).json()));
-  expect(countsAfterTransition.search).toBe(1);
+  expect(countsAfterTransition.search, JSON.stringify(countsAfterTransition.searchQueries)).toBe(1);
 
   // More watched ticks are folded by the local transition key before the
   // account/session lookup, not merely before the final POST.

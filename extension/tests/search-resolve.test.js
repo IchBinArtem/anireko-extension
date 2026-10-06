@@ -37,6 +37,373 @@ function adoptionState() {
     player: { watched: true, playbackStarted: true, episode: 2, currentTime: 1000, duration: 1200 } };
 }
 
+const controllerHistoryId = '22222222-2222-4222-8222-222222222222';
+const controllerCycleId = '33333333-3333-4333-8333-333333333333';
+function controllerSnapshot(started = false) {
+  const current = started ? { cycle_id: controllerCycleId, status: 'active', kind: 'rewatching',
+    tracked_start_ordinal: 2, episode: 3, position_sec: 600, duration_sec: 1200, voice: null } : null;
+  const state = { anime_id: 101, version: started ? 1 : 0, current,
+    previously_completed: true, history_before_tracking_unknown: false,
+    lifetime_completed_count: 1, completed_count_lower_bound: 1, tracked_completed_count: 1 };
+  return { ...adoptionSnapshot(started), primary_history_id: controllerHistoryId,
+    start_anime_id: 101, start_state: state, origins: started
+      ? [{ history_id: controllerHistoryId, anime_id: 101, state }] : [],
+    reconciliation_token: 'a'.repeat(64), previously_completed: true,
+    foreground: { anime_id: 101, generation: started ? 1 : 0, cycle_id: started ? controllerCycleId : null },
+    catalog: { anime_id: 101, title: 'Known anime', season: 'SUMMER', season_year: 2026 },
+    totals: { started: started ? 2 : 1, completed: 1, cancelled: 0 } };
+}
+
+function prepareController(context, chrome) {
+  const state = { ...adoptionState(), tabId: 71 };
+  context.testHistoryState = state;
+  vm.runInContext('stateByTab[71] = testHistoryState;', context);
+  context.activeSyncAccount = async () => ({ userId: 18 });
+  chrome.tabs.sendMessage = async (_tabId, message, options) => {
+    if (message.type !== 'anireko-detector-status') return;
+    assert.equal(options.documentId, 'native-document-a');
+    return { ok: true, documentUrl: state.pageUrl, documentToken: state.navigationToken };
+  };
+  const send = (message) => new Promise((resolve) => {
+    chrome.runtime.onMessage.listener(message,
+      { id: chrome.runtime.id, url: `chrome-extension://${chrome.runtime.id}/popup.html` }, resolve);
+  });
+  return { state, send };
+}
+
+test('cycle terminal observation requires its own scoped fresh catalog proof', async () => {
+  const { context, chrome } = loadServiceWorker({ historyFetchImpl: async () => (
+    { ok: true, status: 200, json: async () => controllerSnapshot(true) }
+  ), fetchImpl: async () => { throw new Error('unexpected_endpoint'); } });
+  const { state, send } = prepareController(context, chrome);
+  state.player.episode = 12;
+  state.player.watched = true;
+  const revision = (await context.handlePopupRequest({ type: 'popup-runtime-info' })).payload.localWriteRevision;
+  const read = await send({ type: 'popup-watch-history', tabId: 71, expectedRevision: revision });
+  assert.equal(read.ok, true);
+  context.terminalState = state;
+  const capture = vm.runInContext('captureCycleProgress(captureProgressEvent(terminalState), captureLocalWrite())', context);
+  assert.equal(capture.intent.request.command, 'progress', 'stale FINISHED metadata cannot close a new cycle');
+});
+
+test('retained unconsumed ONGOING result cannot complete a cycle in actual producer order', async () => {
+  const posts = [];
+  let enteredSearch; let releaseSearch;
+  const entered = new Promise((resolve) => { enteredSearch = resolve; });
+  const blocked = new Promise((resolve) => { releaseSearch = resolve; });
+  const transport = completionFetch({ failSearchCount: 0 });
+  const { context, chrome, storage } = loadServiceWorker({
+    historyFetchImpl: async (_url, options) => {
+      if (options.method === 'POST') {
+        posts.push(JSON.parse(options.body));
+        return { ok: true, status: 200, json: async () => ({ history_id: controllerHistoryId,
+          anime_id: 101, foreground: controllerSnapshot(true).foreground, state: controllerSnapshot(true).start_state }) };
+      }
+      return { ok: true, status: 200, json: async () => controllerSnapshot(true) };
+    }, fetchImpl: async (url, init) => {
+      if (url.includes('/api/search')) {
+        enteredSearch(); await blocked;
+        const payload = freshFinishedSearchPayload();
+        payload.data[0].id = 101; payload.data[0].title = 'Known anime';
+        payload.data[0].episodes = 13; payload.data[0].release_status = 'ONGOING';
+        return { ok: true, status: 200, json: async () => payload };
+      }
+      return transport.fetchImpl(url, init);
+    },
+  });
+  await bindSyncAccount(storage);
+  const { state, send } = prepareController(context, chrome);
+  state.player.episode = 12;
+  const revision = (await context.handlePopupRequest({ type: 'popup-runtime-info' })).payload.localWriteRevision;
+  assert.equal((await send({ type: 'popup-watch-history', tabId: 71, expectedRevision: revision })).ok, true);
+  const old = context.maybeAutoMark(state);
+  await entered;
+  state.player = { ...state.player, currentTime: 1001 };
+  releaseSearch(); await old;
+  assert.equal(state.match.releaseStatus, 'FINISHED', 'result retained but old observation cannot publish');
+  await Promise.all([context.maybeSyncProgress(state, true), context.maybeAutoMark(state)]);
+  assert.equal(state.match.releaseStatus, 'ONGOING');
+  assert.ok(posts.length > 0, 'actual cycle producer reaches POST');
+  assert.equal(posts.some((request) => request.command === 'complete'), false);
+});
+
+test('actual controller explicit start uses one immutable admission and fresh snapshot, not receipt', async () => {
+  const posts = []; let started = false;
+  const { context, chrome } = loadServiceWorker({
+    historyFetchImpl: async (_url, options) => {
+      if (options.method === 'POST') {
+        posts.push(JSON.parse(options.body)); started = true;
+        return { ok: true, status: 200, json: async () => ({ history_id: controllerHistoryId,
+          anime_id: 101, foreground: controllerSnapshot(true).foreground, state: controllerSnapshot(true).start_state }) };
+      }
+      return { ok: true, status: 200, json: async () => controllerSnapshot(started) };
+    },
+    fetchImpl: async () => { throw new Error('unexpected_endpoint'); },
+  });
+  const { state, send } = prepareController(context, chrome);
+  const revision = (await context.handlePopupRequest({ type: 'popup-runtime-info' })).payload.localWriteRevision;
+  const read = await send({ type: 'popup-watch-history', tabId: 71, expectedRevision: revision });
+  assert.equal(posts.length, 0, 'GET never implicitly starts');
+  assert.equal(Object.isFrozen(state), false, 'capability must not recursively freeze live SW state');
+  const start = read.payload.actions.find((action) => action.command === 'start');
+  const request = { type: 'popup-watch-command', capabilityId: start.capabilityId, expectedRevision: revision };
+  const results = await Promise.all([send(request), send(request)]);
+  assert.equal(posts.length, 1, 'same capability has one admission/POST');
+  assert.equal(posts[0].command, 'start'); assert.equal(posts[0].expected_version, 0);
+  assert.equal(posts[0].expected_user_id, 18); assert.equal(posts[0].history_id, controllerHistoryId);
+  assert.equal(results.filter((result) => result.ok).length, 1);
+  const fresh = results.find((result) => result.ok).payload;
+  assert.equal(fresh.snapshot.history_adopted, true);
+  assert.ok(fresh.actions.some((action) => action.command === 'pause'));
+});
+
+test('actual controller restart retries original persisted bytes, never starts on startup', async () => {
+  const posts = [];
+  const first = loadServiceWorker({ historyFetchImpl: async (_url, options) => {
+    if (options.method === 'POST') { posts.push(options.body); throw new Error('lost_ack'); }
+    const snapshot = controllerSnapshot();
+    if (new URL(_url).searchParams.get('anime_id') === '202') {
+      snapshot.requested_anime_id = 202; snapshot.effective_anime_id = 202; snapshot.start_anime_id = 202;
+      snapshot.foreground.anime_id = 202; snapshot.start_state.anime_id = 202; snapshot.catalog.anime_id = 202;
+    }
+    return { ok: true, status: 200, json: async () => snapshot };
+  }, fetchImpl: async () => { throw new Error('unexpected_endpoint'); } });
+  const initial = prepareController(first.context, first.chrome);
+  const revision = (await first.context.handlePopupRequest({ type: 'popup-runtime-info' })).payload.localWriteRevision;
+  const read = await initial.send({ type: 'popup-watch-history', tabId: 71, expectedRevision: revision });
+  await initial.send({ type: 'popup-watch-command', expectedRevision: revision,
+    capabilityId: read.payload.actions.find((action) => action.command === 'start').capabilityId });
+  assert.equal(posts.length, 1);
+  const persisted = await first.storage.local.get(null);
+  assert.equal(persisted['watch-command-pending-v1'].acknowledged, false);
+  initial.state.match = { ...initial.state.match, animeId: 202 };
+  first.context.currentPendingState = initial.state;
+  const descriptorRead = await initial.send({ type: 'popup-watch-history', tabId: 71, expectedRevision: revision });
+  assert.equal(descriptorRead.payload.pendingIntent?.animeId, 101, 'original target visible before retry on another title');
+  assert.equal(descriptorRead.payload.pendingIntent?.action, 'start');
+  assert.equal(descriptorRead.payload.pendingIntent?.commandId, JSON.parse(posts[0]).command_id);
+  const foreign = JSON.parse(JSON.stringify(persisted['watch-command-pending-v1']));
+  foreign.request.expected_user_id = 17;
+  await first.storage.local.set({ 'watch-command-pending-v1': foreign });
+  const foreignRead = await initial.send({ type: 'popup-watch-history', tabId: 71, expectedRevision: revision });
+  assert.equal(foreignRead.payload.pending, true);
+  assert.equal(foreignRead.payload.pendingIntent, null, 'other account target/action stay private');
+  await first.storage.local.set({ 'watch-command-pending-v1': persisted['watch-command-pending-v1'] });
+  const second = loadServiceWorker({ localStorage: first.storage.local, historyFetchImpl: async (_url, options) => {
+    if (options.method === 'POST') {
+      posts.push(options.body);
+      return { ok: true, status: 200, json: async () => ({ history_id: controllerHistoryId,
+        anime_id: 101, foreground: controllerSnapshot(true).foreground, state: controllerSnapshot(true).start_state }) };
+    }
+    return { ok: true, status: 200, json: async () => controllerSnapshot(true) };
+  }, fetchImpl: async () => { throw new Error('unexpected_endpoint'); } });
+  const restarted = prepareController(second.context, second.chrome);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(posts.length, 1, 'startup must not replay');
+  const nextRevision = (await second.context.handlePopupRequest({ type: 'popup-runtime-info' })).payload.localWriteRevision;
+  const wrong = await restarted.send({ type: 'popup-watch-retry', expectedRevision: nextRevision, commandId: 'wrong-command' });
+  assert.equal(wrong.ok, false); assert.equal(posts.length, 1, 'changed/unseen intent cannot be resent');
+  const result = await restarted.send({ type: 'popup-watch-retry', expectedRevision: nextRevision, commandId: JSON.parse(posts[0]).command_id });
+  assert.equal(result.ok, true);
+  assert.equal(posts.length, 2);
+  assert.equal(posts[1], posts[0], 'same original UUID/body/CAS after restart');
+  assert.equal(result.payload.originalAnimeId, 101);
+  assert.equal(result.payload.snapshot, undefined, 'retry receipt is not current-document state');
+  assert.equal(Object.hasOwn(await second.storage.local.get(null), 'watch-command-pending-v1'), false);
+});
+
+test('actual acknowledged command survives restart and retries GET only', async () => {
+  let acknowledged = false;
+  const posts = [];
+  const first = loadServiceWorker({ historyFetchImpl: async (_url, options) => {
+    if (options.method === 'POST') {
+      acknowledged = true; posts.push(options.body);
+      return { ok: true, status: 200, json: async () => ({ history_id: controllerHistoryId,
+        anime_id: 101, foreground: controllerSnapshot(true).foreground, state: controllerSnapshot(true).start_state }) };
+    }
+    return { ok: true, status: 200, json: async () => acknowledged ? {} : controllerSnapshot() };
+  }, fetchImpl: async () => { throw new Error('unexpected_endpoint'); } });
+  const initial = prepareController(first.context, first.chrome);
+  const revision = (await first.context.handlePopupRequest({ type: 'popup-runtime-info' })).payload.localWriteRevision;
+  const read = await initial.send({ type: 'popup-watch-history', tabId: 71, expectedRevision: revision });
+  const result = await initial.send({ type: 'popup-watch-command', expectedRevision: revision,
+    capabilityId: read.payload.actions.find((action) => action.command === 'start').capabilityId });
+  assert.equal(result.ok, false);
+  assert.equal((await first.storage.local.get('watch-command-pending-v1'))['watch-command-pending-v1'].acknowledged, true);
+  const second = loadServiceWorker({ localStorage: first.storage.local, historyFetchImpl: async (_url, options) => {
+    assert.notEqual(options.method, 'POST', 'acknowledged original command is never resent');
+    return { ok: true, status: 200, json: async () => controllerSnapshot(true) };
+  }, fetchImpl: async () => { throw new Error('unexpected_endpoint'); } });
+  const restarted = prepareController(second.context, second.chrome);
+  const nextRevision = (await second.context.handlePopupRequest({ type: 'popup-runtime-info' })).payload.localWriteRevision;
+  assert.equal((await restarted.send({ type: 'popup-watch-retry', expectedRevision: nextRevision, commandId: JSON.parse(posts[0]).command_id })).ok, true);
+  assert.equal(posts.length, 1);
+});
+
+test('actual command rejects a replaced native document before durable admission', async () => {
+  const posts = [];
+  const { context, chrome, storage } = loadServiceWorker({ historyFetchImpl: async (_url, options) => {
+    if (options.method === 'POST') posts.push(options.body);
+    return { ok: true, status: 200, json: async () => controllerSnapshot() };
+  }, fetchImpl: async () => { throw new Error('unexpected_endpoint'); } });
+  const { state, send } = prepareController(context, chrome);
+  const revision = (await context.handlePopupRequest({ type: 'popup-runtime-info' })).payload.localWriteRevision;
+  const read = await send({ type: 'popup-watch-history', tabId: 71, expectedRevision: revision });
+  chrome.tabs.sendMessage = async () => ({ ok: true, documentUrl: state.pageUrl, documentToken: 'new-document-same-url' });
+  const result = await send({ type: 'popup-watch-command', expectedRevision: revision,
+    capabilityId: read.payload.actions.find((action) => action.command === 'start').capabilityId });
+  assert.equal(result.ok, false);
+  assert.deepEqual(posts, []);
+  assert.equal(Object.hasOwn(await storage.local.get(null), 'watch-command-pending-v1'), false);
+});
+
+test('actual controller obtains off-page foreground origin with the exact snapshot token', async () => {
+  const pages = [];
+  const full = controllerSnapshot(true);
+  const { context, chrome } = loadServiceWorker({ historyFetchImpl: async (url) => {
+    const page = new URL(url).searchParams.get('page');
+    pages.push(page);
+    return { ok: true, status: 200, json: async () => page
+      ? { ...full, origins: [], selected_origin: full.origins[0] }
+      : { ...full, origins: [] } };
+  }, fetchImpl: async () => { throw new Error('unexpected_endpoint'); } });
+  const { send } = prepareController(context, chrome);
+  const revision = (await context.handlePopupRequest({ type: 'popup-runtime-info' })).payload.localWriteRevision;
+  const response = await send({ type: 'popup-watch-history', tabId: 71, expectedRevision: revision });
+  assert.equal(response.ok, true);
+  assert.deepEqual(JSON.parse(pages[1]), { selected_cycle_id: controllerCycleId, snapshot_token: 'a'.repeat(64) });
+  assert.ok(response.payload.actions.some((action) => action.command === 'pause'));
+});
+
+test('actual media producer learns the cycle without retrobinding and ignores old completed history', async () => {
+  const posts = [];
+  const full = controllerSnapshot(true);
+  const { context, chrome, storage } = loadServiceWorker({ historyFetchImpl: async (_url, options) => {
+    if (options.method === 'POST') {
+      const payload = JSON.parse(options.body); posts.push(payload);
+      return { ok: true, status: 200, json: async () => ({ history_id: controllerHistoryId,
+        anime_id: 101, foreground: full.foreground, state: { ...full.start_state, version: 2 } }) };
+    }
+    return { ok: true, status: 200, json: async () => full };
+  }, fetchImpl: async () => { throw new Error('legacy_endpoint_must_not_be_called'); } });
+  const { state } = prepareController(context, chrome);
+  state.player = { ...state.player, watched: false, currentTime: 100 };
+  await storage.local.set({ 'watch-history': { days: {}, records: {
+    'known anime::12': { animeId: 101, episode: 12, completed: true, position: 1200, duration: 1200 },
+  } } });
+  await context.maybeSyncProgress(state, true);
+  assert.deepEqual(posts, [], 'first observation learns foreground, never retrobinds that observation');
+  state.player = { ...state.player, currentTime: 150 };
+  await context.maybeSyncProgress(state, true);
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].command, 'progress', 'previous completion cannot complete the current cycle');
+  assert.equal(posts[0].cycle_id, controllerCycleId);
+  assert.equal(posts[0].expected_version, 1);
+  assert.equal(posts[0].position_sec, 150);
+  assert.equal(posts[0].episode, 2);
+});
+
+test('authoritative episode signal mutating the same player rejects captured cycle progress', async () => {
+  const posts = [];
+  const full = controllerSnapshot(true);
+  const { context, chrome } = loadServiceWorker({ historyFetchImpl: async (_url, options) => {
+    if (options.method === 'POST') {
+      posts.push(JSON.parse(options.body));
+      return { ok: true, status: 200, json: async () => ({ history_id: controllerHistoryId,
+        anime_id: 101, foreground: full.foreground, state: full.start_state }) };
+    }
+    return { ok: true, status: 200, json: async () => full };
+  }, fetchImpl: async () => { throw new Error('legacy_endpoint_must_not_be_called'); } });
+  const { state, send } = prepareController(context, chrome);
+  state.player.watched = false;
+  state.player.documentId = 'native-document-a';
+  state.player.frameId = 0; state.player.locallyVisible = true;
+  state.players = { main: state.player };
+  const reference = state.player;
+  const revision = (await context.handlePopupRequest({ type: 'popup-runtime-info' })).payload.localWriteRevision;
+  assert.equal((await send({ type: 'popup-watch-history', tabId: 71, expectedRevision: revision })).ok, true);
+  let enteredGate; let releaseGate;
+  const entered = new Promise((resolve) => { enteredGate = resolve; });
+  const blocked = new Promise((resolve) => { releaseGate = resolve; });
+  context.activeSyncAccount = async () => { enteredGate(); await blocked; return { userId: 18 }; };
+  const pending = context.maybeSyncProgress(state, true);
+  await entered;
+  context.episodeSignalState = state;
+  assert.equal(vm.runInContext("applyEpisodeSignal(episodeSignalState, { episode: 1, authoritative: true, sourceKind: 'playlist', topFrame: true, documentId: 'native-document-a' })", context), true);
+  assert.equal(state.player, reference, 'actual signal producer mutates original object');
+  assert.equal(state.player.episode, 1);
+  releaseGate(); await pending;
+  assert.deepEqual(posts, [], 'old captured episode cannot enter durable network command');
+});
+
+test('actual popup saved movie sync cannot complete an adopted active cycle', async () => {
+  const posts = [];
+  const full = controllerSnapshot(true);
+  const { context, chrome, storage } = loadServiceWorker({ historyFetchImpl: async (_url, options) => {
+    if (options.method === 'POST') {
+      posts.push(JSON.parse(options.body));
+      return { ok: true, status: 200, json: async () => ({ history_id: controllerHistoryId,
+        anime_id: 101, foreground: full.foreground, state: full.start_state }) };
+    }
+    return { ok: true, status: 200, json: async () => full };
+  }, fetchImpl: async (url) => {
+    if (url.includes('/api/auth/session-info.php')) {
+      return { ok: true, status: 200, json: async () => ({ success: true, user: { id: 18 } }) };
+    }
+    throw new Error('legacy_endpoint_must_not_be_called');
+  } });
+  await storage.local.set({ 'auto-mark': true, 'sync-account': { id: 18, boundAt: Date.now() },
+    'privacy-consent': { version: 1, acceptedAt: Date.now() },
+    'watch-history': { days: {}, records: { 'known anime::full': {
+      animeId: 101, episode: null, position: 1200, duration: 1200, completed: true, lastWatchedAt: 2000,
+    } } } });
+  const { state, send } = prepareController(context, chrome);
+  state.match.type = 'MOVIE';
+  state.player = { player: 'iframe-shell', playbackStarted: false };
+  const revision = (await context.handlePopupRequest({ type: 'popup-runtime-info' })).payload.localWriteRevision;
+  assert.equal((await send({ type: 'popup-watch-history', tabId: 71, expectedRevision: revision })).ok, true);
+  await send({ type: 'popup-sync-current', tabId: 71, expectedUserId: 18, expectedRevision: revision });
+  assert.deepEqual(posts, [], 'previous saved completion cannot write current cycle');
+  const read = await send({ type: 'popup-watch-history', tabId: 71, expectedRevision: revision });
+  const complete = read.payload.actions.find((action) => action.command === 'complete');
+  assert.ok(complete, 'explicit user Complete remains available independently of playback');
+  assert.equal((await send({ type: 'popup-watch-command', capabilityId: complete.capabilityId, expectedRevision: revision })).ok, true);
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].command, 'complete', 'only explicitly selected capability can complete this cycle');
+});
+
+test('actual controller clear drains entered journal persistence and rejects old command callback', async () => {
+  const posts = [];
+  const { context, chrome, storage } = loadServiceWorker({
+    historyFetchImpl: async (_url, options) => {
+      if (options.method === 'POST') posts.push(options.body);
+      return { ok: true, status: 200, json: async () => controllerSnapshot() };
+    }, fetchImpl: async () => { throw new Error('unexpected_endpoint'); },
+  });
+  const { send } = prepareController(context, chrome);
+  const revision = (await context.handlePopupRequest({ type: 'popup-runtime-info' })).payload.localWriteRevision;
+  const read = await send({ type: 'popup-watch-history', tabId: 71, expectedRevision: revision });
+  let release; let entered;
+  const blocked = new Promise((resolve) => { release = resolve; });
+  const waiting = new Promise((resolve) => { entered = resolve; });
+  const originalSet = storage.local.set;
+  storage.local.set = async (items) => {
+    const captured = JSON.parse(JSON.stringify(items));
+    if (Object.hasOwn(items, 'watch-command-pending-v1')) { entered(); await blocked; }
+    return originalSet(captured);
+  };
+  const command = send({ type: 'popup-watch-command', expectedRevision: revision,
+    capabilityId: read.payload.actions.find((action) => action.command === 'start').capabilityId });
+  await waiting;
+  let cleared = false;
+  const clear = send({ type: 'popup-delete-local-data', expectedRevision: revision }).then((value) => { cleared = true; return value; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(cleared, false, 'clear must wait for entered journal storage write');
+  release(); await Promise.all([command, clear]);
+  assert.deepEqual(await storage.local.get(null), {});
+  assert.deepEqual(posts, [], 'invalidated admission never starts network mutation');
+});
+
 test('actual progress and auto-mark require strict owner-bound unadopted history', async () => {
   for (const [name, snapshot, allowed] of [
     ['false', adoptionSnapshot(false), true],
@@ -182,6 +549,11 @@ test('popup history listener is readonly and rejects persisted-only document sta
   });
   context.activeSyncAccount = async () => ({ userId: 18 });
   const state = { ...adoptionState(), tabId: 71 };
+  chrome.tabs.sendMessage = async (_tabId, message, options) => {
+    assert.equal(message.type, 'anireko-detector-status');
+    assert.equal(options.documentId, state.topDocumentId);
+    return { ok: true, documentUrl: state.pageUrl, documentToken: state.navigationToken };
+  };
   context.testHistoryState = state;
   vm.runInContext('stateByTab[71] = testHistoryState;', context);
   const revision = (await context.handlePopupRequest({ type: 'popup-runtime-info' })).payload.localWriteRevision;
@@ -247,8 +619,8 @@ function makeStorage() {
   };
 }
 
-function loadServiceWorker({ fetchImpl, historyFetchImpl } = {}) {
-  const local = makeStorage();
+function loadServiceWorker({ fetchImpl, historyFetchImpl, localStorage } = {}) {
+  const local = localStorage || makeStorage();
   const session = makeStorage();
   const actionCalls = {
     icon: [],
@@ -1055,6 +1427,84 @@ async function bindSyncAccount(storage) {
 function statusWrites(calls) {
   return calls.filter((call) => call.url.includes('/api/anime/status.php')
     && call.init?.method === 'POST');
+}
+
+test('same-episode tick retains scoped forced metadata without writing the old media event', async () => {
+  const transport = completionFetch({ failSearchCount: 0 });
+  let releaseSearch; let enteredSearch;
+  const entered = new Promise((resolve) => { enteredSearch = resolve; });
+  const delayed = new Promise((resolve) => { releaseSearch = resolve; });
+  const { context, storage } = loadServiceWorker({ fetchImpl: async (url, init) => {
+    if (url.includes('/api/search')) { enteredSearch(); await delayed; }
+    return transport.fetchImpl(url, init);
+  } });
+  await bindSyncAccount(storage);
+  const state = terminalEpisodeState();
+  state.player.currentTime = 260;
+  const originalMatch = state.match;
+  const pending = context.maybeAutoMark(state);
+  await entered;
+  state.player = { ...state.player, currentTime: 261 };
+  releaseSearch();
+  await pending;
+  assert.equal(state.match, originalMatch, 'old observation does not publish');
+  assert.equal(statusWrites(transport.calls).length, 0, 'old media cannot write');
+  await context.maybeAutoMark(state);
+  assert.equal(transport.searchAttempts(), 1, 'next current observation consumes this forced result');
+  assert.equal(statusWrites(transport.calls).length, 1);
+});
+
+test('completion metadata freshness cannot be borrowed by another stale state', async () => {
+  let searches = 0;
+  const transport = completionFetch({ failSearchCount: 0 });
+  const { context, storage } = loadServiceWorker({ fetchImpl: async (url, init) => {
+    if (url.includes('/api/search')) {
+      searches += 1;
+      const payload = freshFinishedSearchPayload();
+      payload.data[0].episodes = 13;
+      payload.data[0].release_status = 'ONGOING';
+      return { ok: true, status: 200, json: async () => payload };
+    }
+    return transport.fetchImpl(url, init);
+  } });
+  await bindSyncAccount(storage);
+  const first = terminalEpisodeState();
+  const second = terminalEpisodeState();
+  await context.maybeAutoMark(first);
+  await context.maybeAutoMark(second);
+  assert.equal(statusWrites(transport.calls).length, 0, 'both states must consume fresh ONGOING metadata');
+  assert.equal(second.match.releaseStatus, 'ONGOING');
+  assert.equal(searches, 2, 'independent state cannot borrow a boolean freshness proof');
+});
+
+for (const change of ['episode', 'document', 'rematch', 'account']) {
+  test(`retained completion metadata is rejected after ${change} changes`, async () => {
+    const transport = completionFetch({ failSearchCount: 0 });
+    let releaseSearch; let enteredSearch;
+    const entered = new Promise((resolve) => { enteredSearch = resolve; });
+    const delayed = new Promise((resolve) => { releaseSearch = resolve; });
+    const { context, storage } = loadServiceWorker({ fetchImpl: async (url, init) => {
+      if (url.includes('/api/search')) { enteredSearch(); await delayed; }
+      return transport.fetchImpl(url, init);
+    } });
+    await bindSyncAccount(storage);
+    context.noteSessionIdentity({ ok: true, payload: { success: true, user: { id: 7 } } });
+    const state = terminalEpisodeState();
+    state.topDocumentId = 'document-a';
+    const pending = context.maybeAutoMark(state);
+    await entered;
+    if (change === 'episode') state.player = { ...state.player, episode: 1 };
+    if (change === 'document') state.topDocumentId = 'document-b';
+    if (change === 'rematch') state.match = { ...state.match };
+    if (change === 'account') context.noteSessionIdentity({ ok: true, payload: { success: true, user: { id: 8 } } });
+    const currentMatch = state.match;
+    releaseSearch();
+    await pending;
+    assert.equal(state.match, currentMatch);
+    assert.equal(statusWrites(transport.calls).length, 0);
+    context.metadataScopeState = state;
+    assert.equal(vm.runInContext('completionMetadataResults.has(metadataScopeState)', context), false);
+  });
 }
 
 test('maybeAutoMark does not complete from stale cache when forced refresh fails transiently', async () => {
