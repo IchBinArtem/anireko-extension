@@ -1,9 +1,11 @@
-import { test, expect, chromium, type BrowserContext, type Page, type Worker } from '@playwright/test';
+import { test as baseTest, expect, chromium, type BrowserContext, type Page, type Worker } from '@playwright/test';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-const sourceExtensionPath = path.resolve(__dirname, '../../../extension');
+const sourceExtensionPath = process.env.ANIREKO_EXTENSION_TEST_SOURCE
+  ? path.resolve(process.env.ANIREKO_EXTENSION_TEST_SOURCE)
+  : path.resolve(__dirname, '../../../extension');
 const fixturePort = Number(process.env.ANIREKO_EXTENSION_FIXTURE_PORT || 4178);
 const apiBase = `http://127.0.0.1:${fixturePort}`;
 const siteBase = `http://127.0.0.2:${fixturePort}`;
@@ -15,6 +17,69 @@ let extensionId: string;
 let userDataDir: string;
 let testRootDir: string;
 let extensionPath: string;
+
+async function cleanupExtensionFixture(
+  close: () => Promise<void>,
+  roots: [string | undefined, string][],
+  remove: (root: string) => void = (root) => fs.rmSync(root, { recursive: true, force: true })
+): Promise<unknown[]> {
+  const errors: unknown[] = [];
+  try { await close(); } catch (error) { errors.push(error); }
+  for (const [root, prefix] of roots) {
+    if (!root) continue;
+    try {
+      const resolved = path.resolve(root);
+      if (path.dirname(resolved) !== path.resolve(os.tmpdir()) || !path.basename(resolved).startsWith(prefix)
+        || (fs.existsSync(resolved) && fs.lstatSync(resolved).isSymbolicLink())) {
+        throw new Error('unsafe_extension_fixture_cleanup_target');
+      }
+      remove(resolved);
+    } catch (error) { errors.push(error); }
+  }
+  return errors;
+}
+
+const test = baseTest.extend<{}, { extensionLifecycle: void }>({
+  extensionLifecycle: [async ({}, use) => {
+    let setupError: unknown;
+    try {
+      await setupExtension();
+      await use();
+    } catch (error) {
+      setupError = error;
+      throw error;
+    } finally {
+      const errors = await cleanupExtensionFixture(() => context?.close() ?? Promise.resolve(),
+        [[userDataDir, 'anireko-extension-e2e-'], [testRootDir, 'anireko-extension-build-']]);
+      if (errors.length && setupError !== undefined) console.error('secondary extension fixture cleanup failures', errors);
+      else if (errors.length) throw new AggregateError(errors, 'extension fixture cleanup failed');
+    }
+  }, { scope: 'worker', auto: true }],
+});
+
+test('extension fixture cleanup attempts all owned roots and preserves foreign state', async () => {
+  const first = fs.mkdtempSync(path.join(os.tmpdir(), 'anireko-extension-e2e-'));
+  const second = fs.mkdtempSync(path.join(os.tmpdir(), 'anireko-extension-build-'));
+  const foreign = fs.mkdtempSync(path.join(os.tmpdir(), 'anireko-foreign-fixture-'));
+  fs.writeFileSync(path.join(foreign, 'sentinel'), 'preserve');
+  try {
+    const attempted: string[] = [];
+    const errors = await cleanupExtensionFixture(async () => { throw new Error('close failure'); },
+      [[first, 'anireko-extension-e2e-'], [second, 'anireko-extension-build-'], [foreign, 'anireko-extension-e2e-']],
+      (root) => { attempted.push(root); if (root === first) throw new Error('first delete failure'); fs.rmSync(root, { recursive: true }); });
+    expect(errors).toHaveLength(3);
+    expect(attempted).toEqual([first, second]);
+    expect(fs.existsSync(first)).toBe(true);
+    expect(fs.existsSync(second)).toBe(false);
+    expect(fs.readFileSync(path.join(foreign, 'sentinel'), 'utf8')).toBe('preserve');
+    // Partial setup: no browser/profile yet, but an exact build directory exists.
+    const partial = await cleanupExtensionFixture(async () => {}, [[undefined, 'anireko-extension-e2e-'], [first, 'anireko-extension-e2e-']]);
+    expect(partial).toEqual([]);
+    expect(fs.existsSync(first)).toBe(false);
+  } finally {
+    for (const root of [first, second, foreign]) fs.rmSync(root, { recursive: true, force: true });
+  }
+});
 
 async function setSyntheticPlayback(
   frame: ReturnType<Page['frameLocator']>,
@@ -79,7 +144,7 @@ async function waitForDetectorReady(tabId: number) {
   }, { timeout: 10_000 }).toBeGreaterThan(0);
 }
 
-test.beforeAll(async () => {
+async function setupExtension() {
   expect(fs.existsSync(path.join(sourceExtensionPath, 'manifest.json'))).toBe(true);
   testRootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'anireko-extension-build-'));
   extensionPath = path.join(testRootDir, 'extension');
@@ -133,13 +198,7 @@ test.beforeAll(async () => {
   const setupTabId = await extensionTabId(`${siteBase}/*`);
   await expect.poll(async () => (await storedTabState(setupTabId))?.match?.status ?? null).toBe('ok');
   await setupPage.close();
-});
-
-test.afterAll(async () => {
-  await context?.close();
-  fs.rmSync(userDataDir, { recursive: true, force: true });
-  fs.rmSync(testRootDir, { recursive: true, force: true });
-});
+}
 
 test.beforeEach(async () => {
   await worker.evaluate(async () => {
@@ -191,6 +250,106 @@ test('cycle popup keeps previous completion and starts only after explicit actio
     await popup?.close();
     await page.close();
   }
+});
+
+test('cycle settlement preserves lost-ACK intent across account transfer and popup reopen', async () => {
+  await worker.evaluate(async () => {
+    await chrome.storage.local.set({ 'auto-mark': true, 'sync-account': { id: 18, name: 'TestUser' } });
+    const base = (globalThis as any).AniRekoRuntimeConfig.apiBase;
+    await fetch(base + '/__test/session?on=1&user=18');
+    await fetch(base + '/__test/cycle-history?lostAck=1');
+  });
+  const page = await context.newPage(); let popup: Page | null = null;
+  const pending = () => worker.evaluate(async () =>
+    (await chrome.storage.local.get('watch-command-pending-v1'))['watch-command-pending-v1']);
+  const receipts = () => worker.evaluate(async () => {
+    const response = await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/cycle-history');
+    return response.json();
+  });
+  try {
+    await page.goto(`${siteBase}/anime.html`);
+    const tabId = await extensionTabId(`${siteBase}/*`);
+    await expect.poll(async () => (await storedTabState(tabId))?.match?.status).toBe('ok');
+    popup = await openPopup(tabId);
+    await popup.getByRole('button', { name: 'Начать новый просмотр', exact: true }).click();
+    await expect(popup.getByRole('button', { name: 'Проверить результат команды', exact: true })).toBeVisible();
+    const original = await pending();
+    expect(original.version).toBe(1);
+    expect(original.acknowledged).toBe(false);
+    expect((await receipts()).posts).toHaveLength(1);
+    await popup.close(); popup = null;
+    await worker.evaluate(async () => {
+      await chrome.storage.local.set({ 'sync-account': { id: 19, name: 'MergedOwner' } });
+      await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/session?on=1&user=19');
+    });
+    popup = await openPopup(tabId);
+    await expect(popup.locator('#watch-feedback')).toContainText('Исходная команда относится к другому аккаунту');
+    const settle = () => popup!.getByRole('button', { name: 'Проверить результат команды', exact: true });
+    await expect(settle()).toBeVisible();
+    expect(await pending()).toEqual(original);
+    expect((await receipts()).settlementPosts).toEqual([]);
+    await settle().click();
+    await expect(settle()).toBeEnabled();
+    await expect.poll(async () => (await receipts()).settlementPosts.length).toBe(1);
+    expect(await pending()).toEqual(original);
+    await popup.close(); popup = await openPopup(tabId);
+    await expect(settle()).toBeVisible();
+    expect((await receipts()).settlementPosts).toHaveLength(1);
+    expect((await receipts()).posts).toHaveLength(1);
+    await settle().click();
+    await expect.poll(pending).toBeUndefined();
+    await expect(popup.locator('#watch-current')).toContainText('Пересматриваю');
+    await expect(popup.locator('#watch-completion')).toContainText('Уже просмотрено');
+    const observed = await receipts();
+    expect(observed.posts).toHaveLength(1);
+    expect(observed.settlementPosts).toHaveLength(2);
+    for (const attempt of observed.settlementPosts) {
+      expect(attempt.currentUser).toBe(19);
+      expect(attempt.payload).toEqual({ ...observed.posts[0], operation: 'settle' });
+      expect(attempt.payload.expected_user_id).toBe(18);
+    }
+  } finally { await popup?.close(); await page.close(); }
+});
+
+test('cycle repair requires separate explicit choices for complete related groups', async ({}, testInfo) => {
+  await worker.evaluate(async () => {
+    await chrome.storage.local.set({ 'auto-mark': true, 'sync-account': { id: 18, name: 'TestUser' } });
+    const base = (globalThis as any).AniRekoRuntimeConfig.apiBase;
+    await fetch(base + '/__test/session?on=1&user=18');
+    await fetch(base + '/__test/cycle-history?repair=1');
+  });
+  const page = await context.newPage(); let popup: Page | null = null;
+  try {
+    await page.goto(`${siteBase}/anime.html`);
+    const tabId = await extensionTabId(`${siteBase}/*`);
+    await expect.poll(async () => (await storedTabState(tabId))?.match?.status).toBe('ok');
+    popup = await openPopup(tabId);
+    const groups = popup.locator('.watch-choice-group');
+    await expect(groups).toHaveCount(2);
+    await expect(groups.nth(1).locator('legend')).toHaveText('Связанный тайтл');
+    const apply = popup.getByRole('button', { name: 'Выбрать историю просмотра', exact: true });
+    await expect(apply).toBeDisabled();
+    expect(await popup.locator('.watch-choice-group input:checked').count()).toBe(0);
+    await groups.nth(0).getByRole('radio').nth(1).check();
+    await expect(apply).toBeDisabled();
+    await groups.nth(1).getByRole('radio').nth(0).check();
+    await expect(apply).toBeEnabled();
+    await expect(popup.locator('#watch-completion')).toContainText('Уже просмотрено');
+    const screenshotPath = testInfo.outputPath('watch-choice-popup.png');
+    await popup.screenshot({ path: screenshotPath, fullPage: true });
+    await testInfo.attach('watch-choice-popup', { path: screenshotPath, contentType: 'image/png' });
+    await apply.click();
+    await expect(groups).toHaveCount(0);
+    await expect(popup.locator('#watch-completion')).toContainText('Уже просмотрено');
+    const posts = await worker.evaluate(async () => {
+      const response = await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/cycle-history');
+      return (await response.json()).posts;
+    });
+    expect(posts).toHaveLength(1);
+    expect(posts[0].operation).toBe('select');
+    expect(posts[0].choices.map((choice: any) => choice.cycle_id)).toEqual([
+      '33333333-3333-4333-8333-000000000002', '33333333-3333-4333-8333-000000000003']);
+  } finally { await popup?.close(); await page.close(); }
 });
 
 test('renders browser-local activity as a calm calendar with honest missing days', async () => {

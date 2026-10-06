@@ -1,4 +1,7 @@
 {
+  "watchChoicesHint": {"message":"Выберите один текущий просмотр в каждой группе. Остальные будут поставлены на паузу, не удалены; прежние завершения сохранятся."},
+  "watchChoicesIncomplete": {"message":"Полный список вариантов не загрузился. Частичный выбор не будет применён."},
+  "watchHistoryIdentity": {"message":"История $ID$","placeholders":{"id":{"content":"$1"}}},
   "watchCurrentHistoryCount": {"message":"В текущей истории просмотра"},
   "watchStartHistoryCount": {"message":"В истории для нового просмотра"},
   "watchOriginalTarget": {"message":"Исходное аниме: ID $N$","placeholders":{"n":{"content":"$1"}}},
@@ -17,7 +20,9 @@
   "watchHistoryUnavailable": {"message":"История просмотра недоступна"},
   "watchNoLegacyFallback": {"message":"Старый прогресс не подставляется в новый просмотр"},
   "watchCommandUnresolved": {"message":"Результат команды ещё не подтверждён. Повторяется только исходная команда."},
-  "watchRetryOriginal": {"message":"Проверить исходную команду"},
+  "watchRetryOriginal": {"message":"Повторить исходную команду"},
+  "watchSettleOriginal": {"message":"Проверить результат команды"},
+  "watchSettlementHint": {"message":"Сервер проверит результат. Если команда не была применена, её позднее выполнение будет запрещено. История просмотров сохранится."},
   "watchAction_initialize": {"message":"Подключить историю просмотров"},
   "watchAction_start": {"message":"Начать новый просмотр"},
   "watchAction_pause": {"message":"Приостановить просмотр"},

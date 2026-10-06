@@ -1,4 +1,7 @@
 {
+  "watchChoicesHint": {"message":"Choose one current watch in each group. Other watches will be paused, not deleted; earlier completions are preserved."},
+  "watchChoicesIncomplete": {"message":"The complete choice list could not be loaded. No partial choice will be applied."},
+  "watchHistoryIdentity": {"message":"History $ID$","placeholders":{"id":{"content":"$1"}}},
   "watchCurrentHistoryCount": {"message":"In the current watch history"},
   "watchStartHistoryCount": {"message":"In the history for a new watch"},
   "watchOriginalTarget": {"message":"Original anime: ID $N$","placeholders":{"n":{"content":"$1"}}},
@@ -17,7 +20,9 @@
   "watchHistoryUnavailable": {"message":"Watch history is unavailable"},
   "watchNoLegacyFallback": {"message":"Previous progress is not substituted into a new watch"},
   "watchCommandUnresolved": {"message":"Command outcome is not confirmed yet. Only the original command will be retried."},
-  "watchRetryOriginal": {"message":"Check original command"},
+  "watchRetryOriginal": {"message":"Retry original command"},
+  "watchSettleOriginal": {"message":"Check command outcome"},
+  "watchSettlementHint": {"message":"The server checks the outcome. If the command was not applied, its late execution will be prevented. Watch history is preserved."},
   "watchAction_initialize": {"message":"Enable watch history"},
   "watchAction_start": {"message":"Start a new watch"},
   "watchAction_pause": {"message":"Pause this watch"},

@@ -71,6 +71,162 @@ function prepareController(context, chrome) {
   return { state, send };
 }
 
+function repairRow(group, origin, number) {
+  return { effective_anime_id: group, anime_id: origin, history_id: controllerHistoryId,
+    cycle_id: `33333333-3333-4333-8333-${String(number).padStart(12, '0')}`,
+    competing: true, tracked_start_ordinal: number, episode: number, kind: 'rewatching',
+    catalog: { anime_id: group, title: `Title ${group}`, title_ru: null, title_en: null,
+      season: null, season_year: null } };
+}
+
+function repairSnapshot(rows, more = false) {
+  const snapshot = controllerSnapshot();
+  snapshot.history_adopted = true; snapshot.readiness = 'reconciliation_required';
+  snapshot.component_choices = rows;
+  const last = rows.at(-1);
+  snapshot.page = { choices_has_more: more, choices_next: more ? {
+    after_choice: { effective_anime_id: last.effective_anime_id, anime_id: last.anime_id,
+      history_id: last.history_id, cycle_id: last.cycle_id }, snapshot_token: snapshot.reconciliation_token,
+  } : null };
+  return snapshot;
+}
+
+test('actual SW collects complete related-group pages, requires every explicit winner and retains lost-ACK selection', async () => {
+  const rows = [repairRow(101, 101, 1), repairRow(101, 102, 2),
+    repairRow(202, 202, 3), repairRow(202, 203, 4)];
+  const first = repairSnapshot(rows.slice(0, 2), true);
+  const second = repairSnapshot(rows.slice(2));
+  const posts = []; const continuation = [];
+  const subject = loadServiceWorker({ historyFetchImpl: async (url, options) => {
+    if (options.method === 'POST') { posts.push(options.body); throw new Error('lost_ack'); }
+    const page = new URL(url).searchParams.get('page');
+    if (page) continuation.push(JSON.parse(page));
+    return { ok: true, status: 200, json: async () => page ? second : first };
+  }, fetchImpl: async () => { throw new Error('unexpected_endpoint'); } });
+  const { send } = prepareController(subject.context, subject.chrome);
+  const revision = (await subject.context.handlePopupRequest({ type: 'popup-runtime-info' })).payload.localWriteRevision;
+  for (const invalid of [undefined, [], [rows[0].cycle_id], [rows[0].cycle_id, rows[0].cycle_id],
+    [rows[0].cycle_id, rows[1].cycle_id], [rows[0].cycle_id, 'foreign-cycle']]) {
+    const read = await send({ type: 'popup-watch-history', tabId: 71, expectedRevision: revision });
+    assert.equal(read.ok, true);
+    const action = read.payload.actions.find(item => item.command === 'reconcile');
+    assert.equal(action.groups.length, 2, 'related group outside visible root included');
+    const result = await send({ type: 'popup-watch-command', expectedRevision: revision,
+      capabilityId: action.capabilityId, ...(invalid === undefined ? {} : { choiceCycleIds: invalid }) });
+    assert.equal(result.ok, false);
+    assert.equal(posts.length, 0, 'no partial or inferred winner can reach POST');
+  }
+  const read = await send({ type: 'popup-watch-history', tabId: 71, expectedRevision: revision });
+  const result = await send({ type: 'popup-watch-command', expectedRevision: revision,
+    capabilityId: read.payload.actions[0].capabilityId, choiceCycleIds: [rows[1].cycle_id, rows[2].cycle_id] });
+  assert.equal(result.ok, false, 'lost acknowledgement is unresolved');
+  assert.equal(posts.length, 1);
+  const original = JSON.parse(posts[0]);
+  assert.equal(original.operation, 'select'); assert.equal(original.cycle_id, null);
+  assert.equal(original.anime_id, 101); assert.equal(original.expected_effective_anime_id, 101);
+  assert.deepEqual(original.choices, [rows[1], rows[2]].map(row =>
+    ({ history_id: row.history_id, anime_id: row.anime_id, cycle_id: row.cycle_id })));
+  assert.deepEqual(continuation[0], first.page.choices_next);
+  const pending = (await subject.storage.local.get('watch-command-pending-v1'))['watch-command-pending-v1'];
+  assert.equal(pending.action, 'history-select');
+  const retry = await send({ type: 'popup-watch-retry', expectedRevision: revision, commandId: original.command_id });
+  assert.equal(retry.ok, false);
+  assert.equal(posts[1], posts[0], 'explicit retry preserves UUID/CAS and all winners');
+});
+
+test('actual SW bounds complete repair collection and offers no partial action beyond 500 choices', async () => {
+  const rows = Array.from({ length: 501 }, (_, index) => repairRow(101, 101, index + 1));
+  const pages = Array.from({ length: 6 }, (_, index) => repairSnapshot(rows.slice(index * 100, (index + 1) * 100), index < 5));
+  let reads = 0; let posts = 0;
+  const subject = loadServiceWorker({ historyFetchImpl: async (_url, options) => {
+    if (options.method === 'POST') posts++;
+    return { ok: true, status: 200, json: async () => pages[reads++] };
+  }, fetchImpl: async () => { throw new Error('unexpected_endpoint'); } });
+  const { send } = prepareController(subject.context, subject.chrome);
+  const revision = (await subject.context.handlePopupRequest({ type: 'popup-runtime-info' })).payload.localWriteRevision;
+  const read = await send({ type: 'popup-watch-history', tabId: 71, expectedRevision: revision });
+  assert.equal(read.ok, true);
+  assert.equal(reads, 6);
+  assert.equal(read.payload.repairComplete, false);
+  assert.equal(read.payload.actions.length, 0);
+  assert.equal(posts, 0);
+});
+
+test('actual SW refuses stale token, duplicate cycles and incomplete repair pages without POST', async () => {
+  for (const defect of ['token', 'duplicate', 'cursor', 'missing-page']) {
+    const rows = [repairRow(101, 101, 1), repairRow(101, 102, 2)];
+    const first = repairSnapshot(rows.slice(0, 1), true);
+    const second = repairSnapshot(rows.slice(1));
+    if (defect === 'token') second.reconciliation_token = 'b'.repeat(64);
+    if (defect === 'duplicate') second.component_choices[0].cycle_id = rows[0].cycle_id;
+    if (defect === 'cursor') first.page.choices_next.after_choice.anime_id = 999;
+    if (defect === 'missing-page') delete second.component_choices;
+    let posts = 0;
+    const subject = loadServiceWorker({ historyFetchImpl: async (url, options) => {
+      if (options.method === 'POST') posts++;
+      return { ok: true, status: 200, json: async () => new URL(url).searchParams.has('page') ? second : first };
+    }, fetchImpl: async () => { throw new Error('unexpected_endpoint'); } });
+    const { send } = prepareController(subject.context, subject.chrome);
+    const revision = (await subject.context.handlePopupRequest({ type: 'popup-runtime-info' })).payload.localWriteRevision;
+    const read = await send({ type: 'popup-watch-history', tabId: 71, expectedRevision: revision });
+    assert.equal(read.ok, false, defect);
+    assert.equal(posts, 0);
+  }
+});
+
+test('actual SW explicit settlement hides transferred intent and persists proof before original-root GET', async () => {
+  const calls = []; let failOriginal = true; let userId = 18; let clientContext;
+  const subject = loadServiceWorker({ historyFetchImpl: async (url, init) => {
+    calls.push({ url, body: init.body, headers: init.headers });
+    if (init.method === 'POST') {
+      const wire = JSON.parse(init.body);
+      if (wire.operation === 'command') { if (failOriginal) throw new Error('lost_ack'); throw new Error('unexpected_retry'); }
+      assert.equal(wire.operation, 'settle');
+      assert.equal(wire.expected_user_id, 18, 'old expectation is immutable');
+      assert.equal(init.headers['X-Anireko-Watch-Expected-User'], '19');
+      const original = { ...wire }; delete original.operation;
+      return { ok: true, status: 200, json: async () => ({ settlement_version: 1, outcome: 'not_applied',
+        current_user_id: 19, history_id: wire.history_id, anime_id: wire.anime_id, command_id: wire.command_id,
+        original_operation: 'command', command_kind: 'start',
+        request_hash: await clientContext.AniRekoWatchRequestHash.hash('history-command', original) }) };
+    }
+    if (!failOriginal) {
+      const pending = (await subject.storage.local.get('watch-command-pending-v1'))['watch-command-pending-v1'];
+      assert.equal(pending.version, 2, 'proof durable before GET');
+      assert.equal(pending.terminalOutcome.current_user_id, 19);
+      assert.equal(new URL(url).searchParams.get('anime_id'), '101', 'original root, not current title');
+    }
+    const snapshot = controllerSnapshot(); snapshot.user_id = userId;
+    return { ok: true, status: 200, json: async () => snapshot };
+  }, fetchImpl: async () => { throw new Error('unexpected_endpoint'); } });
+  clientContext = subject.context;
+  const { send } = prepareController(subject.context, subject.chrome);
+  subject.context.activeSyncAccount = async () => ({ userId });
+  const revision = (await subject.context.handlePopupRequest({ type: 'popup-runtime-info' })).payload.localWriteRevision;
+  let read = await send({ type: 'popup-watch-history', tabId: 71, expectedRevision: revision });
+  await send({ type: 'popup-watch-command', expectedRevision: revision,
+    capabilityId: read.payload.actions.find(a => a.command === 'start').capabilityId });
+  const original = (await subject.storage.local.get('watch-command-pending-v1'))['watch-command-pending-v1'];
+  userId = 19;
+  read = await send({ type: 'popup-watch-history', tabId: 71, expectedRevision: revision });
+  assert.equal(read.payload.pendingIntent, null, 'new login alone must not expose previous target/action');
+  assert.equal(typeof read.payload.settlementCapabilityId, 'string');
+  const before = calls.length;
+  assert.equal((await send({ type: 'popup-watch-settle', expectedRevision: revision, capabilityId: 'unknown' })).ok, false);
+  assert.equal(calls.length, before);
+  failOriginal = false;
+  const result = await send({ type: 'popup-watch-settle', expectedRevision: revision,
+    capabilityId: read.payload.settlementCapabilityId });
+  assert.equal(result.ok, true);
+  assert.equal(result.payload.outcome, 'not_applied');
+  assert.equal(result.payload.snapshot, undefined, 'result is not current-document publication');
+  assert.equal(result.payload.originalAnimeId, undefined, 'no unnecessary previous target exposure');
+  assert.equal((await subject.storage.local.get('watch-command-pending-v1'))['watch-command-pending-v1'], undefined);
+  const settle = JSON.parse(calls.find(c => c.body && JSON.parse(c.body).operation === 'settle').body);
+  delete settle.operation;
+  assert.deepEqual(settle, JSON.parse(JSON.stringify(original.request)));
+});
+
 test('cycle terminal observation requires its own scoped fresh catalog proof', async () => {
   const { context, chrome } = loadServiceWorker({ historyFetchImpl: async () => (
     { ok: true, status: 200, json: async () => controllerSnapshot(true) }

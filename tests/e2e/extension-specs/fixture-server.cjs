@@ -1,6 +1,7 @@
 const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
+const crypto = require('node:crypto');
 
 let sessionUser = null;
 const fixturePort = Number(process.env.ANIREKO_EXTENSION_FIXTURE_PORT || 4178);
@@ -21,22 +22,45 @@ let failProgressPosts = false;
 let holdTasteResponses = false;
 const pendingTasteResponses = [];
 let cycleHistoryEnabled = false;
+let cycleRepairEnabled = false;
+let cycleLoseNextAck = false;
+let cycleLoseSettlementAck = false;
+const cycleSettlementPosts = [];
 let cycleCurrent = null;
 let cycleVersion = 0;
 let cycleGeneration = 0;
 const cyclePosts = [];
 const cycleHistoryId = '22222222-2222-4222-8222-222222222222';
 const cycleId = '33333333-3333-4333-8333-333333333333';
-function cycleSnapshot(animeId) {
+function cycleSnapshot(animeId, page = null) {
   const state = { anime_id: animeId, version: cycleVersion, current: cycleCurrent,
     previously_completed: true, history_before_tracking_unknown: false,
     lifetime_completed_count: 1, tracked_completed_count: 1, completed_count_lower_bound: 1 };
-  return { user_id: sessionUser.id, requested_anime_id: animeId, effective_anime_id: animeId,
+  const snapshot = { user_id: sessionUser.id, requested_anime_id: animeId, effective_anime_id: animeId,
     history_adopted: cycleHistoryEnabled, readiness: 'ready',
     foreground: { anime_id: animeId, generation: cycleGeneration, cycle_id: cycleCurrent?.status === 'active' ? cycleId : null },
     ...(cycleHistoryEnabled ? { primary_history_id: cycleHistoryId, start_anime_id: animeId,
       start_state: state, previously_completed: true, reconciliation_token: 'a'.repeat(64),
       origins: cycleCurrent ? [{ history_id: cycleHistoryId, anime_id: animeId, state }] : [] } : {}) };
+  if (cycleRepairEnabled) {
+    const related = animeId + 1000;
+    const rows = [animeId, related].flatMap((group, index) => [1, 2].map(number => ({
+      effective_anime_id: group, anime_id: group + number - 1, history_id: cycleHistoryId,
+      cycle_id: `33333333-3333-4333-8333-${String(index * 2 + number).padStart(12, '0')}`,
+      competing: true, tracked_start_ordinal: number, episode: index * 4 + number,
+      kind: 'rewatching', catalog: { anime_id: group, title: index ? 'Связанный тайтл' : 'Текущий тайтл',
+        title_ru: null, title_en: null, season: null, season_year: null },
+    })));
+    const continuation = page?.after_choice != null;
+    const last = rows[1];
+    snapshot.readiness = 'reconciliation_required';
+    snapshot.component_choices = continuation ? rows.slice(2) : rows.slice(0, 2);
+    snapshot.page = { choices_has_more: !continuation, choices_next: continuation ? null : {
+      after_choice: { effective_anime_id: last.effective_anime_id, anime_id: last.anime_id,
+        history_id: last.history_id, cycle_id: last.cycle_id }, snapshot_token: snapshot.reconciliation_token,
+    } };
+  }
+  return snapshot;
 }
 
 function releaseTasteResponses() {
@@ -373,8 +397,11 @@ pages['/lazy-iframeCVH.html?episode=2'] = ['text/html; charset=utf-8', `<!doctyp
 const server = http.createServer((request, response) => {
   if (request.url.startsWith('/__test/cycle-history')) {
     cycleHistoryEnabled = true;
+    const settings = new URL(request.url, 'http://localhost').searchParams;
+    if (settings.get('repair') === '1') cycleRepairEnabled = true;
+    if (settings.get('lostAck') === '1') { cycleLoseNextAck = true; cycleLoseSettlementAck = true; }
     response.writeHead(200, { 'content-type': 'application/json' });
-    response.end(JSON.stringify({ posts: cyclePosts }));
+    response.end(JSON.stringify({ posts: cyclePosts, settlementPosts: cycleSettlementPosts }));
     return;
   }
   if (request.url.startsWith('/api/extension/history.php')) {
@@ -384,13 +411,50 @@ const server = http.createServer((request, response) => {
         response.writeHead(409, { 'content-type': 'application/json' }); response.end('{}'); return;
       }
       response.writeHead(200, { 'content-type': 'application/json' });
-      response.end(JSON.stringify(cycleSnapshot(Number(query.get('anime_id')))));
+      response.end(JSON.stringify(cycleSnapshot(Number(query.get('anime_id')), query.has('page') ? JSON.parse(query.get('page')) : null)));
       return;
     }
     let body = '';
     request.on('data', (chunk) => { body += chunk; });
     request.on('end', () => {
       const payload = JSON.parse(body);
+      if (payload.operation === 'settle') {
+        const original = cyclePosts[0];
+        const currentUser = Number(request.headers['x-anireko-watch-expected-user']);
+        // A transport fixture, not the PostgreSQL settlement implementation.
+        if (!original || !sessionUser || currentUser !== sessionUser.id
+          || JSON.stringify(payload) !== JSON.stringify({ ...original, operation: 'settle' })) {
+          response.writeHead(409); response.end('{}'); return;
+        }
+        cycleSettlementPosts.push({ payload, currentUser });
+        const canonical = { history_id: original.history_id, anime_id: original.anime_id,
+          expected_effective_anime_id: original.expected_effective_anime_id,
+          expected_foreground_generation: original.expected_foreground_generation,
+          command: { command: 'start', command_id: original.command_id, expected_version: original.expected_version } };
+        const requestHash = crypto.createHash('sha256').update(JSON.stringify(canonical)).digest('hex');
+        if (cycleLoseSettlementAck) {
+          cycleLoseSettlementAck = false; response.writeHead(500); response.end('{}'); return;
+        }
+        response.writeHead(200, { 'content-type': 'application/json' });
+        response.end(JSON.stringify({ settlement_version: 1, outcome: 'accepted', current_user_id: currentUser,
+          history_id: original.history_id, anime_id: original.anime_id, command_id: original.command_id,
+          original_operation: 'command', command_kind: 'start', request_hash: requestHash }));
+        return;
+      }
+      if (payload.operation === 'select' && cycleRepairEnabled) {
+        const valid = sessionUser && payload.expected_user_id === sessionUser.id
+          && payload.history_id === cycleHistoryId && payload.cycle_id === null
+          && payload.reconciliation_token === 'a'.repeat(64) && payload.choices?.length === 2
+          && payload.choices[0].cycle_id === '33333333-3333-4333-8333-000000000002'
+          && payload.choices[1].cycle_id === '33333333-3333-4333-8333-000000000003';
+        if (!valid) { response.writeHead(409); response.end('{}'); return; }
+        cyclePosts.push(payload); cycleRepairEnabled = false;
+        const snapshot = cycleSnapshot(payload.anime_id);
+        response.writeHead(200, { 'content-type': 'application/json' });
+        response.end(JSON.stringify({ history_id: cycleHistoryId, anime_id: payload.anime_id,
+          foreground: snapshot.foreground, snapshot }));
+        return;
+      }
       if (!sessionUser || payload.expected_user_id !== sessionUser.id || !cycleHistoryEnabled
         || payload.history_id !== cycleHistoryId || payload.expected_version !== cycleVersion
         || payload.expected_foreground_generation !== cycleGeneration) {
@@ -411,6 +475,9 @@ const server = http.createServer((request, response) => {
       }
       cycleVersion++;
       const snapshot = cycleSnapshot(payload.anime_id);
+      if (cycleLoseNextAck) {
+        cycleLoseNextAck = false; response.writeHead(500); response.end('{}'); return;
+      }
       response.writeHead(200, { 'content-type': 'application/json' });
       response.end(JSON.stringify({ history_id: cycleHistoryId, anime_id: payload.anime_id,
         foreground: snapshot.foreground, state: snapshot.start_state }));
@@ -699,7 +766,8 @@ const server = http.createServer((request, response) => {
     return;
   }
   if (request.url.startsWith('/__test/reset')) {
-    cycleHistoryEnabled = false; cycleCurrent = null; cycleVersion = 0; cycleGeneration = 0; cyclePosts.length = 0;
+    cycleHistoryEnabled = false; cycleRepairEnabled = false; cycleCurrent = null; cycleVersion = 0; cycleGeneration = 0; cyclePosts.length = 0;
+    cycleLoseNextAck = false; cycleLoseSettlementAck = false; cycleSettlementPosts.length = 0;
     releaseTasteResponses();
     sessionUser = null;
     watchStatus = null;

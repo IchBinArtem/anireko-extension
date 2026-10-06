@@ -16,6 +16,41 @@ function fixture() {
 }
 const start = { expected_user_id: 1, anime_id: 10, expected_effective_anime_id: 10,
   history_id: uuid, command_id: uuid, command: 'start', expected_version: 0, expected_foreground_generation: 0 };
+test('explicit settlement keeps original body and separates current owner header', async () => {
+  const { client, calls } = fixture();
+  await client.request('history-command', start);
+  await client.request('history-settle', { action:'history-command', request:start, current_user_id:2147483647 });
+  const original = JSON.parse(calls[0].init.body);
+  const settled = JSON.parse(calls[1].init.body);
+  assert.deepEqual(settled, { ...original, operation:'settle' });
+  assert.equal(settled.expected_user_id, 1);
+  assert.equal(calls[1].init.headers['X-Anireko-Watch-Expected-User'], '2147483647');
+  assert.equal(calls[1].init.headers['X-Anireko-Watch-History'], '1');
+  await client.request('history-command', start);
+  assert.equal(calls[2].init.body, calls[0].init.body);
+  assert.equal(calls[2].init.headers['X-Anireko-Watch-Expected-User'], undefined);
+  for (const delta of [{ current_user_id:'1' }, { current_user_id:0 }, { current_user_id:2147483648 },
+    { action:'history-initialize' }, { extra:true }, { request:{...start,operation:'settle'} }]) {
+    await assert.rejects(client.request('history-settle', { action:'history-command', request:start, current_user_id:1, ...delta }), /payload_invalid/);
+  }
+  assert.equal(calls.length, 3);
+});
+test('component choice cursor has exact four-field owned-root wire tuple', async () => {
+  const { client, calls } = fixture();
+  const page = { snapshot_token:'a'.repeat(64), after_choice: {
+    effective_anime_id:10, anime_id:12, history_id:uuid, cycle_id:uuid,
+  } };
+  await client.request('history-read', {anime_id:10,expected_user_id:1,page});
+  assert.deepEqual(JSON.parse(new URL(calls[0].url).searchParams.get('page')), page);
+  for (const delta of [{ effective_anime_id:'10' }, { effective_anime_id:0 },
+    { anime_id:2147483648 }, { history_id:'bad' }, { cycle_id:'bad' }, { internal_principal:1 }]) {
+    await assert.rejects(client.request('history-read', {anime_id:10,expected_user_id:1,
+      page:{...page,after_choice:{...page.after_choice,...delta}}}), /payload_invalid/);
+  }
+  await assert.rejects(client.request('history-read', {anime_id:10,expected_user_id:1,
+    page:{after_choice:page.after_choice}}), /payload_invalid/);
+  assert.equal(calls.length, 1);
+});
 test('fixed history route, immutable envelope and explicit marker', async () => {
   const { client, calls } = fixture();
   await client.request('history-command', start);

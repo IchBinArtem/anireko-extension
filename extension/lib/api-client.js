@@ -53,7 +53,7 @@
     return { operation: action === 'history-select' ? 'select' : 'command', ...input };
   }
   function historyPage(page) {
-    historyFields(page, [], ['limit', 'after_anime_id', 'after_history_id', 'snapshot_token', 'selected_cycle_id', 'after_evidence', 'after_legacy', 'after_cycle']);
+    historyFields(page, [], ['limit', 'after_anime_id', 'after_history_id', 'snapshot_token', 'selected_cycle_id', 'after_evidence', 'after_legacy', 'after_cycle', 'after_choice']);
     const has = (key) => Object.hasOwn(page, key);
     if ((has('limit') && !historyInt(page.limit, 100))
       || (has('snapshot_token') && (typeof page.snapshot_token !== 'string' || !TOKEN.test(page.snapshot_token)))
@@ -66,17 +66,19 @@
     for (const key of ['limit', 'after_anime_id', 'after_history_id', 'snapshot_token', 'selected_cycle_id']) {
       if (has(key)) result[key] = page[key];
     }
-    for (const key of ['after_cycle', 'after_evidence', 'after_legacy']) {
+    for (const key of ['after_cycle', 'after_evidence', 'after_legacy', 'after_choice']) {
       if (!has(key)) continue;
       if (!has('snapshot_token')) throw new Error('payload_invalid');
-      const fields = key === 'after_cycle' ? ['anime_id', 'history_id', 'cycle_id']
+      const fields = key === 'after_choice' ? ['effective_anime_id', 'anime_id', 'history_id', 'cycle_id']
+        : key === 'after_cycle' ? ['anime_id', 'history_id', 'cycle_id']
         : key === 'after_evidence' ? ['anime_id', 'history_id', 'evidence_kind'] : ['anime_id', 'evidence_kind'];
       const cursor = page[key];
       historyFields(cursor, fields);
       if (!historyInt(cursor.anime_id)
+        || (fields.includes('effective_anime_id') && !historyInt(cursor.effective_anime_id))
         || (fields.includes('history_id') && (typeof cursor.history_id !== 'string' || !UUID.test(cursor.history_id)))
-        || (key === 'after_cycle' && (typeof cursor.cycle_id !== 'string' || !UUID.test(cursor.cycle_id)))
-        || (key !== 'after_cycle' && !['watchlist', 'legacy_rating'].includes(cursor.evidence_kind))) throw new Error('payload_invalid');
+        || (fields.includes('cycle_id') && (typeof cursor.cycle_id !== 'string' || !UUID.test(cursor.cycle_id)))
+        || (fields.includes('evidence_kind') && !['watchlist', 'legacy_rating'].includes(cursor.evidence_kind))) throw new Error('payload_invalid');
       result[key] = Object.fromEntries(fields.map((field) => [field, cursor[field]]));
     }
     return result;
@@ -123,6 +125,24 @@
           if (new TextEncoder().encode(body).length > 65536) throw new Error('payload_invalid');
           path = '/api/extension/history.php';
           init = { ...init, method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Anireko-Watch-History': '1' }, body };
+          break;
+        }
+        case 'history-settle': {
+          historyFields(input, ['action', 'request', 'current_user_id']);
+          if (!['history-command', 'history-select'].includes(input.action)
+            || !historyInt(input.current_user_id)) throw new Error('payload_invalid');
+          // Keep the original owner, UUID, CAS and field order. Only the operation
+          // changes; the cookie-authorized current owner is a separate header.
+          const payload = historyPayload(input.action, input.request);
+          payload.operation = 'settle';
+          const body = JSON.stringify(payload);
+          if (new TextEncoder().encode(body).length > 65536) throw new Error('payload_invalid');
+          path = '/api/extension/history.php';
+          init = { ...init, method: 'POST', headers: {
+            'Content-Type': 'application/json',
+            'X-Anireko-Watch-History': '1',
+            'X-Anireko-Watch-Expected-User': String(input.current_user_id),
+          }, body };
           break;
         }
         case 'session-info':

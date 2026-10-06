@@ -656,10 +656,11 @@
           pauseSessionStateReload = false;
         }
       };
-      const addButton = (label, type, input) => {
+      const addButton = (label, type, input, explanation = '') => {
         const button = document.createElement('button');
         button.type = 'button';
         button.textContent = label;
+        if (explanation) button.title = explanation;
         button.addEventListener('click', () => run(type, input));
         watchActions.append(button);
       };
@@ -670,8 +671,63 @@
           watchFeedback.textContent += ` · ${t('watchOriginalTarget', String(original.animeId))} · ${t(`watchAction_${original.action}`)}`;
           addButton(t('watchRetryOriginal'), 'popup-watch-retry', { commandId: original.commandId });
         } else watchFeedback.textContent += ` · ${t('watchPendingOtherAccount')}`;
+        if (watchProjection.settlementCapabilityId) {
+          addButton(t('watchSettleOriginal'), 'popup-watch-settle',
+            { capabilityId: watchProjection.settlementCapabilityId }, t('watchSettlementHint'));
+        }
       } else {
+        if (watchProjection.repairComplete === false) watchFeedback.textContent = t('watchChoicesIncomplete');
         for (const action of watchProjection.actions || []) {
+          if (action.command === 'reconcile') {
+            const selected = new Map();
+            const groups = action.groups || [];
+            const hint = document.createElement('p');
+            hint.className = 'watch-choice-hint';
+            hint.textContent = t('watchChoicesHint');
+            watchActions.append(hint);
+            const apply = document.createElement('button');
+            apply.type = 'button';
+            apply.textContent = t('watchAction_reconcile');
+            apply.disabled = groups.length > 0;
+            groups.forEach((group, index) => {
+              const fieldset = document.createElement('fieldset');
+              fieldset.className = 'watch-choice-group';
+              const legend = document.createElement('legend');
+              legend.textContent = group.catalog?.title_ru || group.catalog?.title
+                || group.catalog?.title_en || t('watchOriginalTarget', String(group.effectiveAnimeId));
+              fieldset.append(legend);
+              for (const option of group.options) {
+                const label = document.createElement('label');
+                const radio = document.createElement('input');
+                radio.type = 'radio';
+                radio.name = `watch-choice-${index}`;
+                radio.value = option.cycleId;
+                radio.checked = false;
+                const detail = document.createElement('span');
+                detail.textContent = [t(option.kind === 'rewatching' ? 'watchRewatching' : 'statusWatching'),
+                  t('watchTrackedCycle', String(option.ordinal)),
+                  ...(option.episode == null ? [] : [t('episodeLabel', String(option.episode))]),
+                  t('watchOriginalTarget', String(option.animeId)),
+                  t('watchHistoryIdentity', String(option.historyId))].join(' · ');
+                radio.addEventListener('change', () => {
+                  if (!radio.checked) return;
+                  selected.set(index, option.cycleId);
+                  apply.disabled = selected.size !== groups.length;
+                });
+                label.append(radio);
+                label.append(detail);
+                fieldset.append(label);
+              }
+              watchActions.append(fieldset);
+            });
+            apply.addEventListener('click', () => {
+              if (apply.disabled || selected.size !== groups.length) return;
+              run('popup-watch-command', { capabilityId: action.capabilityId,
+                choiceCycleIds: groups.map((_, index) => selected.get(index)) });
+            });
+            watchActions.append(apply);
+            continue;
+          }
           const label = t(`watchAction_${action.command}`);
           const suffix = action.ordinal == null ? '' : ` · ${t('watchTrackedCycle', String(action.ordinal))}`;
           addButton(label + suffix, 'popup-watch-command', { capabilityId: action.capabilityId });

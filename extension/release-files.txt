@@ -15,3 +15,5 @@ lib/recognition.js
 lib/runtime-config.js
 lib/trust.js
 lib/watch-write-barrier.js
+lib/watch-command-journal.js
+lib/watch-request-hash.js

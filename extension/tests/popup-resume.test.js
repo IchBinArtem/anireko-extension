@@ -41,6 +41,67 @@ async function render({ match, records, playing = false, bulk = {}, syncAccountA
 
 const history = (animeId, position = 600) => ({ animeId, position, episode: 3, lastWatchedAt: 1 });
 
+test('actual repair renderer requires a human choice in every group and preserves text-only labels', async () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'popup.js'), 'utf8').replace(/\r\n/g, '\n');
+  const start = source.indexOf('  async function renderWatchCycle() {');
+  const end = source.indexOf('\n  await renderWatchCycle();\n', start);
+  assert.ok(start >= 0 && end > start);
+  const nodes = [];
+  const element = tag => {
+    const node = { tag, hidden: true, textContent: '', children: [], events: {},
+      replaceChildren(...children) { this.children = children; },
+      append(child) { this.children.push(child); },
+      addEventListener(type, callback) { this.events[type] = callback; },
+      querySelectorAll(selector) { return nodes.filter(item => item.tag === selector); } };
+    nodes.push(node); return node;
+  };
+  const elements = new Map(['watch-completion', 'watch-current', 'watch-actions', 'watch-feedback',
+    'watch-cycle-card', 'resume-label', 'resume'].map(id => [id, element('div')]));
+  const groups = [101, 202].map((id, index) => ({ effectiveAnimeId: id,
+    catalog: { title: index ? 'Related title' : '<img src=x onerror=alert(1)>' },
+    options: [1, 2].map(n => ({ cycleId: `cycle-${id}-${n}`, historyId: `history-${n}`,
+      animeId: id + n, ordinal: n, episode: n + 3, kind: 'rewatching' })) }));
+  const projection = { snapshot: { requested_anime_id: 101, previously_completed: true,
+    readiness: 'reconciliation_required', origins: [], foreground: { cycle_id: null } },
+    repairComplete: true, actions: [{ command: 'reconcile', capabilityId: 'opaque-choice', groups }] };
+  const mutations = [];
+  const context = vm.createContext({ matchConfirmed: true, syncAccountActive: true, tab: { id: 71 },
+    watchProjection: null, pauseSessionStateReload: false,
+    watchCard: elements.get('watch-cycle-card'), watchActions: elements.get('watch-actions'),
+    watchFeedback: elements.get('watch-feedback'),
+    set: (id, value) => { elements.get(id).textContent = value; },
+    t: (key, value) => value === undefined ? key : `${key}:${value}`,
+    requestBackground: async (type, input) => {
+      if (type === 'popup-watch-history') return { ok: true, payload: projection };
+      mutations.push({ type, input }); return { ok: true };
+    }, document: { createElement: element, getElementById: id => elements.get(id) } });
+  vm.runInContext(`${source.slice(start, end)}\n globalThis.run = renderWatchCycle;`, context);
+  await context.run();
+  const radios = nodes.filter(node => node.tag === 'input');
+  const apply = nodes.find(node => node.tag === 'button');
+  assert.equal(radios.length, 4);
+  assert.ok(radios.every(node => node.checked === false), 'no default winner');
+  assert.equal(apply.disabled, true);
+  apply.events.click();
+  assert.equal(mutations.length, 0, 'even a synthetic disabled click cannot submit');
+  assert.equal(nodes.find(node => node.tag === 'legend').textContent, '<img src=x onerror=alert(1)>');
+  radios[1].checked = true; radios[1].events.change();
+  assert.equal(apply.disabled, true, 'related group also requires selection');
+  radios[2].checked = true; radios[2].events.change();
+  assert.equal(apply.disabled, false);
+  apply.events.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(mutations.length, 1);
+  assert.equal(mutations[0].type, 'popup-watch-command');
+  assert.deepEqual(JSON.parse(JSON.stringify(mutations[0].input)),
+    { capabilityId: 'opaque-choice', choiceCycleIds: ['cycle-101-2', 'cycle-202-1'] });
+  assert.ok(elements.get('watch-completion').textContent.includes('watchPreviouslyCompleted'));
+  projection.actions = []; projection.repairComplete = false;
+  await context.run();
+  assert.equal(elements.get('watch-actions').children.length, 0);
+  assert.equal(elements.get('watch-feedback').textContent, 'watchChoicesIncomplete');
+});
+
 test('same popup clears previously visible legacy resume after adoption or unknown history', async () => {
   for (const transition of [{ snapshot: { history_adopted: true } }, { snapshot: {} }]) {
     const result = await render({ match: { status: 'ok', animeId: 1 }, records: { 'naruto::3': history(1) },
@@ -59,7 +120,7 @@ test('late legacy bulk response cannot restore resume after adoption', async () 
 });
 
 test('actual cycle renderer retains completion and labels unknown lifetime as tracked, not second watch', async () => {
-  const source = fs.readFileSync(path.join(__dirname, '..', 'popup.js'), 'utf8');
+  const source = fs.readFileSync(path.join(__dirname, '..', 'popup.js'), 'utf8').replace(/\r\n/g, '\n');
   const start = source.indexOf('  async function renderWatchCycle() {');
   const end = source.indexOf('\n  await renderWatchCycle();\n', start);
   assert.ok(start >= 0 && end > start);
@@ -130,6 +191,15 @@ test('actual cycle renderer retains completion and labels unknown lifetime as tr
   await context.run();
   assert.equal(elements.get('watch-actions').children.length, 0, 'foreign account intent offers no retry');
   assert.equal(elements.get('watch-feedback').textContent.includes('303'), false);
+  projection.settlementCapabilityId = 'opaque-check';
+  await context.run();
+  assert.equal(elements.get('watch-actions').children.length, 1, 'generic check does not disclose a foreign intent');
+  assert.equal(elements.get('watch-actions').children[0].textContent, 'watchSettleOriginal');
+  assert.equal(elements.get('watch-actions').children[0].title, 'watchSettlementHint');
+  assert.equal(elements.get('watch-feedback').textContent.includes('303'), false);
+  projection.pendingIntent = { animeId: 303, action: 'start', commandId: 'original-id' };
+  await context.run();
+  assert.equal(elements.get('watch-actions').children.length, 2, 'retry and outcome check are distinct explicit actions');
 });
 
 test('adopted or unknown account history never substitutes legacy resume into a cycle', async () => {

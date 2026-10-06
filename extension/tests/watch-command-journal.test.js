@@ -53,8 +53,8 @@ function fixture({ data = {}, fetchImpl, authorize = async () => true, setImpl }
     async set(items) { if (setImpl) await setImpl(items); Object.assign(data, copy(items)); },
     async remove(key) { delete data[key]; },
   };
-  const context = vm.createContext({ URL, URLSearchParams, TextEncoder, AbortSignal });
-  for (const name of ['api-client.js', 'watch-command-journal.js'])
+  const context = vm.createContext({ URL, URLSearchParams, TextEncoder, AbortSignal, crypto: require('node:crypto').webcrypto });
+  for (const name of ['api-client.js', 'watch-request-hash.js', 'watch-command-journal.js'])
     vm.runInContext(fs.readFileSync(path.join(__dirname, '../lib', name), 'utf8'), context);
   const client = context.AniRekoApiClient.create({ baseUrl: 'https://anireko.com', fetchImpl: async (url, init) => {
     calls.push({ url, init, persisted: copy(data) });
@@ -65,8 +65,206 @@ function fixture({ data = {}, fetchImpl, authorize = async () => true, setImpl }
     return { ok: true, status: 200, json: async () => payload };
   } });
   const factory = context.AniRekoWatchCommandJournal;
-  return { journal: factory.create({ storage, client, authorize }), key: factory.key, data, calls };
+  return { journal: factory.create({ storage, client, authorize }), key: factory.key, data, calls,
+    hash: context.AniRekoWatchRequestHash.hash };
 }
+
+async function settlementProof(subject, currentUser = 1, outcome = 'not_applied') {
+  return { settlement_version: 1, outcome, current_user_id: currentUser,
+    history_id: request.history_id, anime_id: request.anime_id, command_id: request.command_id,
+    original_operation: 'command', command_kind: request.command,
+    request_hash: await subject.hash('history-command', request) };
+}
+
+test('explicit settlement persists typed proof before fresh original-root GET, including transfer', async () => {
+  const data = {}; let proof;
+  const subject = fixture({ data, fetchImpl: async (_url, init) => ({ ok: true, status: 200,
+    json: async () => init.method === 'POST' ? proof : {
+      user_id: 2, requested_anime_id: 10, effective_anime_id: 10,
+      history_adopted: true, readiness: 'ready', foreground: ack.foreground,
+    } }) });
+  proof = await settlementProof(subject, 2);
+  await subject.journal.admit(subject.journal.capture('history-command', request, binding));
+  const original = JSON.stringify(data[subject.key].request);
+  assert.equal((await subject.journal.settle(2)).settled, true);
+  assert.equal(data[subject.key].version, 2);
+  assert.equal(data[subject.key].acknowledged, false);
+  assert.deepEqual(data[subject.key].terminalOutcome, proof);
+  assert.equal(JSON.stringify(data[subject.key].request), original);
+  assert.equal(subject.calls[0].init.headers['X-Anireko-Watch-Expected-User'], '2');
+  assert.equal(JSON.parse(subject.calls[0].init.body).expected_user_id, 1);
+  assert.equal(JSON.parse(subject.calls[0].init.body).operation, 'settle');
+  assert.equal((await subject.journal.refresh(2)).refreshed, true);
+  assert.deepEqual(subject.calls[1].persisted[subject.key].terminalOutcome, proof);
+  assert.equal(new URL(subject.calls[1].url).searchParams.get('anime_id'), '10');
+  assert.equal(data[subject.key], undefined);
+});
+
+test('unknown or incorrectly bound settlement proof never upgrades or releases v1', async () => {
+  for (const mutation of [p => ({ ...p, outcome: 'unknown' }), p => ({ ...p, request_hash: 'a'.repeat(64) }),
+    p => ({ ...p, current_user_id: 2 }), p => ({ ...p, anime_id: 20 }),
+    p => ({ ...p, history_id: freshCycle }), p => ({ ...p, command_id: freshCycle }),
+    p => ({ ...p, original_operation: 'select' }), p => ({ ...p, command_kind: 'pause' }),
+    p => ({ ...p, settlement_version: '1' }), p => ({ ...p, extra: true }), () => ({})]) {
+    let proof;
+    const subject = fixture({ fetchImpl: async () => ({ ok: true, status: 200, json: async () => proof }) });
+    proof = mutation(await settlementProof(subject));
+    await subject.journal.admit(subject.journal.capture('history-command', request, binding));
+    const original = JSON.stringify(subject.data[subject.key]);
+    assert.equal((await subject.journal.settle(1)).settled, false);
+    assert.equal(JSON.stringify(subject.data[subject.key]), original);
+    await assert.rejects(subject.journal.refresh(1), /journal_unresolved/);
+    assert.equal(subject.calls.length, 1);
+  }
+});
+
+test('proof persistence failure and lost settlement ACK leave exact original pending', async () => {
+  for (const lost of [false, true]) {
+    let proof; let writes = 0;
+    const subject = fixture({ setImpl: async () => { if (++writes > 1) throw new Error('quota'); },
+      fetchImpl: async () => { if (lost) throw new Error('lost settlement ACK');
+        return { ok: true, status: 200, json: async () => proof }; } });
+    proof = await settlementProof(subject);
+    await subject.journal.admit(subject.journal.capture('history-command', request, binding));
+    const original = JSON.stringify(subject.data[subject.key]);
+    await assert.rejects(subject.journal.settle(1), lost ? /lost settlement ACK/ : /quota/);
+    assert.equal(JSON.stringify(subject.data[subject.key]), original);
+    await assert.rejects(subject.journal.refresh(1), /journal_unresolved/);
+  }
+});
+
+test('terminal proof survives restart without automatic send and never replays original', async () => {
+  const data = {}; let proof;
+  const subject = fixture({ data, fetchImpl: async () => ({ ok: true, status: 200, json: async () => proof }) });
+  proof = await settlementProof(subject);
+  await subject.journal.admit(subject.journal.capture('history-command', request, binding));
+  await subject.journal.settle(1);
+  const restarted = fixture({ data });
+  assert.equal(restarted.calls.length, 0);
+  await restarted.journal.deliver(1);
+  assert.equal(restarted.calls.length, 0, 'durable terminal outcome must prevent original execution');
+  assert.equal((await restarted.journal.refresh(1)).refreshed, true);
+  assert.equal(restarted.calls.length, 1);
+  assert.equal(data[restarted.key], undefined);
+});
+
+test('proof owner cannot be silently rebound by another login; explicit settlement required', async () => {
+  const data = {}; let proof;
+  const subject = fixture({ data, fetchImpl: async () => ({ ok: true, status: 200, json: async () => proof }) });
+  proof = await settlementProof(subject, 2, 'accepted');
+  await subject.journal.admit(subject.journal.capture('history-command', request, binding));
+  await subject.journal.settle(2);
+  const restarted = fixture({ data });
+  await assert.rejects(restarted.journal.refresh(3), /journal_account_changed/);
+  assert.equal(restarted.calls.length, 0);
+  assert.equal(data[subject.key].terminalOutcome.current_user_id, 2);
+  assert.equal(data[subject.key].request.expected_user_id, 1);
+});
+
+test('second transfer requires fresh proof without changing original request or prior outcome', async () => {
+  const data = {}; let currentUser = 2; let proof;
+  const subject = fixture({ data, fetchImpl: async (_url, init) => ({ ok: true, status: 200,
+    json: async () => init.method === 'POST' ? proof : {
+      user_id: currentUser, requested_anime_id: 10, effective_anime_id: 10,
+      history_adopted: true, readiness: 'ready', foreground: ack.foreground,
+    } }) });
+  proof = await settlementProof(subject, currentUser, 'accepted');
+  await subject.journal.admit(subject.journal.capture('history-command', request, binding));
+  await subject.journal.settle(currentUser);
+  const immutable = JSON.stringify(data[subject.key].request);
+  currentUser = 3; proof = await settlementProof(subject, currentUser, 'accepted');
+  assert.equal((await subject.journal.settle(currentUser)).settled, true);
+  assert.equal(subject.calls.length, 2, 'new owner requires explicit server authorization again');
+  assert.equal(data[subject.key].terminalOutcome.current_user_id, 3);
+  assert.equal(JSON.stringify(data[subject.key].request), immutable);
+  assert.equal((await subject.journal.refresh(currentUser)).refreshed, true);
+});
+
+test('selection proof binds the entire ordered choice intent and preserves original selection', async () => {
+  let proof;
+  const subject = fixture({ fetchImpl: async () => ({ ok: true, status: 200, json: async () => proof }) });
+  const selection = { expected_user_id: 1, anime_id: 10, expected_effective_anime_id: 10,
+    history_id: uuid, command_id: uuid, cycle_id: null, reconciliation_token: 'b'.repeat(64),
+    choices: [{ history_id: uuid, anime_id: 20, cycle_id: freshCycle }] };
+  const intent = subject.journal.capture('history-select', selection, binding);
+  proof = { settlement_version: 1, outcome: 'not_applied', current_user_id: 2,
+    history_id: uuid, anime_id: 10, command_id: uuid, original_operation: 'select', command_kind: 'select',
+    request_hash: await subject.hash('history-select', selection) };
+  await subject.journal.admit(intent);
+  assert.equal((await subject.journal.settle(2)).settled, true);
+  assert.deepEqual(subject.data[subject.key].request, selection);
+  const wire = JSON.parse(subject.calls[0].init.body); delete wire.operation;
+  assert.deepEqual(wire, selection);
+});
+
+test('malformed persisted v2 proof fails closed even when a different current owner asks to settle', async () => {
+  let proof;
+  const subject = fixture({ fetchImpl: async () => ({ ok: true, status: 200, json: async () => proof }) });
+  proof = await settlementProof(subject, 2);
+  await subject.journal.admit(subject.journal.capture('history-command', request, binding));
+  await subject.journal.settle(2);
+  subject.data[subject.key].terminalOutcome.request_hash = 'a'.repeat(64);
+  const before = subject.calls.length;
+  await assert.rejects(subject.journal.settle(3), /journal_invalid/);
+  assert.equal(subject.calls.length, before, 'corrupt terminal journal is not repaired or sent');
+});
+
+test('HTTP errors with apparently valid proof and failed fresh read retain pending', async () => {
+  for (const status of [401, 409, 429, 500]) {
+    let proof;
+    const subject = fixture({ fetchImpl: async () => ({ ok: false, status, json: async () => proof }) });
+    proof = await settlementProof(subject);
+    await subject.journal.admit(subject.journal.capture('history-command', request, binding));
+    assert.equal((await subject.journal.settle(1)).settled, false);
+    assert.equal(subject.data[subject.key].version, 1);
+  }
+  let proof; let allowGet = false;
+  const subject = fixture({ fetchImpl: async (_url, init) => ({ ok: init.method === 'POST' || allowGet,
+    status: init.method === 'POST' || allowGet ? 200 : 409, json: async () => init.method === 'POST' ? proof : {} }) });
+  proof = await settlementProof(subject);
+  await subject.journal.admit(subject.journal.capture('history-command', request, binding));
+  await subject.journal.settle(1);
+  assert.equal((await subject.journal.refresh(1)).refreshed, false);
+  assert.equal(subject.data[subject.key].version, 2);
+  allowGet = true;
+  assert.equal((await subject.journal.refresh(1)).refreshed, false, 'malformed 200 read also stays pending');
+  assert.deepEqual(subject.data[subject.key].terminalOutcome, proof);
+});
+
+test('late settlement proof after epoch change cannot persist or publish', async () => {
+  const entered = deferred(); const gate = deferred(); let proof;
+  const subject = fixture({ fetchImpl: async () => { entered.resolve(); await gate.promise;
+    return { ok: true, status: 200, json: async () => proof }; } });
+  proof = await settlementProof(subject);
+  await subject.journal.admit(subject.journal.capture('history-command', request, binding));
+  const settling = subject.journal.settle(1); await entered.promise;
+  subject.journal.invalidate(); gate.resolve();
+  await assert.rejects(settling, /journal_binding_changed/);
+  assert.equal(subject.data[subject.key].version, 1);
+});
+
+test('predecessor journal cannot downgrade or hide settled pending behind a new key', async () => {
+  const data = {}; let proof;
+  const subject = fixture({ data, fetchImpl: async () => ({ ok: true, status: 200, json: async () => proof }) });
+  proof = await settlementProof(subject);
+  await subject.journal.admit(subject.journal.capture('history-command', request, binding));
+  await subject.journal.settle(1);
+  const context = vm.createContext({ TextEncoder });
+  vm.runInContext(fs.readFileSync(path.join(__dirname, '../lib/api-client.js'), 'utf8'), context);
+  // Actual frozen v1 producer at 6a8effe; inline fixture avoids a mutable Local
+  // dependency or requiring private server source in public tests.
+  const predecessor = "(function initWatchCommandJournal(global) {\r\n  const KEY = 'watch-command-pending-v1';\r\n  const MAX_BYTES = 70000;\r\n  const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;\r\n  const id = (value) => Number.isSafeInteger(value) && value > 0 && value <= 2147483647;\r\n  const version = (value) => Number.isSafeInteger(value) && value >= 0;\r\n  function foreground(value) {\r\n    return value && id(value.anime_id) && version(value.generation)\r\n      && (value.cycle_id === null || (typeof value.cycle_id === 'string' && UUID.test(value.cycle_id)));\r\n  }\r\n  const clone = (value) => JSON.parse(JSON.stringify(value));\r\n  function freeze(value) {\r\n    if (value && typeof value === 'object') {\r\n      Object.values(value).forEach(freeze);\r\n      Object.freeze(value);\r\n    }\r\n    return value;\r\n  }\r\n  function exact(value, fields) {\r\n    if (!value || typeof value !== 'object' || Array.isArray(value)\r\n      || Object.keys(value).length !== fields.length\r\n      || fields.some((key) => !Object.hasOwn(value, key))) throw new Error('journal_invalid');\r\n  }\r\n  function capture(action, request, binding) {\r\n    exact(binding, ['document_id', 'navigation_token', 'revision']);\r\n    for (const key of ['document_id', 'navigation_token']) {\r\n      if (typeof binding[key] !== 'string' || !binding[key] || binding[key].length > 256)\r\n        throw new Error('journal_invalid');\r\n    }\r\n    if (!Number.isSafeInteger(binding.revision) || binding.revision < 0) throw new Error('journal_invalid');\r\n    const record = { version: 1, action,\r\n      request: global.AniRekoApiClient.historyIntent(action, request), binding: clone(binding), acknowledged: false };\r\n    if (new TextEncoder().encode(JSON.stringify(record)).length > MAX_BYTES) throw new Error('journal_full');\r\n    return freeze(record);\r\n  }\r\n  function storedRecord(value) {\r\n    exact(value, ['version', 'action', 'request', 'binding', 'acknowledged']);\r\n    if (value.version !== 1 || typeof value.acknowledged !== 'boolean') throw new Error('journal_invalid');\r\n    const normalized = capture(value.action, value.request, value.binding);\r\n    // Reject malformed persisted bytes; never repair or evict an unresolved intent.\r\n    if (JSON.stringify(normalized.request) !== JSON.stringify(value.request)) throw new Error('journal_invalid');\r\n    return { ...clone(normalized), acknowledged: value.acknowledged };\r\n  }\r\n  function create({ storage, client, authorize }) {\r\n    let queue = Promise.resolve();\r\n    let epoch = 0;\r\n    let closed = false;\r\n    const captures = new WeakMap();\r\n    function serial(fn) {\r\n      const next = queue.catch(() => {}).then(fn);\r\n      queue = next;\r\n      return next;\r\n    }\r\n    function current(expectedEpoch) {\r\n      if (closed || epoch !== expectedEpoch) throw new Error('journal_binding_changed');\r\n    }\r\n    async function read() {\r\n      const data = await storage.get(KEY);\r\n      return Object.hasOwn(data, KEY) ? storedRecord(data[KEY]) : null;\r\n    }\r\n    async function account(record, userId, expectedEpoch) {\r\n      current(expectedEpoch);\r\n      if (userId !== record.request.expected_user_id || await authorize(userId) !== true)\r\n        throw new Error('journal_account_changed');\r\n      current(expectedEpoch);\r\n    }\r\n    return Object.freeze({\r\n      // Capture is synchronous. Caller must capture the event BEFORE any async gate.\r\n      capture(action, request, binding) {\r\n        const intent = capture(action, request, binding);\r\n        captures.set(intent, epoch);\r\n        return intent;\r\n      },\r\n      pending() { return serial(async () => { const value = await read(); return value && freeze(clone(value)); }); },\r\n      admit(intent) {\r\n        const captured = storedRecord(intent);\r\n        if (captured.acknowledged) throw new Error('journal_invalid');\r\n        const admittedEpoch = captures.get(intent);\r\n        current(admittedEpoch);\r\n        return serial(async () => {\r\n          current(admittedEpoch);\r\n          const existing = await read();\r\n          current(admittedEpoch);\r\n          if (existing) throw new Error('journal_full');\r\n          await storage.set({ [KEY]: captured });\r\n          current(admittedEpoch);\r\n          return freeze(clone(captured));\r\n        });\r\n      },\r\n      // Explicit retry only; UUID/body/CAS never change. No startup replay/timer.\r\n      deliver(userId) {\r\n        const admittedEpoch = epoch;\r\n        return serial(async () => {\r\n          current(admittedEpoch);\r\n          const record = await read();\r\n          if (!record) throw new Error('journal_empty');\r\n          await account(record, userId, admittedEpoch);\r\n          if (record.acknowledged) return { acknowledged: true };\r\n          const response = await client.request(record.action, clone(record.request));\r\n          current(admittedEpoch);\r\n          const payload = response?.payload;\r\n          const resultIds = record.request.command === 'start'\r\n            ? [record.request.anime_id, record.request.expected_effective_anime_id] : [record.request.anime_id];\r\n          if (response?.ok !== true || response.status !== 200\r\n            || payload?.history_id !== record.request.history_id\r\n            || !id(payload.anime_id) || !foreground(payload.foreground)\r\n            || payload.foreground.anime_id !== record.request.expected_effective_anime_id\r\n            || (record.action === 'history-command'\r\n              ? !resultIds.includes(payload.anime_id) || payload.state?.anime_id !== payload.anime_id || !version(payload.state.version)\r\n              : payload.snapshot?.user_id !== userId || !foreground(payload.snapshot.foreground))) {\r\n            return { acknowledged: false, response };\r\n          }\r\n          await storage.set({ [KEY]: { ...record, acknowledged: true } });\r\n          current(admittedEpoch);\r\n          // The historical receipt is deliberately NOT published as current state.\r\n          return { acknowledged: true };\r\n        });\r\n      },\r\n      refresh(userId) {\r\n        const admittedEpoch = epoch;\r\n        return serial(async () => {\r\n          current(admittedEpoch);\r\n          const record = await read();\r\n          if (!record?.acknowledged) throw new Error('journal_unresolved');\r\n          await account(record, userId, admittedEpoch);\r\n          const response = await client.request('history-read', {\r\n            anime_id: record.request.anime_id, expected_user_id: userId,\r\n          });\r\n          current(admittedEpoch);\r\n          const value = response?.payload;\r\n          if (response?.ok !== true || response.status !== 200 || value?.user_id !== userId\r\n            || value.requested_anime_id !== record.request.anime_id\r\n            || typeof value.history_adopted !== 'boolean'\r\n            || !id(value.effective_anime_id) || !foreground(value.foreground)\r\n            || !['ready', 'reconciliation_required'].includes(value.readiness)) {\r\n            return { refreshed: false, response };\r\n          }\r\n          await storage.remove(KEY);\r\n          current(admittedEpoch);\r\n          // Caller still verifies foreground/document/revision before event admission.\r\n          return { refreshed: true, snapshot: value };\r\n        });\r\n      },\r\n      invalidate() { epoch++; },\r\n      closeAndClear() {\r\n        closed = true;\r\n        epoch++;\r\n        // Drain previously started storage writes before deletion. Server COMMIT\r\n        // may already have happened; clearing local data does not claim cancellation.\r\n        return serial(() => storage.remove(KEY));\r\n      },\r\n    });\r\n  }\r\n  global.AniRekoWatchCommandJournal = Object.freeze({ create, capture, key: KEY });\r\n})(typeof globalThis !== 'undefined' ? globalThis : self);\r\n";
+  vm.runInContext(predecessor, context);
+  let sends = 0;
+  const old = context.AniRekoWatchCommandJournal;
+  assert.equal(old.key, subject.key);
+  const journal = old.create({ storage: { get: async key => ({ [key]: copy(data[key]) }) },
+    client: { request: async () => { sends++; } }, authorize: async () => true });
+  await assert.rejects(journal.pending(), /journal_invalid/);
+  await assert.rejects(journal.deliver(1), /journal_invalid/);
+  assert.equal(sends, 0);
+  assert.equal(data[subject.key].version, 2);
+});
 test('persist before actual client fetch; fresh GET, never receipt, closes pending', async () => {
   const { journal, key, data, calls } = fixture();
   await journal.admit(journal.capture('history-command', request, binding));

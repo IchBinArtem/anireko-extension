@@ -327,7 +327,7 @@ test('search cache invalidates pre-completion metadata and retries partial match
 test('public API contract and client action allowlist stay aligned', () => {
   const contract = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'api-contract.json'), 'utf8'));
   const client = fs.readFileSync(path.join(__dirname, '..', 'lib', 'api-client.js'), 'utf8');
-  assert.equal(contract.version, 4);
+  assert.equal(contract.version, 5);
   assert.deepEqual(contract.rate_limit, {
     status: 429,
     retry_after_header: 'Retry-After',
@@ -335,8 +335,10 @@ test('public API contract and client action allowlist stay aligned', () => {
   for (const action of Object.keys(contract.actions)) {
     assert.equal(client.includes(`case '${action}'`), true, `missing client action ${action}`);
   }
+  const clientActions = [...client.matchAll(/case '([^']+)'/g)].map((match) => match[1]);
+  assert.deepEqual([...new Set(clientActions)].sort(), Object.keys(contract.actions).sort());
   assert.deepEqual(Object.keys(contract.actions).sort(), [
-    'diagnostic', 'history-command', 'history-initialize', 'history-read', 'history-select',
+    'diagnostic', 'history-command', 'history-initialize', 'history-read', 'history-select', 'history-settle',
     'progress-all', 'progress-write', 'search', 'session-info',
     'status-get', 'status-write', 'taste-match',
   ]);
@@ -376,6 +378,9 @@ test('public export contains every source and fixture used by release verificati
     'extension/tests/watch-history-client.test.js',
     'extension/tests/watch-command-journal.test.js',
     'extension/lib/watch-command-journal.js',
+    'extension/lib/watch-request-hash.js',
+    'extension/tests/watch-request-hash.test.js',
+    'extension/tests/watch-request-hash-vectors.json',
     'extension/lib/watch-write-barrier.js',
     'extension/tests/watch-write-barrier.test.js',
     'extension/lib/activity.js',
@@ -392,7 +397,7 @@ test('public export contains every source and fixture used by release verificati
     assert.equal(fs.existsSync(path.join(repo, relative)), true, `public source misses ${relative}`);
   }
 
-  assert.equal(listed.size, 58, 'public export allowlist changed without an explicit review');
+  assert.equal(listed.size, 61, 'public export allowlist changed without an explicit review');
   const exactSupportFiles = new Set([
     '.github/dependabot.yml',
     '.github/workflows/extension-release.yml',

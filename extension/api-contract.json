@@ -1,11 +1,12 @@
 {
-  "version": 4,
+  "version": 5,
   "base": "https://anireko.com",
   "rate_limit": {
     "status": 429,
     "retry_after_header": "Retry-After"
   },
   "actions": {
+    "history-settle": { "method": "POST", "path": "/api/extension/history.php", "credentials": true, "header": { "X-Anireko-Watch-History": "1", "X-Anireko-Watch-Expected-User": "<current_user_id>" }, "body": ["operation", "expected_user_id", "history_id", "anime_id", "expected_effective_anime_id", "command_id", "expected_foreground_generation", "expected_version", "command", "cycle_id", "episode", "position_sec", "duration_sec", "voice", "reconciliation_token", "choices"], "body_variants": ["immutable history-command body with operation=settle", "immutable history-select body with operation=settle"], "client_input": ["action", "request", "current_user_id"] },
     "history-read": { "method": "GET", "path": "/api/extension/history.php", "credentials": true, "query": ["anime_id", "expected_user_id", "page"] },
     "history-initialize": { "method": "POST", "path": "/api/extension/history.php", "credentials": true, "header": { "X-Anireko-Watch-History": "1" }, "body": ["operation", "expected_user_id"] },
     "history-command": { "method": "POST", "path": "/api/extension/history.php", "credentials": true, "header": { "X-Anireko-Watch-History": "1" }, "body": ["operation", "expected_user_id", "history_id", "anime_id", "expected_effective_anime_id", "expected_foreground_generation", "expected_version", "command_id", "command", "cycle_id", "episode", "position_sec", "duration_sec", "voice"] },

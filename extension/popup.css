@@ -292,3 +292,8 @@ h1 { margin: 0; font-size: 17px; line-height: 1.15; letter-spacing: -.02em; }
 #watch-actions button { padding: 6px 9px; border: 1px solid #475569; border-radius: 7px; background: #1e293b; color: #e2e8f0; cursor: pointer; }
 #watch-actions button:disabled { opacity: .5; cursor: default; }
 #watch-actions button:focus-visible { outline: 2px solid #8bd5b2; outline-offset: 2px; }
+.watch-choice-hint { width: 100%; margin: 3px 0; color: var(--muted); font-size: 11px; line-height: 1.45; }
+.watch-choice-group { width: 100%; min-width: 0; margin: 0; padding: 8px; border: 1px solid var(--line); border-radius: 8px; }
+.watch-choice-group legend { max-width: 100%; overflow-wrap: anywhere; font-size: 12px; }
+.watch-choice-group label { display: flex; gap: 7px; margin: 7px 0; font-size: 11px; line-height: 1.45; overflow-wrap: anywhere; cursor: pointer; }
+.watch-choice-group input { flex-shrink: 0; accent-color: #8bd5b2; }

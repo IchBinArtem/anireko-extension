@@ -4,6 +4,7 @@ importScripts(
   'lib/trust.js',
   'lib/auto-mark.js',
   'lib/watch-write-barrier.js',
+  'lib/watch-request-hash.js',
   'lib/watch-command-journal.js'
 );
 
@@ -28,6 +29,7 @@ const watchCycleJournals = new Set();
 const watchPreparedSnapshots = new WeakMap();
 let watchControllerGeneration = 0;
 let watchMutation = null;
+let watchSettlementCapability = null;
 let localWriteBarrier = AniRekoWatchWriteBarrier.create();
 let localWriteRevision = crypto.randomUUID();
 let localControlInFlight = null;
@@ -1187,6 +1189,7 @@ function blockLegacyWatchWrites(event, writeBinding, userId) {
 function invalidateWatchController() {
   watchControllerGeneration++;
   watchCycleCapabilities.clear();
+  watchSettlementCapability = null;
   for (const journal of watchCycleJournals) journal.invalidate();
 }
 
@@ -1243,7 +1246,7 @@ function freezeWatchValue(value) {
   return value;
 }
 
-function publishWatchCapabilities(event, binding, userId, snapshot) {
+function publishWatchCapabilities(event, binding, userId, snapshot, repair = null) {
   // Only the newest rendered snapshot for this source remains actionable.
   for (const [id, capability] of watchCycleCapabilities) {
     if (capability.event.liveState === event.liveState) watchCycleCapabilities.delete(id);
@@ -1293,9 +1296,80 @@ function publishWatchCapabilities(event, binding, userId, snapshot) {
       }
     }
   }
+  if (repair?.complete === true && snapshot.readiness === 'reconciliation_required') {
+    const id = crypto.randomUUID();
+    const request = freezeWatchValue({ expected_user_id: userId, history_id: snapshot.primary_history_id,
+      anime_id: snapshot.requested_anime_id, expected_effective_anime_id: snapshot.effective_anime_id,
+      cycle_id: null, reconciliation_token: snapshot.reconciliation_token });
+    // Validate root grammar before offering an action. No winner is chosen here.
+    AniRekoApiClient.historyIntent('history-select', { ...request, command_id: crypto.randomUUID(), choices: [] });
+    const capability = Object.freeze({ id, command: 'reconcile', request, repair: freezeWatchValue(repair), userId,
+      generation: watchControllerGeneration, event, binding });
+    watchCycleCapabilities.set(id, capability);
+    actions.push({ capabilityId: id, command: 'reconcile', groups: repair.groups });
+  }
   // Bounded volatile capabilities; eviction never deletes a durable pending command.
   while (watchCycleCapabilities.size > 512) watchCycleCapabilities.delete(watchCycleCapabilities.keys().next().value);
-  return { snapshot, actions };
+  return { snapshot, actions, repairComplete: repair?.complete ?? null };
+}
+
+async function loadWatchRepairChoices(event, binding, userId, snapshot) {
+  const uuid = value => typeof value === 'string'
+    && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value);
+  const positive = value => Number.isSafeInteger(value) && value > 0 && value <= 2147483647;
+  const tuple = row => [row.effective_anime_id, row.anime_id, row.history_id, row.cycle_id];
+  const compare = (a, b) => {
+    for (let index = 0; index < 4; index++) {
+      if (a[index] !== b[index]) return a[index] < b[index] ? -1 : 1;
+    }
+    return 0;
+  };
+  const groups = new Map(); const seen = new Set(); let previous = null; let page = snapshot;
+  const generation = watchControllerGeneration;
+  for (;;) {
+    if (!Array.isArray(page.component_choices) || page.component_choices.length > 100
+      || typeof page.page?.choices_has_more !== 'boolean') throw new Error('history_choices_unavailable');
+    for (const row of page.component_choices) {
+      if (!positive(row?.effective_anime_id) || !positive(row.anime_id) || !uuid(row.history_id) || !uuid(row.cycle_id)
+        || typeof row.competing !== 'boolean' || !Number.isSafeInteger(row.tracked_start_ordinal) || row.tracked_start_ordinal < 1
+        || (row.episode !== null && (!Number.isSafeInteger(row.episode) || row.episode < 1 || row.episode > 5000))
+        || !['watching', 'rewatching'].includes(row.kind) || row.catalog?.anime_id !== row.effective_anime_id
+        || !['title', 'title_ru', 'title_en'].every(key => row.catalog[key] === null || typeof row.catalog[key] === 'string')) {
+        throw new Error('history_choices_unavailable');
+      }
+      const key = tuple(row);
+      if ((previous && compare(previous, key) >= 0) || seen.has(row.cycle_id)) throw new Error('history_page_restart_required');
+      previous = key; seen.add(row.cycle_id);
+      // Bounded volatile UI collection. Incomplete coverage never yields a POST.
+      if (seen.size > 500) return { complete: false, groups: [] };
+      if (!groups.has(row.effective_anime_id)) groups.set(row.effective_anime_id,
+        { effectiveAnimeId: row.effective_anime_id, catalog: row.catalog, options: [], competing: row.competing });
+      const group = groups.get(row.effective_anime_id);
+      if (group.competing !== row.competing) throw new Error('history_page_restart_required');
+      group.options.push({ cycleId: row.cycle_id, historyId: row.history_id, animeId: row.anime_id,
+        ordinal: row.tracked_start_ordinal, episode: row.episode, kind: row.kind });
+    }
+    if (!page.page.choices_has_more) {
+      if (page.page.choices_next !== null) throw new Error('history_choices_unavailable');
+      break;
+    }
+    const next = page.page.choices_next;
+    if (!previous || next?.snapshot_token !== snapshot.reconciliation_token
+      || !next.after_choice || Object.keys(next.after_choice).length !== 4
+      || compare(previous, tuple(next.after_choice)) !== 0) throw new Error('history_page_restart_required');
+    if (!await verifyWatchDocument(event, binding) || generation !== watchControllerGeneration) throw new Error('current_document_required');
+    const response = await apiClient.request('history-read', { anime_id: snapshot.requested_anime_id,
+      expected_user_id: userId, page: next });
+    page = response?.payload;
+    if (response?.ok !== true || response.status !== 200 || !validWatchHistorySnapshot(page, userId, snapshot.requested_anime_id)
+      || page.reconciliation_token !== snapshot.reconciliation_token || page.readiness !== snapshot.readiness
+      || page.primary_history_id !== snapshot.primary_history_id || page.foreground.generation !== snapshot.foreground.generation
+      || generation !== watchControllerGeneration) throw new Error('history_page_restart_required');
+  }
+  for (const group of groups.values()) {
+    if (group.competing !== (group.options.length > 1)) throw new Error('history_choices_unavailable');
+  }
+  return { complete: true, groups: [...groups.values()].filter(group => group.competing) };
 }
 
 async function loadWatchController(event, binding, userId, suppliedSnapshot = null) {
@@ -1319,13 +1393,16 @@ async function loadWatchController(event, binding, userId, suppliedSnapshot = nu
     snapshot = selected;
   }
   if (!await verifyWatchDocument(event, binding)) throw new Error('current_document_required');
-  const projection = publishWatchCapabilities(event, binding, userId, snapshot);
+  const repair = snapshot.readiness === 'reconciliation_required'
+    ? await loadWatchRepairChoices(event, binding, userId, snapshot) : null;
+  if (!await verifyWatchDocument(event, binding)) throw new Error('current_document_required');
+  const projection = publishWatchCapabilities(event, binding, userId, snapshot, repair);
   watchPreparedSnapshots.set(event.liveState, { snapshot, projection, userId,
     generation: watchControllerGeneration, revision: binding.revision });
   return projection;
 }
 
-async function executeWatchCapability(id, binding) {
+async function executeWatchCapability(id, binding, choiceCycleIds) {
   const capability = watchCycleCapabilities.get(id);
   if (watchMutation || !capability || capability.generation !== watchControllerGeneration
     || capability.binding.revision !== binding.revision || !watchDocumentCurrent(capability.event, binding)) {
@@ -1337,10 +1414,21 @@ async function executeWatchCapability(id, binding) {
   const journal = createWatchJournal(binding, capability.event);
   // Capture body, UUID and CAS synchronously, before any storage/session await.
   try {
-    const intent = capability.command === 'initialize' ? null : journal.capture('history-command', {
-      ...capability.request, command_id: crypto.randomUUID(),
-    }, { document_id: capability.event.topDocumentId, navigation_token: capability.event.navigationToken,
-      revision: capability.generation });
+    let choices = null;
+    if (capability.command === 'reconcile') {
+      if (!Array.isArray(choiceCycleIds) || choiceCycleIds.length !== capability.repair.groups.length
+        || new Set(choiceCycleIds).size !== choiceCycleIds.length) throw new Error('history_choice_required');
+      choices = capability.repair.groups.map(group => {
+        const selected = group.options.filter(option => choiceCycleIds.includes(option.cycleId));
+        if (selected.length !== 1) throw new Error('history_choice_required');
+        return { history_id: selected[0].historyId, anime_id: selected[0].animeId, cycle_id: selected[0].cycleId };
+      });
+    } else if (choiceCycleIds !== undefined) throw new Error('history_choice_required');
+    const intent = capability.command === 'initialize' ? null : journal.capture(
+      capability.command === 'reconcile' ? 'history-select' : 'history-command', {
+        ...capability.request, command_id: crypto.randomUUID(), ...(choices === null ? {} : { choices }),
+      }, { document_id: capability.event.topDocumentId, navigation_token: capability.event.navigationToken,
+        revision: capability.generation });
     if (await journal.pending()) throw new Error('journal_full');
     const account = await activeSyncAccount(binding);
     if (account?.userId !== capability.userId || !await verifyWatchDocument(capability.event, binding)) {
@@ -1379,11 +1467,41 @@ async function retryWatchCommand(binding, expectedCommandId) {
     const account = await activeSyncAccount(binding);
     if (account?.userId !== pending.request.expected_user_id) throw new Error('journal_account_changed');
     const delivered = await journal.deliver(account.userId);
-    if (!delivered.acknowledged) return { ok: false, status: 409, payload: { pending: true } };
+    if (!delivered.acknowledged && !delivered.settled) return { ok: false, status: 409, payload: { pending: true } };
     const refreshed = await journal.refresh(account.userId);
     // This receipt is never a current-document projection. UI must explicitly reread.
     return { ok: refreshed.refreshed, status: refreshed.refreshed ? 200 : 409,
       payload: { acknowledged: true, pending: !refreshed.refreshed, originalAnimeId: pending.request.anime_id } };
+  } finally {
+    watchCycleJournals.delete(journal);
+    if (watchMutation === reservation) watchMutation = null;
+  }
+}
+
+async function settleWatchCommand(binding, capabilityId) {
+  const capability = watchSettlementCapability;
+  if (watchMutation || !capability || capability.id !== capabilityId
+    || capability.generation !== watchControllerGeneration || capability.revision !== binding.revision) {
+    throw new Error('history_capability_changed');
+  }
+  const reservation = Object.freeze({});
+  watchMutation = reservation;
+  watchSettlementCapability = null;
+  const journal = createWatchJournal(binding);
+  try {
+    const pending = await journal.pending();
+    if (!pending || pending.request.command_id !== capability.commandId) throw new Error('journal_intent_changed');
+    const account = await activeSyncAccount(binding);
+    if (account?.userId !== capability.userId || capability.generation !== watchControllerGeneration) {
+      throw new Error('journal_account_changed');
+    }
+    const settled = await journal.settle(account.userId);
+    if (!settled.settled) return { ok: false, status: 409, payload: { pending: true } };
+    const refreshed = await journal.refresh(account.userId);
+    // This proves only the saved original command. Never publish it as the
+    // currently open document's state or disclose another login's old target.
+    return { ok: refreshed.refreshed, status: refreshed.refreshed ? 200 : 409,
+      payload: { settled: true, outcome: settled.outcome, pending: !refreshed.refreshed } };
   } finally {
     watchCycleJournals.delete(journal);
     if (watchMutation === reservation) watchMutation = null;
@@ -2621,10 +2739,17 @@ async function handlePopupRequest(message, writeBinding = captureLocalWrite()) {
       const storedPending = await chrome.storage.local.get(AniRekoWatchCommandJournal.key);
       if (!watchDocumentCurrent(event, writeBinding)) throw new Error('current_document_required');
       let pendingIntent = null;
+      let settlementCapabilityId = null;
       if (Object.hasOwn(storedPending, AniRekoWatchCommandJournal.key)) {
         const journal = createWatchJournal(writeBinding);
         try {
           const pending = await journal.pending();
+          if (pending) {
+            const capability = Object.freeze({ id: crypto.randomUUID(), commandId: pending.request.command_id,
+              userId: syncAccount.userId, generation: watchControllerGeneration, revision: writeBinding.revision });
+            watchSettlementCapability = capability;
+            settlementCapabilityId = capability.id;
+          }
           if (pending?.request.expected_user_id === syncAccount.userId) {
             pendingIntent = { animeId: pending.request.anime_id,
               action: pending.request.command || 'reconcile', commandId: pending.request.command_id };
@@ -2633,16 +2758,21 @@ async function handlePopupRequest(message, writeBinding = captureLocalWrite()) {
       }
       if (!watchDocumentCurrent(event, writeBinding)) throw new Error('current_document_required');
       return { ok: true, status: 200, payload: { ...projection,
-        pending: Object.hasOwn(storedPending, AniRekoWatchCommandJournal.key), pendingIntent } };
+        pending: Object.hasOwn(storedPending, AniRekoWatchCommandJournal.key), pendingIntent, settlementCapabilityId } };
     }
     case 'popup-watch-command':
       if (message.expectedRevision !== localWriteRevision || typeof message.capabilityId !== 'string') {
         throw new Error('history_capability_changed');
       }
-      return executeWatchCapability(message.capabilityId, writeBinding);
+      return executeWatchCapability(message.capabilityId, writeBinding, message.choiceCycleIds);
     case 'popup-watch-retry':
       if (message.expectedRevision !== localWriteRevision) throw new Error('write_binding_changed');
       return retryWatchCommand(writeBinding, message.commandId);
+    case 'popup-watch-settle':
+      if (message.expectedRevision !== localWriteRevision || typeof message.capabilityId !== 'string') {
+        throw new Error('write_binding_changed');
+      }
+      return settleWatchCommand(writeBinding, message.capabilityId);
     case 'popup-progress-all': {
       const expectedUserId = Number(message.expectedUserId);
       const syncAccount = await activeSyncAccount(writeBinding);

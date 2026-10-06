@@ -13,21 +13,31 @@ All production requests are built by `lib/api-client.js` from the immutable `htt
 | Recognition-miss report | Hostname and compact structural probe | Explicit click on “Здесь есть аниме” |
 
 Full third-party URLs, paths, queries, iframe URLs, page titles/content, and video content are never sent to AniReko. Search and diagnostic requests omit credentials; account-scoped actions use the AniReko cookie.
-The local watch-history client candidate adds fixed `history-read`, `history-initialize`,
-`history-command` and `history-select` actions. No service-worker/UI producer is wired yet;
-this does not claim that the public server route is available. Reads carry strict integer
+The local watch-history candidate wires the service worker and popup to fixed
+`history-read`, `history-initialize`, `history-command`, `history-select` and
+`history-settle` actions; local source wiring does not prove installed/Store/public
+server availability. Reads carry strict integer
 anime/account IDs; writes additionally carry immutable command/history/cycle identities
 and exact state expectations. POST uses JSON and `X-Anireko-Watch-History: 1`, not a
 client-supplied credential. Inputs reject unknown fields/coercion; POST bodies are bounded
 at 64 KiB without truncating selection choices. GET cannot initialize a history.
 Automatic and manual diagnostics contain no anime ID or title; the backend also discards those legacy fields from older clients.
-The unwired `watch-command-journal` foundation stores at most one unresolved immutable
+The `watch-command-journal` stores at most one unresolved immutable
 history command globally (70,000 UTF-8 bytes maximum), without source URLs or cookies.
 Admission uses the actual wire validator synchronously; persistence precedes delivery.
 Retry is explicit, preserves UUID/body/CAS, and never starts on extension startup.
 An acknowledged historical receipt does not release the slot until a fresh authorized
-history read succeeds. Account/navigation invalidation fences callbacks; close drains
-started journal storage operations before removing its own key. This foundation does
-not yet fence other legacy writers, provide a popup, or prove actual Chrome restart.
+history read succeeds. Explicit settlement sends the original immutable intent with
+`operation=settle`; a separate `X-Anireko-Watch-Expected-User` header binds the current
+authenticated account, without rewriting the original owner expectation. Only an exact
+typed outcome/hash proof is persisted before the fresh original-root GET can release
+pending. Another login alone receives no old title/intent descriptor; transferred
+ownership is checked server-side. Unknown/corrupt receipts remain unresolved. Settlement
+and Retry never start automatically on restart or login change.
+Account/navigation invalidation fences callbacks; the service worker fences legacy
+status/progress writers while the history namespace owns the mutation. Complete related
+cycle choices require explicit selection without defaults; incomplete pagination cannot
+authorize POST. Local Chromium reload/lost-ACK fixtures are evidence only for their
+loopback environment, not installed or real browser-to-backend acceptance.
 When automatic catalog matching is not unique, the selected catalog ID and metadata are stored locally against the normalized recognized title. The binding contains no source URL or hostname and is revalidated through catalog search before it can authorize sync.
 An explicit season with an empty initial result may use one base-title search, followed by one catalog-alias search. Automatic selection requires a unique exact alias for the requested season that is also present among the base-title candidates; the first season is never selected merely because its base title matches.
