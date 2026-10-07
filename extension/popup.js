@@ -163,6 +163,7 @@
   // already-enabled extension would silently change the write target.
   const autoMarkToggle = document.getElementById('auto-mark');
   autoMarkToggle.checked = false;
+  document.getElementById('resume-sync').disabled = true;
   let syncAccountActive = false;
   let currentUserId = null;
 
@@ -388,13 +389,6 @@
   reportSection.hidden = true;
   for (const id of animeDetailIds) document.getElementById(id).hidden = false;
   document.getElementById('account-warning').hidden = true;
-  if (consentAccepted) {
-    await renderAccount();
-  } else {
-    document.getElementById('account-label').textContent = t('syncOffUntilConsent');
-    autoMarkToggle.disabled = true;
-    document.getElementById('resume-sync').disabled = true;
-  }
   renderStats(stored['watch-history']);
   const playerFound = Boolean(player);
   // Episode is optional — movies and unmarked players are still fully tracked.
@@ -552,9 +546,36 @@
   });
   // Compatibility is supporting context here; the anime page is the popup's
   // single primary destination, so we deliberately avoid a competing link.
+  // Publish validated local fields before any account/history network wait.
+  const episode = player?.episode ?? recognition?.episode;
+  set('episode', episode != null ? t('episodeLabel', String(episode)) : t('episodeUnknown'));
+  set('voice', state.voice || recognition?.voice);
+  set('player', player?.player);
+  const playerCount = players.length || (player?.player === 'iframe-shell' ? 1 : null);
+  set('player-count', playerCount);
+  document.getElementById('player-count-label').textContent = playerCount
+    ? ` ${t(`playerCount${pluralCategory(playerCount)}`)}`
+    : '';
+  const rate = Number.isFinite(player?.playbackRate) ? player.playbackRate : 1;
+  const rateSuffix = rate !== 1 ? ` ×${rate}` : '';
+  set('status', player?.watched ? t('statusWatched')
+    : player?.playing ? `${t('statusWatching')}${rateSuffix}`
+      : player?.playbackStarted ? `${t('statusPaused')}${rateSuffix}` : playerFound ? t('statusWaiting') : null);
+  document.getElementById('status').className = `status-chip${player?.watched ? ' ok' : ''}`;
+  set('progress', player?.progress == null ? null : `${(player.progress * 100).toFixed(1)}%`);
+  const hint = document.getElementById('hint');
+  if (playerReady) hint.hidden = true;
+  else set('hint', matchConfirmed
+    ? t('animeFoundPlayVideo')
+    : t('catalogMatchNotConfirmed'));
+
+  await renderAccount();
   const taste = state.taste;
+  const tasteAccountCurrent = Number.isInteger(currentUserId) && currentUserId > 0
+    && taste?.userKey === `user:${currentUserId}`
+    && Number(taste.animeId) === Number(match?.animeId);
   const tasteElement = document.getElementById('taste-match');
-  if (taste?.status === 'ok' && Number.isFinite(taste.percent)) {
+  if (tasteAccountCurrent && taste.status === 'ok' && Number.isFinite(taste.percent)) {
     const verdicts = {
       very_likely: t('verdictVeryLikely'),
       likely: t('verdictLikely'),
@@ -573,7 +594,7 @@
     tasteElement.replaceChildren(percent, ` · ${verdicts[taste.labelKey] || verdicts.mixed}`);
   } else {
     set('taste-match', taste?.status === 'guest' ? t('loginForMatch')
-      : taste?.status === 'no-data' ? t('notEnoughTasteData')
+      : tasteAccountCurrent && taste.status === 'no-data' ? t('notEnoughTasteData')
         : null);
   }
   // «Где остановился» (KAN-2725): открыл это аниме на любом сайте → сразу видно
@@ -859,6 +880,7 @@
     if (!syncAccountActive) syncButton.disabled = true;
     const lastAt = (await chrome.storage.local.get('resume-sync-at'))['resume-sync-at'] || 0;
     const remaining = SYNC_COOLDOWN_MS - (Date.now() - lastAt);
+    syncButton.disabled = !syncAccountActive || remaining > 0;
     if (remaining > 0) {
       syncButton.disabled = true;
       syncButton.title = t('syncRecently', String(Math.ceil(remaining / 1000)));
@@ -956,25 +978,4 @@
       }, SYNC_COOLDOWN_MS);
     });
   })();
-  const episode = player?.episode ?? recognition?.episode;
-  set('episode', episode != null ? t('episodeLabel', String(episode)) : t('episodeUnknown'));
-  set('voice', state.voice || recognition?.voice);
-  set('player', player?.player);
-  const playerCount = players.length || (player?.player === 'iframe-shell' ? 1 : null);
-  set('player-count', playerCount);
-  document.getElementById('player-count-label').textContent = playerCount
-    ? ` ${t(`playerCount${pluralCategory(playerCount)}`)}`
-    : '';
-  const rate = Number.isFinite(player?.playbackRate) ? player.playbackRate : 1;
-  const rateSuffix = rate !== 1 ? ` ×${rate}` : '';
-  set('status', player?.watched ? t('statusWatched')
-    : player?.playing ? `${t('statusWatching')}${rateSuffix}`
-      : player?.playbackStarted ? `${t('statusPaused')}${rateSuffix}` : playerFound ? t('statusWaiting') : null);
-  document.getElementById('status').className = `status-chip${player?.watched ? ' ok' : ''}`;
-  set('progress', player?.progress == null ? null : `${(player.progress * 100).toFixed(1)}%`);
-  const hint = document.getElementById('hint');
-  if (playerReady) hint.hidden = true;
-  else set('hint', matchConfirmed
-    ? t('animeFoundPlayVideo')
-    : t('catalogMatchNotConfirmed'));
 })();

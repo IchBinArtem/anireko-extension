@@ -21,6 +21,27 @@ let resetGeneration = 0;
 let failProgressPosts = false;
 let holdTasteResponses = false;
 const pendingTasteResponses = [];
+const popupReadGates = Object.fromEntries(['session', 'history'].map(kind =>
+  [kind, { held: false, status: 200, pending: [] }]));
+function finishPopupRead(kind, response, finish) {
+  const gate = popupReadGates[kind];
+  if (gate.held) {
+    gate.pending.push(() => finishPopupRead(kind, response, finish));
+    return;
+  }
+  if (response.destroyed) return;
+  if (gate.status !== 200) {
+    response.writeHead(gate.status, { 'content-type': 'application/json' });
+    response.end('{}');
+    return;
+  }
+  finish();
+}
+function releasePopupReads(kind) {
+  const gate = popupReadGates[kind];
+  gate.held = false;
+  for (const finish of gate.pending.splice(0)) finish();
+}
 let cycleHistoryEnabled = false;
 let cycleMovie = false;
 let cycleCompleted = 1;
@@ -429,11 +450,13 @@ const server = http.createServer((request, response) => {
   if (request.url.startsWith('/api/extension/history.php')) {
     const query = new URL(request.url, 'http://localhost').searchParams;
     if (request.method === 'GET') {
+      finishPopupRead('history', response, () => {
       if (!sessionUser || Number(query.get('expected_user_id')) !== sessionUser.id) {
         response.writeHead(409, { 'content-type': 'application/json' }); response.end('{}'); return;
       }
       response.writeHead(200, { 'content-type': 'application/json' });
       response.end(JSON.stringify(cycleSnapshot(Number(query.get('anime_id')), query.has('page') ? JSON.parse(query.get('page')) : null)));
+      });
       return;
     }
     let body = '';
@@ -644,6 +667,7 @@ const server = http.createServer((request, response) => {
   }
   if (request.url.startsWith('/api/auth/session-info.php')) {
     sessionInfoRequests += 1;
+    finishPopupRead('session', response, () => {
     response.writeHead(200, {
       'content-type': 'application/json; charset=utf-8',
       'cache-control': 'no-store',
@@ -651,6 +675,7 @@ const server = http.createServer((request, response) => {
     response.end(JSON.stringify(sessionUser
       ? { success: true, user: { ...sessionUser, avatar: '', provider: 'test', nsfw_show: false } }
       : { success: false, error: 'No session' }));
+    });
     return;
   }
   if (/^\/api\/anime\/\d+\/match/u.test(request.url)) {
@@ -776,6 +801,18 @@ const server = http.createServer((request, response) => {
     return;
   }
   // Test-only control endpoints for the e2e spec.
+  if (request.url.startsWith('/__test/popup-read-gate')) {
+    const query = new URL(request.url, 'http://localhost').searchParams;
+    const kind = query.get('kind');
+    const gate = popupReadGates[kind];
+    if (!gate) { response.writeHead(400); response.end('{}'); return; }
+    if (query.has('status')) gate.status = Number(query.get('status'));
+    if (query.get('hold') === '1') gate.held = true;
+    if (query.get('hold') === '0') releasePopupReads(kind);
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ held: gate.held, pending: gate.pending.length, status: gate.status }));
+    return;
+  }
   if (request.url.startsWith('/__test/session')) {
     const query = new URL(request.url, 'http://localhost').searchParams;
     const on = query.get('on') === '1';
@@ -800,6 +837,11 @@ const server = http.createServer((request, response) => {
     return;
   }
   if (request.url.startsWith('/__test/reset')) {
+    for (const kind of Object.keys(popupReadGates)) {
+      popupReadGates[kind].status = 503;
+      releasePopupReads(kind);
+      popupReadGates[kind].status = 200;
+    }
     cycleHistoryEnabled = false; cycleMovie = false; cycleCompleted = 1;
     cycleRepairEnabled = false; cycleCurrent = null; cycleVersion = 0; cycleGeneration = 0; cyclePosts.length = 0;
     cycleLoseNextAck = false; cycleLoseSettlementAck = false; cycleSettlementPosts.length = 0;

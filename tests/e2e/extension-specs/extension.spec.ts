@@ -210,6 +210,138 @@ test.beforeEach(async () => {
   });
 });
 
+async function popupReadGate(kind: 'session' | 'history', query = '') {
+  return worker.evaluate(async ({ kind, query }) => {
+    const response = await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase
+      + '/__test/popup-read-gate?kind=' + kind + query);
+    return response.json();
+  }, { kind, query });
+}
+
+async function localPopupPage() {
+  await worker.evaluate(async () => {
+    const base = (globalThis as any).AniRekoRuntimeConfig.apiBase;
+    await fetch(base + '/__test/session?on=1&user=18');
+    await fetch(base + '/__test/cycle-history');
+  });
+  const page = await context.newPage();
+  await page.goto(`${siteBase}/anime.html`);
+  const tabId = await extensionTabId(`${siteBase}/*`);
+  await expect.poll(async () => (await storedTabState(tabId))?.match?.status).toBe('ok');
+  await waitForDetectorReady(tabId);
+  await setSyntheticPlayback(page.frameLocator('#main-player'), '#main-video', { currentTime: 1, paused: false });
+  await setSyntheticPlayback(page.frameLocator('#main-player'), '#main-video', { currentTime: 1, paused: true });
+  await expect.poll(async () => (await storedTabState(tabId))?.player?.playing).toBe(false);
+  await worker.evaluate(async () => {
+    await chrome.storage.local.set({ 'auto-mark': true, 'sync-account': { id: 18, name: 'TestUser' } });
+    const now = new Date();
+    const key = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+    await (globalThis as any).AniRekoTestHooks.seedLocalHistory({ records: {}, days: {
+      [key]: { watchedSeconds: 600, episodeKeys: ['local::2'] },
+    } });
+  });
+  return { page, tabId };
+}
+
+for (const kind of ['session', 'history'] as const) {
+  for (const warm of [false, true]) {
+    test(`popup local fields precede held ${kind} HTTP response (${warm ? 'warm' : 'cold'})`, async ({}, testInfo) => {
+      const { page, tabId } = await localPopupPage();
+      let popup: Page | null = null;
+      try {
+        if (warm) {
+          const first = await openPopup(tabId);
+          await expect(first.locator('#watch-completion')).toContainText('Уже просмотрено');
+          await first.close();
+        }
+        const postsBefore = await worker.evaluate(async () => (await (await fetch(
+          (globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/cycle-history')).json()).posts);
+        await popupReadGate(kind, '&hold=1');
+        popup = await context.newPage();
+        await popup.addInitScript(() => {
+          const observer = new MutationObserver(() => {
+            const title = document.getElementById('anime-check-detail')?.textContent;
+            const progress = document.getElementById('progress')?.textContent;
+            if (title && progress && progress.includes('%') && (window as any).__localFirstMs == null) {
+              (window as any).__localFirstMs = performance.now();
+              observer.disconnect();
+            }
+          });
+          observer.observe(document, { subtree: true, childList: true, characterData: true });
+        });
+        await popup.goto(`chrome-extension://${extensionId}/popup.html?tabId=${tabId}`);
+        await expect.poll(async () => (await popupReadGate(kind)).pending).toBeGreaterThan(0);
+        await expect(popup.locator('#anime-check-detail')).toContainText('Расхититель гробниц', { timeout: 1500 });
+        await expect(popup.locator('#progress')).toHaveText(/\d+\.\d%/, { timeout: 1500 });
+        await expect(popup.locator('#episode')).toContainText('2');
+        await expect(popup.locator('#player')).not.toHaveText('—');
+        await expect(popup.locator('#status')).not.toHaveText('—');
+        await expect(popup.locator('#week-chart .activity-cell')).toHaveCount(84);
+        await expect(popup.locator('#today-time')).toHaveText('10 мин');
+        await expect(popup.locator('#resume')).toBeHidden();
+        await expect(popup.locator('#resume-sync')).toBeDisabled();
+        if (kind === 'session') {
+          await expect(popup.locator('#auto-mark')).toBeDisabled();
+          await expect(popup.locator('#taste-match')).toHaveText('—');
+          await expect(popup.locator('#watch-cycle-card')).toBeHidden();
+        }
+        const held = await popupReadGate(kind);
+        expect(held.held).toBe(true);
+        expect(held.pending).toBeGreaterThan(0);
+        const localFirstMs = await popup.evaluate(() => (window as any).__localFirstMs);
+        expect(Number.isFinite(localFirstMs)).toBe(true);
+        await testInfo.attach('local-before-network', { body: JSON.stringify({ kind, warm, localFirstMs, held }),
+          contentType: 'application/json' });
+        console.log('popup local-before-network ' + JSON.stringify({ kind, warm, localFirstMs }));
+        await popupReadGate(kind, '&hold=0');
+        await expect(popup.locator('#watch-completion')).toContainText('Уже просмотрено');
+        await expect(popup.locator('#resume-sync')).toBeEnabled();
+        await expect(popup.locator('#resume')).toBeHidden();
+        const postsAfter = await worker.evaluate(async () => (await (await fetch(
+          (globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/cycle-history')).json()).posts);
+        expect(postsAfter).toEqual(postsBefore, 'popup opening only reads, including warm cache');
+      } finally {
+        await popupReadGate(kind, '&hold=0&status=200');
+        await popup?.close();
+        await page.close();
+      }
+    });
+  }
+}
+
+test('popup keeps local UI on failed session and rejects old taste after an account switch during the read', async () => {
+  const { page, tabId } = await localPopupPage();
+  let popup: Page | null = null;
+  try {
+    await popupReadGate('session', '&hold=1');
+    popup = await openPopup(tabId);
+    await expect.poll(async () => (await popupReadGate('session')).pending).toBeGreaterThan(0);
+    await expect(popup.locator('#progress')).toHaveText(/\d+\.\d%/, { timeout: 1500 });
+    await worker.evaluate(async () => {
+      await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/session?on=1&user=953');
+    });
+    await popupReadGate('session', '&hold=0');
+    await expect(popup.locator('#account-label')).toContainText('Demo YooKassa');
+    await expect(popup.locator('#account-warning')).toBeVisible();
+    await expect(popup.locator('#resume-sync')).toBeDisabled();
+    await expect(popup.locator('#taste-match')).not.toContainText('87%');
+    await popup.close();
+    await popupReadGate('session', '&hold=1&status=503');
+    popup = await openPopup(tabId);
+    await expect.poll(async () => (await popupReadGate('session')).pending).toBeGreaterThan(0);
+    await expect(popup.locator('#progress')).toHaveText(/\d+\.\d%/, { timeout: 1500 });
+    await popupReadGate('session', '&hold=0');
+    await expect(popup.locator('#account-login')).toBeVisible();
+    await expect(popup.locator('#auto-mark')).toBeDisabled();
+    await expect(popup.locator('#resume-sync')).toBeDisabled();
+    await expect(popup.locator('#taste-match')).not.toContainText('%');
+  } finally {
+    await popupReadGate('session', '&hold=0&status=200');
+    await popup?.close();
+    await page.close();
+  }
+});
+
 test('paused playback preserves previous completion and exposes optional manual controls', async ({}, testInfo) => {
   await worker.evaluate(async () => {
     await chrome.storage.local.set({ 'auto-mark': true, 'sync-account': { id: 18, name: 'TestUser' } });

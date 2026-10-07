@@ -2,6 +2,12 @@
 
 All production requests are built by `lib/api-client.js` from the immutable `https://anireko.com` base and an action allowlist. Content scripts and the popup have no direct `fetch` egress. User-writable storage cannot redirect the API.
 
+Popup renders the validated current document's local title/player/progress and
+browser activity before waiting for account/history reads. Account checks remain
+fresh; personalized taste requires the matching freshly checked user/anime tuple.
+Account/history/resume phases remain ordered, with no new request, POST or retry on
+popup open. Unknown/adopted history still suppresses legacy resume.
+
 | Action | Data sent | Condition |
 |---|---|---|
 | Catalog match | Cleaned current anime title, up to four adjacent alternative titles, or a manual catalog-search query | After first-run disclosure, when Chrome allows AniReko on a page that looks like anime; manual search requires an explicit popup action |
