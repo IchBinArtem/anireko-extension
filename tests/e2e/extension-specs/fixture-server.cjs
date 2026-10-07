@@ -73,6 +73,23 @@ function releaseTasteResponses() {
 }
 
 const pages = {
+  '/title-alternatives-decoy.html': ['text/html; charset=utf-8', `<!doctype html><html lang="ru"><head>
+    <meta charset="utf-8"><meta name="description" content="Смотреть аниме онлайн">
+    <title>Водное поло на грани фола</title></head><body>
+    <main><h1>Водное поло на грани фола</h1></main>
+    <aside class="recommendations"><div class="titles"><h1>Водное поло на грани фола</h1>
+    <ul class="alt-names-list"><li>Hantsu x Trash</li></ul></div></aside>
+    <iframe src="http://localhost:${fixturePort}/player.html" width="640" height="360"></iframe>
+    </body></html>`],
+  '/title-alternatives.html': ['text/html; charset=utf-8', `<!doctype html><html lang="ru"><head>
+    <meta charset="utf-8"><meta name="description" content="Смотреть аниме онлайн">
+    <meta property="og:title" content="Водное поло на грани фола — смотреть аниме онлайн">
+    <title>Водное поло на грани фола</title></head><body>
+    <div class="content-page"><div class="titles"><h1>Водное поло на грани фола</h1>
+    <ul class="alt-names-list"></ul></div></div>
+    <aside><h1>Рекомендации</h1><ul class="alt-names-list"><li>Other recommendation</li></ul></aside>
+    <iframe src="http://localhost:${fixturePort}/player.html" width="640" height="360"></iframe>
+    </body></html>`],
   '/health': ['text/plain', 'ok'],
   '/anime.html': ['text/html; charset=utf-8', `<!doctype html>
     <html lang="ru"><head>
@@ -510,7 +527,10 @@ const server = http.createServer((request, response) => {
       release_status: 'ONGOING',
       exact_alias_match: true,
     };
-    const data = cycleMovie && /расхититель гробниц/iu.test(query)
+    const data = ['Hantsu x Torasshu', 'Hantsu x Trash', 'ハンツー×トラッシュ'].includes(query)
+      ? [{ id: 11758, title: 'Охотник и корзина', subtitle: 'Hantsu x Trash', slug: 'hantsu-x-trash',
+        type: 'OVA', episodes: 3, release_status: 'FINISHED', exact_alias_match: true }]
+      : cycleMovie && /расхититель гробниц/iu.test(query)
       ? [{ id: 4242, title: 'Расхититель гробниц', type: 'MOVIE', episodes: 1,
         release_status: 'FINISHED', exact_alias_match: true }]
       : /Honzuki no Gekokujou:.*4th Season$/iu.test(query)

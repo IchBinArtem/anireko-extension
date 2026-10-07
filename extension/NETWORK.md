@@ -4,7 +4,7 @@ All production requests are built by `lib/api-client.js` from the immutable `htt
 
 | Action | Data sent | Condition |
 |---|---|---|
-| Catalog match | Cleaned anime title or a manual catalog-search query | After first-run disclosure, when Chrome allows AniReko on a page that looks like anime; manual search requires an explicit popup action |
+| Catalog match | Cleaned current anime title, up to four adjacent alternative titles, or a manual catalog-search query | After first-run disclosure, when Chrome allows AniReko on a page that looks like anime; manual search requires an explicit popup action |
 | Taste match | AniReko anime ID | Signed-in user on a recognized title |
 | Account check | AniReko session cookie | Popup on a recognized anime page / account-bound sync and progress-read checks |
 | Status sync | Anime ID, status, expected bound user ID | Explicit account sync + trusted top origin |
@@ -12,7 +12,15 @@ All production requests are built by `lib/api-client.js` from the immutable `htt
 | Unsupported-player diagnostic | Hostname and compact structural probe | Separate diagnostics opt-in |
 | Recognition-miss report | Hostname and compact structural probe | Explicit click on “Здесь есть аниме” |
 
-Full third-party URLs, paths, queries, iframe URLs, page titles/content, and video content are never sent to AniReko. Search and diagnostic requests omit credentials; account-scoped actions use the AniReko cookie.
+Full third-party URLs, paths, queries, iframe URLs, full page text and video content are never sent to AniReko. Catalog search sends only the bounded current-title strings above. Search and diagnostic requests omit credentials; account-scoped actions use the AniReko cookie.
+Alternative titles come only from the plain direct LI text of the list immediately
+adjacent to a unique current H1 in its title block. Linked/nested items, comments
+and recommendations are excluded. Only an unresolved primary title triggers this
+bounded fallback; manual bindings and exact primary matches need no alias requests.
+All planned responses must complete and exact evidence must converge to one catalog
+ID, preserving the original numeric/season restrictions. The query tuple is cached
+and deduplicated, including Unicode; unchanged rescans/media ticks do not search.
+Late insertion, removal or ambiguous title blocks replace the same-document tuple.
 The local watch-history candidate wires the service worker and popup to fixed
 `history-read`, `history-initialize`, `history-command`, `history-select` and
 `history-settle` actions; local source wiring does not prove installed/Store/public
@@ -82,3 +90,4 @@ authorize POST. Local Chromium reload/lost-ACK fixtures are evidence only for th
 loopback environment, not installed or real browser-to-backend acceptance.
 When automatic catalog matching is not unique, the selected catalog ID and metadata are stored locally against the normalized recognized title. The binding contains no source URL or hostname and is revalidated through catalog search before it can authorize sync.
 An explicit season with an empty initial result may use one base-title search, followed by one catalog-alias search. Automatic selection requires a unique exact alias for the requested season that is also present among the base-title candidates; the first season is never selected merely because its base title matches.
+Recognition arrivals are fenced before asynchronous consent reads by the native top-document ID, detector token and exact page URL. A fresh page-observed receipt permits navigation even when its consent read finishes later; an old native document cannot revoke the new mapping. Popup/session recovery and publication cannot admit a tuple already superseded by a live recognition receipt. Same-native-document SPA changes remain supported. These receipts are volatile/local and are cleared with their tab; no new endpoint, timer or upload is introduced.

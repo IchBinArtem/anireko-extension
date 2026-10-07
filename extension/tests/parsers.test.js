@@ -14,6 +14,13 @@ function load(relativePath, exportedName) {
 const recognition = load('lib/recognition.js', 'AniRekoRecognition');
 const progress = load('lib/progress.js', 'AniRekoProgress');
 
+test('alternatives are bounded, Unicode preserving, deduplicated and contain no URL or markup', () => {
+  assert.deepEqual(Array.from(recognition.normalizeAlternativeTitles([
+    ' Primary ', 'Hantsu x Trash', 'HANTSU X TRASH', '…', '<b>Other</b>',
+    'https://example.test', 'ハンツー×トラッシュ', 'Third', 'Fourth', 'Fifth',
+  ], 'Primary')), ['Hantsu x Trash', 'ハンツー×トラッシュ', 'Third', 'Fourth']);
+});
+
 test('parses episode numbers from common label shapes', () => {
   assert.equal(recognition.parseEpisode(['Эпизод №7']), 7);
   assert.equal(recognition.parseEpisode(['2 серия']), 2);

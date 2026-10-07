@@ -13,7 +13,7 @@
   let lastEpisode = null;
   let eventEpisode = null;
   let lastVoice = '';
-  let metadataUrl = '';
+  let metadataSignature = '';
   let observedUrl = '';
   let lastShadowScanAt = 0;
   let playerInteractionReported = false;
@@ -536,7 +536,7 @@
   }
 
   function reportTopMetadata() {
-    if (window !== window.top || metadataUrl === location.href) return;
+    if (window !== window.top) return;
     const primaryHeadings = [...document.querySelectorAll('main h1, article h1')]
       .map((element) => element.textContent || '');
     const ogTitle = document.querySelector('meta[property="og:title"]')?.content || '';
@@ -546,12 +546,16 @@
       documentTitle: document.title
     });
     if (!title || !likelyAnimePage(title)) return;
-    metadataUrl = location.href;
+    const alternativeTitles = recognitionApi.currentTitleAlternatives(document, title);
+    const signature = JSON.stringify([location.href, title, alternativeTitles]);
+    if (metadataSignature === signature) return;
+    metadataSignature = signature;
     safeSendMessage({
       type: 'recognition',
       site: location.hostname,
       url: location.href,
       title,
+      alternativeTitles,
       episode: readEpisode(),
       confidence: 'candidate',
       voice: readVoiceLabel() || null,
@@ -674,6 +678,9 @@
       if (episodeUiAdded) invalidateEpisodeAttrCache();
       if (episodeUiAdded) reportEpisodeIfChanged();
       if (episodeUiAdded) reportVoiceIfChanged();
+      // Metadata can hydrate or disappear independently of player mutations.
+      // The signature suppresses unchanged rescans and repeated network work.
+      if (isTop) reportTopMetadata();
       if (mediaAdded || episodeUiAdded || visibilityChanged) {
         if (isTop) reportTopMetadata();
         reportFrameVisibility();
@@ -682,6 +689,7 @@
     mediaObserver.observe(document.documentElement, {
       childList: true,
       subtree: true,
+      characterData: true,
       attributes: true,
       attributeFilter: ['episode', 'data-episode', 'class', 'style', 'hidden', 'src']
     });

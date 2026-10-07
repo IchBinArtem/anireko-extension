@@ -2103,6 +2103,332 @@ async function seedStaleCache({ context, storage }) {
   return key;
 }
 
+test('current-title alternatives resolve a missing primary once, without cross-tuple cache reuse', async () => {
+  const queries = [];
+  const { context } = loadServiceWorker({ fetchImpl: async (url) => {
+    const query = new URL(url).searchParams.get('q');
+    queries.push(query);
+    return { ok: true, status: 200, json: async () => ({ data: query === 'Hantsu x Trash'
+      ? [{ id: 11758, title: 'Охотник и корзина', subtitle: 'Hantsu x Trash', exact_alias_match: true }]
+      : [] }) };
+  } });
+  assert.equal((await context.resolveAnimeMatch('Водное поло на грани фола')).status, 'none');
+  const options = { alternativeTitles: ['Hantsu x Trash'] };
+  const result = await context.resolveAnimeMatch('Водное поло на грани фола', options);
+  assert.equal(result.status, 'ok');
+  assert.equal(result.animeId, 11758);
+  await context.resolveAnimeMatch('Водное поло на грани фола', options);
+  assert.deepEqual(queries, ['Водное поло на грани фола', 'Водное поло на грани фола', 'Hantsu x Trash']);
+});
+
+for (const scenario of [
+  { name: 'shared exact ID across aliases', rows: { First: [{ id: 1, title: 'Catalog', exact_alias_match: true }], Second: [{ id: 1, title: 'Catalog', exact_alias_match: true }] }, status: 'ok', id: 1 },
+  { name: 'conflicting primary exact IDs', rows: { Primary: [{ id: 1, title: 'Primary' }, { id: 2, title: 'Primary' }], First: [{ id: 1, title: 'Catalog', exact_alias_match: true }] }, status: 'ambiguous' },
+  { name: 'conflicting alias exact IDs', rows: { First: [{ id: 1, title: 'Catalog', exact_alias_match: true }], Second: [{ id: 2, title: 'Other', exact_alias_match: true }] }, status: 'ambiguous' },
+  { name: 'primary exact alias marker conflicts with alternative', rows: { Primary: [{ id: 1, title: 'Catalog A', exact_alias_match: true }], First: [{ id: 2, title: 'Catalog B', exact_alias_match: true }] }, status: 'ambiguous' },
+  { name: 'partial fallback error', rows: { First: [{ id: 1, title: 'Catalog', exact_alias_match: true }], Second: 'error' }, status: 'error' },
+  { name: 'fuzzy aliases are not proof', rows: { First: [{ id: 1, title: 'First Again', exact_alias_match: 'true' }] }, status: 'ambiguous' },
+  { name: 'original numeric fence', title: 'Primary 2', rows: { First: [{ id: 3, title: 'Catalog 3', exact_alias_match: true }] }, status: 'none' },
+]) {
+  test(`alternative recognition: ${scenario.name}`, async () => {
+    const { context } = loadServiceWorker({ fetchImpl: async (url) => {
+      const value = scenario.rows[new URL(url).searchParams.get('q')];
+      return value === 'error' ? { ok: false, status: 503, json: async () => ({}) }
+        : { ok: true, status: 200, json: async () => ({ data: value || [] }) };
+    } });
+    const result = await context.resolveAnimeMatch(scenario.title || 'Primary', { alternativeTitles: ['First', 'Second'] });
+    assert.equal(result.status, scenario.status);
+    assert.equal(result.animeId, scenario.id);
+  });
+}
+
+test('unique lexical primary needs no alternative probes even when fallback names are available', async () => {
+  const queries = [];
+  const { context } = loadServiceWorker({ fetchImpl: async url => {
+    const q = new URL(url).searchParams.get('q'); queries.push(q);
+    return { ok: true, status: 200, json: async () => ({ data: q === 'Primary'
+      ? [{ id: 1, title: 'Primary' }] : [{ id: 2, title: 'Other', exact_alias_match: true }] }) };
+  } });
+  const result = await context.resolveAnimeMatch('Primary', { alternativeTitles: ['Other'] });
+  assert.equal(result.status, 'ok'); assert.equal(result.animeId, 1);
+  assert.deepEqual(queries, ['Primary'], 'fallback-only contract avoids unnecessary alias traffic');
+});
+
+test('Unicode alternatives have distinct cache/inflight identities and simultaneous calls deduplicate', async () => {
+  const queries = [];
+  const { context } = loadServiceWorker({ fetchImpl: async (url) => {
+    const q = new URL(url).searchParams.get('q'); queries.push(q);
+    return { ok: true, status: 200, json: async () => ({ data: q === 'ハンツー×トラッシュ'
+      ? [{ id: 11758, title: 'Catalog', exact_alias_match: true }] : [] }) };
+  } });
+  const options = { alternativeTitles: ['ハンツー×トラッシュ'] };
+  const [first, second] = await Promise.all([context.resolveAnimeMatch('Primary', options), context.resolveAnimeMatch('Primary', options)]);
+  assert.equal(first.animeId, 11758); assert.equal(second.animeId, 11758);
+  assert.equal((await context.resolveAnimeMatch('Primary', { alternativeTitles: ['別の作品'] })).status, 'none');
+  assert.deepEqual(queries, ['Primary', 'ハンツー×トラッシュ', 'Primary', '別の作品']);
+});
+
+test('late old alias response cannot publish after the next same-document tuple is queued', async () => {
+  let enteredResolve; const entered = new Promise(resolve => { enteredResolve = resolve; });
+  let releaseResolve; const release = new Promise(resolve => { releaseResolve = resolve; });
+  const { context, storage } = loadServiceWorker({ fetchImpl: async (url) => {
+    const q = new URL(url).searchParams.get('q');
+    if (q === 'Old Alias') { enteredResolve(); await release; }
+    return { ok: true, status: 200, json: async () => ({ data: q === 'Old Alias'
+      ? [{ id: 1, title: 'Old Catalog', exact_alias_match: true }] : [] }) };
+  } });
+  const sender = { tab: { id: 7, url: 'https://anime.example/watch' } };
+  const scope = { documentId: 'top-document', documentToken: '1234567890abcdef',
+    topFrame: true, topOrigin: 'https://anime.example', origin: 'https://anime.example' };
+  const oldMessage = { type: 'recognition', title: 'Primary', alternativeTitles: ['Old Alias'],
+    url: sender.tab.url, observedAt: Date.now() };
+  context.queueSensorMessage(oldMessage, sender, scope);
+  await entered;
+  context.queueSensorMessage({ ...oldMessage, alternativeTitles: ['New Alias'] }, sender, scope);
+  releaseResolve();
+  await vm.runInContext("tabQueues['7']", context);
+  const state = (await storage.session.get('tab:7'))['tab:7'];
+  assert.equal(state.match.status, 'none');
+  assert.equal(state.match.animeId, undefined);
+  assert.deepEqual(Array.from(state.recognition.alternativeTitles), ['New Alias']);
+});
+
+test('raw recognition arrival order survives reversed real consent storage reads', async () => {
+  const queries = [];
+  const { context, storage, chrome } = loadServiceWorker({ fetchImpl: async (url) => {
+    const q = new URL(url).searchParams.get('q'); queries.push(q);
+    return { ok: true, status: 200, json: async () => ({ data: q === 'Old Alias'
+      ? [{ id: 1, title: 'Catalog', exact_alias_match: true }] : [] }) };
+  } });
+  const originalGet = storage.local.get.bind(storage.local);
+  const held = [];
+  storage.local.get = async (keys) => {
+    const result = await originalGet(keys);
+    if (keys === 'privacy-consent' && held.length < 2) await new Promise(resolve => held.push(resolve));
+    return result;
+  };
+  const sender = { id: chrome.runtime.id, frameId: 0, documentId: 'top',
+    url: 'https://anime.example/watch', tab: { id: 7, url: 'https://anime.example/watch' } };
+  const message = { type: 'recognition', title: 'Primary', url: sender.url,
+    documentUrl: sender.url, documentToken: '1234567890abcdef', observedAt: Date.now() };
+  chrome.runtime.onMessage.listener({ ...message, alternativeTitles: ['Old Alias'] }, sender, () => {});
+  chrome.runtime.onMessage.listener({ ...message, alternativeTitles: ['New Alias'] }, sender, () => {});
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(held.length, 2);
+  held[1]();
+  await new Promise(resolve => setImmediate(resolve));
+  await vm.runInContext("tabQueues['7']", context);
+  held[0]();
+  await new Promise(resolve => setImmediate(resolve));
+  await vm.runInContext("tabQueues['7']", context);
+  const state = (await storage.session.get('tab:7'))['tab:7'];
+  assert.deepEqual(Array.from(state.recognition.alternativeTitles), ['New Alias']);
+  assert.equal(state.match.status, 'none');
+  assert.ok(!queries.includes('Old Alias'));
+});
+
+test('old native top document cannot revoke the current recognition receipt or mapping', async () => {
+  const { context, chrome } = loadServiceWorker({ fetchImpl: async () => { throw Error('unexpected_network'); } });
+  const url = 'https://anime.example/watch';
+  const now = Date.now();
+  const recognition = { type: 'recognition', title: 'Primary', alternativeTitles: ['New Alias'],
+    url, documentUrl: url, documentToken: 'new-navigation-token', observedAt: now };
+  context.seedState = { tabId: 7, topDocumentId: 'new-document', navigationToken: recognition.documentToken,
+    pageUrl: url, pageNavigationAt: now - 100, recognition, match: { status: 'ok', animeId: 2 } };
+  vm.runInContext("stateByTab['7'] = seedState; latestRecognitionByTab.set('7', seedState.recognition)", context);
+  chrome.runtime.onMessage.listener({ ...recognition, alternativeTitles: ['Old Alias'],
+    documentToken: 'old-navigation-token', observedAt: now - 200 },
+  { id: chrome.runtime.id, frameId: 0, documentId: 'old-document', url, tab: { id: 7, url } }, () => {});
+  await new Promise(resolve => setImmediate(resolve));
+  await vm.runInContext("tabQueues['7']", context);
+  assert.equal(context.seedState.match?.animeId, 2);
+  assert.equal(vm.runInContext("latestRecognitionByTab.get('7') === seedState.recognition", context), true);
+});
+
+test('pending live recognition prevents popup recovery and publication of an old session tuple', async () => {
+  const { context, storage, chrome } = loadServiceWorker({ fetchImpl: async () => (
+    { ok: true, status: 200, json: async () => ({ data: [] }) }
+  ) });
+  const url = 'https://anime.example/watch';
+  const recognition = { type: 'recognition', title: 'Primary', alternativeTitles: ['Old Alias'],
+    url, documentUrl: url, documentToken: '1234567890abcdef', observedAt: Date.now() };
+  const oldState = { tabId: 7, topDocumentId: 'top', navigationToken: recognition.documentToken,
+    pageUrl: url, recognition, match: { status: 'ok', exact: true, animeId: 1 } };
+  await storage.session.set({ 'tab:7': oldState });
+  const originalGet = storage.local.get.bind(storage.local);
+  let release; let entered; let holdOnce = true;
+  const held = new Promise(resolve => { entered = resolve; });
+  storage.local.get = async keys => {
+    const result = await originalGet(keys);
+    if (keys === 'privacy-consent' && holdOnce) {
+      holdOnce = false; entered(); await new Promise(resolve => { release = resolve; });
+    }
+    return result;
+  };
+  chrome.runtime.onMessage.listener({ ...recognition, alternativeTitles: ['New Alias'] },
+    { id: chrome.runtime.id, frameId: 0, documentId: 'top', url, tab: { id: 7, url } }, () => {});
+  await held;
+  try {
+    assert.equal(await context.popupTabState(7), null, 'known stale recovery must not become live');
+    assert.equal(await context.persistPopupTabState(7, oldState), false, 'pending receipt fences publication too');
+    assert.equal(vm.runInContext("stateByTab['7']", context), undefined);
+  } finally { release(); }
+  await new Promise(resolve => setImmediate(resolve));
+  await vm.runInContext("tabQueues['7']", context);
+  assert.equal((await storage.session.get('tab:7'))['tab:7'].match.status, 'none');
+});
+
+test('fresh navigation recognition survives page-observed authorization finishing later', async () => {
+  const { context, storage, chrome } = loadServiceWorker({ fetchImpl: async url => (
+    { ok: true, status: 200, json: async () => ({ data: new URL(url).searchParams.get('q') === 'New Alias'
+      ? [{ id: 2, title: 'New Catalog', exact_alias_match: true }] : [] }) }
+  ) });
+  const url = 'https://anime.example/watch'; const now = Date.now();
+  context.seedState = { tabId: 7, topDocumentId: 'old-document', navigationToken: 'old-navigation-token',
+    pageUrl: url, pageNavigationAt: now - 1000, players: {}, frames: [], frameReports: {}, documents: {},
+    recognition: { title: 'Primary', alternativeTitles: ['Old Alias'], url }, match: { status: 'ok', animeId: 1 } };
+  vm.runInContext("stateByTab['7'] = seedState", context);
+  const originalGet = storage.local.get.bind(storage.local); let release; let first = true;
+  storage.local.get = async keys => {
+    const result = await originalGet(keys);
+    if (keys === 'privacy-consent' && first) { first = false; await new Promise(resolve => { release = resolve; }); }
+    return result;
+  };
+  const sender = { id: chrome.runtime.id, frameId: 0, documentId: 'new-document', url, tab: { id: 7, url } };
+  const base = { url, documentUrl: url, documentToken: 'new-navigation-token', observedAt: now };
+  chrome.runtime.onMessage.listener({ ...base, type: 'page-observed' }, sender, () => {});
+  chrome.runtime.onMessage.listener({ ...base, type: 'recognition', title: 'Primary', alternativeTitles: ['New Alias'] }, sender, () => {});
+  await new Promise(resolve => setImmediate(resolve));
+  try {
+    await vm.runInContext("tabQueues['7']", context);
+    assert.equal(vm.runInContext("stateByTab['7'].match?.animeId", context), 2);
+  } finally { release(); }
+  await new Promise(resolve => setImmediate(resolve));
+  await vm.runInContext("tabQueues['7']", context);
+  assert.equal((await storage.session.get('tab:7'))['tab:7'].match.animeId, 2);
+});
+
+test('old page-observed consent completion cannot roll back a newer native navigation', async () => {
+  const { context, storage, chrome } = loadServiceWorker({ fetchImpl: async () => (
+    { ok: true, status: 200, json: async () => ({ data: [] }) }
+  ) });
+  const url = 'https://anime.example/watch'; const now = Date.now();
+  const originalGet = storage.local.get.bind(storage.local); let release; let first = true;
+  storage.local.get = async keys => {
+    const result = await originalGet(keys);
+    if (keys === 'privacy-consent' && first) { first = false; await new Promise(resolve => { release = resolve; }); }
+    return result;
+  };
+  const send = (documentId, token, observedAt) => chrome.runtime.onMessage.listener({ type: 'page-observed',
+    url, documentUrl: url, documentToken: token, observedAt },
+  { id: chrome.runtime.id, frameId: 0, documentId, url, tab: { id: 7, url } }, () => {});
+  send('old-document', 'old-navigation-token', now - 100);
+  send('new-document', 'new-navigation-token', now);
+  await new Promise(resolve => setImmediate(resolve));
+  await vm.runInContext("tabQueues['7']", context);
+  release();
+  await new Promise(resolve => setImmediate(resolve));
+  await vm.runInContext("tabQueues['7']", context);
+  assert.equal((await storage.session.get('tab:7'))['tab:7'].topDocumentId, 'new-document');
+});
+
+test('same-native-document SPA recognition revokes and replaces the old URL mapping', async () => {
+  const { context, storage } = loadServiceWorker({ fetchImpl: async () => (
+    { ok: true, status: 200, json: async () => ({ data: [] }) }
+  ) });
+  const url = 'https://anime.example/watch'; const now = Date.now();
+  const scope = { topFrame: true, documentId: 'top', documentToken: '1234567890abcdef',
+    origin: 'https://anime.example', topOrigin: 'https://anime.example' };
+  context.seedState = { tabId: 7, topDocumentId: 'top', navigationToken: scope.documentToken,
+    pageUrl: url, pageNavigationAt: now - 100, recognition: { title: 'Primary', url },
+    match: { status: 'ok', animeId: 1 }, players: {}, frames: [], frameReports: {}, documents: {} };
+  vm.runInContext("stateByTab['7'] = seedState", context);
+  context.queueSensorMessage({ type: 'recognition', title: 'Primary', url: `${url}#next`, observedAt: now },
+    { tab: { id: 7, url: `${url}#next` } }, scope);
+  assert.equal(context.seedState.match, null);
+  await vm.runInContext("tabQueues['7']", context);
+  const state = (await storage.session.get('tab:7'))['tab:7'];
+  assert.equal(state.pageUrl, `${url}#next`);
+  assert.equal(state.match.status, 'none');
+});
+
+test('real detector envelope admits top visibility, native video, voice and interaction without message.url', async () => {
+  const { context, storage, chrome } = loadServiceWorker({ fetchImpl: async () => (
+    { ok: true, status: 200, json: async () => ({ data: [] }) }
+  ) });
+  const url = 'https://anime.example/watch'; const now = Date.now();
+  const sender = { id: chrome.runtime.id, frameId: 0, documentId: 'top', url, tab: { id: 7, url } };
+  const envelope = { documentUrl: url, documentToken: '1234567890abcdef', observedAt: now };
+  const send = async message => {
+    chrome.runtime.onMessage.listener({ ...envelope, ...message }, sender, () => {});
+    await new Promise(resolve => setImmediate(resolve));
+    await vm.runInContext("tabQueues['7']", context);
+  };
+  await send({ type: 'page-observed', url });
+  await send({ type: 'recognition', url, title: 'Primary' });
+  await send({ type: 'frame-visibility', pageUrl: url,
+    frames: [{ src: 'https://player.example/video', visible: true, rect: { width: 600, height: 400 } }] });
+  await send({ type: 'player-progress', frameUrl: url, playerInstanceId: 'native-video',
+    currentTime: 0, duration: 1200, episode: 1, paused: true, playing: false,
+    playbackStarted: false, locallyVisible: true, reason: 'loadedmetadata' });
+  await send({ type: 'voice-change', voice: 'Original' });
+  await send({ type: 'player-interaction', interactionKind: 'pointer', observedAt: now + 1 });
+  const state = (await storage.session.get('tab:7'))['tab:7'];
+  assert.equal(state.frames.length, 1);
+  assert.equal(Object.keys(state.players).length, 1);
+  assert.equal(state.frameReports.top.documentUrl, url);
+  assert.equal(state.topVoice, 'Original');
+  assert.equal(state.playerInteractionAt, now + 1);
+  // Same-origin but wrong document URL must remain fenced, without mutating
+  // the confirmed top scope. This is not permission to skip URL identity.
+  await send({ type: 'voice-change', documentUrl: `${url}/old`, voice: 'Stale' });
+  assert.equal((await storage.session.get('tab:7'))['tab:7'].topVoice, 'Original');
+});
+
+test('ordinary retry never publishes a revoked old alias, even temporarily', async () => {
+  let enteredResolve; const entered = new Promise(resolve => { enteredResolve = resolve; });
+  let releaseResolve; const release = new Promise(resolve => { releaseResolve = resolve; });
+  const { context, storage } = loadServiceWorker({ fetchImpl: async (url) => {
+    const q = new URL(url).searchParams.get('q');
+    if (q === 'Old Alias') { enteredResolve(); await release; }
+    return { ok: true, status: 200, json: async () => ({ data: q === 'Old Alias'
+      ? [{ id: 1, title: 'Catalog', exact_alias_match: true }] : [] }) };
+  } });
+  const sender = { tab: { id: 7, url: 'https://anime.example/watch' } };
+  const scope = { documentId: 'top-document', documentToken: '1234567890abcdef',
+    topFrame: true, topOrigin: 'https://anime.example', origin: 'https://anime.example' };
+  const recognition = { type: 'recognition', title: 'Primary', alternativeTitles: ['Old Alias'],
+    url: sender.tab.url, observedAt: Date.now() };
+  context.seedState = { tabId: 7, navigationToken: scope.documentToken, topDocumentId: scope.documentId,
+    pageUrl: sender.tab.url, sourceOrigin: scope.topOrigin, recognition, players: {}, frames: [], frameReports: {}, documents: {},
+    match: { status: 'error', query: 'Primary', resolvedAt: Date.now() - 61_000 } };
+  vm.runInContext("stateByTab['7'] = seedState", context);
+  const published = [];
+  const originalSet = storage.session.set.bind(storage.session);
+  storage.session.set = async items => {
+    if (items['tab:7']?.match?.animeId) published.push(items['tab:7'].match.animeId);
+    return originalSet(items);
+  };
+  context.queueSensorMessage({ type: 'probe-update', url: sender.tab.url, observedAt: Date.now() }, sender, scope);
+  await entered;
+  context.queueSensorMessage({ ...recognition, alternativeTitles: ['New Alias'] }, sender, scope);
+  assert.equal(context.seedState.match, null);
+  releaseResolve();
+  await vm.runInContext("tabQueues['7']", context);
+  assert.deepEqual(published, []);
+  assert.equal((await storage.session.get('tab:7'))['tab:7'].match.status, 'none');
+});
+
+test('explicit season does not search generic alternatives', async () => {
+  const queries = [];
+  const { context } = loadServiceWorker({ fetchImpl: async (url) => {
+    queries.push(new URL(url).searchParams.get('q'));
+    return { ok: true, status: 200, json: async () => ({ data: [] }) };
+  } });
+  assert.equal((await context.resolveAnimeMatch('Primary Season 2', { alternativeTitles: ['First'] })).status, 'none');
+  assert.ok(!queries.includes('First'));
+});
+
 test('forceRefresh returns an error on transient search failure, not a stale cached ok', async () => {
   const { fetchImpl, calls } = httpErrorFetch(503);
   const { context, storage } = loadServiceWorker({ fetchImpl });

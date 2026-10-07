@@ -2,6 +2,7 @@ importScripts(
   'lib/runtime-config.js',
   'lib/api-client.js',
   'lib/trust.js',
+  'lib/recognition.js',
   'lib/auto-mark.js',
   'lib/watch-write-barrier.js',
   'lib/watch-request-hash.js',
@@ -15,6 +16,8 @@ const apiClient = AniRekoApiClient.create({
 
 const stateByTab = {};
 const tabQueues = {};
+const latestRecognitionByTab = new Map();
+const latestTopDocumentByTab = new Map();
 const tabStateFlushAt = {};
 const actionIconRenderKeyByTab = new Map();
 const actionBadgeRenderKeyByTab = new Map();
@@ -159,6 +162,8 @@ async function disableTab(tabId, writeBinding = captureLocalWrite()) {
   try { await chrome.tabs.sendMessage(tabId, { type: 'anireko-disable-detector' }); } catch { /* no script */ }
   delete stateByTab[String(tabId)];
   delete tabQueues[String(tabId)];
+  latestRecognitionByTab.delete(String(tabId));
+  latestTopDocumentByTab.delete(String(tabId));
   delete tabStateFlushAt[String(tabId)];
   invalidateActionPresentation(tabId);
   if (writeBinding !== false) await removeSession(writeBinding, `tab:${tabId}`);
@@ -667,24 +672,33 @@ async function searchTitleCandidates(title) {
 // KAN-2695: global persistent cache + in-flight dedup + error backoff. Most
 // titles use one search request; an explicit season may also need a base-title
 // search and one bounded alias probe before it is cached.
-function resolveAnimeMatch(title, { forceRefresh = false, writeBinding = captureLocalWrite() } = {}) {
+function recognitionSearchIdentity(title, alternativeTitles = []) {
+  const alternatives = AniRekoRecognition.normalizeAlternativeTitles(alternativeTitles, title);
+  // Preserve Unicode aliases without changing legacy manual title bindings.
+  return alternatives.length ? JSON.stringify([titleSearchKey(title), alternatives]) : titleSearchKey(title);
+}
+
+function resolveAnimeMatch(title, { forceRefresh = false, alternativeTitles = [], writeBinding = captureLocalWrite() } = {}) {
   requireLocalWrite(writeBinding);
   const wanted = titleSearchKey(title);
   if (!wanted) return Promise.resolve({ status: 'none', query: title, resolvedAt: Date.now() });
-  const requestKey = `${writeBinding.revision}:${wanted}:${forceRefresh ? 'fresh' : 'cached'}`;
+  const alternatives = AniRekoRecognition.normalizeAlternativeTitles(alternativeTitles, title);
+  const searchIdentity = recognitionSearchIdentity(title, alternatives);
+  const requestKey = `${writeBinding.revision}:${searchIdentity}:${forceRefresh ? 'fresh' : 'cached'}`;
   let pending = searchInFlight.get(requestKey);
   if (!pending) {
-    pending = resolveAnimeMatchWithBinding(title, wanted, forceRefresh, writeBinding)
+    pending = resolveAnimeMatchWithBinding(title, wanted, forceRefresh, writeBinding, alternatives)
+      .then((match) => ({ ...match, searchIdentity }))
       .finally(() => searchInFlight.delete(requestKey));
     searchInFlight.set(requestKey, pending);
   }
   return pending;
 }
 
-async function resolveAnimeMatchWithBinding(title, wanted, forceRefresh, writeBinding = captureLocalWrite()) {
+async function resolveAnimeMatchWithBinding(title, wanted, forceRefresh, writeBinding = captureLocalWrite(), alternatives = []) {
   const binding = await manualMatchBinding(wanted);
   requireLocalWrite(writeBinding);
-  if (!binding) return resolveAnimeMatchUncached(title, wanted, forceRefresh, writeBinding);
+  if (!binding) return resolveAnimeMatchUncached(title, recognitionSearchIdentity(title, alternatives), forceRefresh, writeBinding, alternatives);
   if (!forceRefresh) {
     return { status: 'ok', query: title, ...binding, exact: false, manual: true, resolvedAt: Date.now() };
   }
@@ -701,7 +715,7 @@ async function resolveAnimeMatchWithBinding(title, wanted, forceRefresh, writeBi
   }
 }
 
-async function resolveAnimeMatchUncached(title, wanted, forceRefresh = false, writeBinding = captureLocalWrite()) {
+async function resolveAnimeMatchUncached(title, wanted, forceRefresh = false, writeBinding = captureLocalWrite(), alternatives = []) {
   const now = Date.now();
   const stored = await chrome.storage.local.get([SEARCH_CACHE_KEY, 'search-cache-version']);
   const cacheVersion = SEARCH_CACHE_VERSION;
@@ -715,7 +729,7 @@ async function resolveAnimeMatchUncached(title, wanted, forceRefresh = false, wr
       && cached.match.candidates.length === 1
       ? catalogCandidate(cached.match.candidates[0])
       : null;
-    if (onlyCandidate && (lexicallyExactTitle(onlyCandidate.title, title)
+    if (!alternatives.length && onlyCandidate && (lexicallyExactTitle(onlyCandidate.title, title)
       || lexicallyExactTitle(onlyCandidate.subtitle, title))) {
       const promoted = {
         status: 'ok', query: title, ...onlyCandidate, exact: true, manual: false,
@@ -732,7 +746,7 @@ async function resolveAnimeMatchUncached(title, wanted, forceRefresh = false, wr
   }
   if (now < searchBackoffUntil) {
     const fallback = { status: 'error', query: title, error: 'search backoff', resolvedAt: now };
-    if (forceRefresh) return fallback;
+    if (forceRefresh || alternatives.length) return fallback;
     return cached?.match || fallback;
   }
   try {
@@ -758,6 +772,33 @@ async function resolveAnimeMatchUncached(title, wanted, forceRefresh = false, wr
           manual: false, seasonAlias: Boolean(seasonAlias), resolvedAt: now,
         }
         : { status: 'ambiguous', query: title, candidates: exact.length ? exact : results, resolvedAt: now };
+    }
+    if (match.status !== 'ok' && alternatives.length && !explicitSeasonRequest(title)) {
+      const exactById = new Map(results
+        .filter((candidate) => candidate.exactAliasMatch || lexicallyExactTitle(candidate.title, title)
+          || lexicallyExactTitle(candidate.subtitle, title))
+        .map((candidate) => [candidate.animeId, candidate]));
+      const allById = new Map(results.map((candidate) => [candidate.animeId, candidate]));
+      // Every planned response must complete. A first success or partial error
+      // cannot prove uniqueness; primary exact conflicts remain conflicts.
+      for (const alternative of alternatives) {
+        const candidates = await searchCatalogCandidates(alternative);
+        requireLocalWrite(writeBinding);
+        for (const candidate of candidates) {
+          if (!numericallyCompatibleCandidate(title, candidate)) continue;
+          allById.set(candidate.animeId, candidate);
+          if (candidate.exactAliasMatch || lexicallyExactTitle(candidate.title, alternative)
+            || lexicallyExactTitle(candidate.subtitle, alternative)) {
+            exactById.set(candidate.animeId, candidate);
+          }
+        }
+      }
+      const exact = [...exactById.values()];
+      match = exact.length === 1
+        ? { status: 'ok', query: title, ...exact[0], exact: true, manual: false, resolvedAt: now }
+        : allById.size
+          ? { status: 'ambiguous', query: title, candidates: exact.length ? exact : [...allById.values()], resolvedAt: now }
+          : { status: 'none', query: title, resolvedAt: now };
     }
     requireLocalWrite(writeBinding);
     searchFailCount = 0;
@@ -787,7 +828,7 @@ async function resolveAnimeMatchUncached(title, wanted, forceRefresh = false, wr
     searchFailCount += 1;
     searchBackoffUntil = now + Math.min(30 * 60_000, 30_000 * 2 ** (searchFailCount - 1));
     const fallback = { status: 'error', query: title, error: String(error), resolvedAt: now };
-    if (forceRefresh) return fallback;
+    if (forceRefresh || alternatives.length) return fallback;
     return cached?.match || fallback;
   }
 }
@@ -1843,7 +1884,9 @@ async function maybeAutoMark(state, writeBinding = captureLocalWrite(), liveStat
       const reservation = reserveWriteOperation(completionMetadataRefreshInFlight, refreshKey, writeBinding);
       if (!reservation) return;
       try {
-        const refreshed = await resolveAnimeMatch(event.recognition?.title, { forceRefresh: true, writeBinding });
+        const refreshed = await resolveAnimeMatch(event.recognition?.title, {
+          forceRefresh: true, alternativeTitles: event.recognition?.alternativeTitles, writeBinding,
+        });
         requireLocalWrite(writeBinding);
         if (!completionMetadataScopeCurrent(event, writeBinding)
           || liveState.match !== event.matchReference) return;
@@ -2530,17 +2573,29 @@ async function updateTabState(message, sender, messageContext, writeBinding = ca
   current.documents ||= {};
   current.tabId = Number(tabId);
   if (messageContext.topFrame) {
+    const receipt = latestTopDocumentByTab.get(tabId);
+    // Every detector type shares this validated envelope, whereas url/pageUrl/
+    // frameUrl are type-specific payload fields. Internal callers use the same
+    // scope, with the payload fallback retained for predecessor test adapters.
+    const documentUrl = messageContext.documentUrl || message.url || message.pageUrl || message.frameUrl;
+    if (receipt && !sameTopDocument(receipt, messageContext, documentUrl)) return;
     const changedDocument = current.navigationToken
       && current.navigationToken !== messageContext.documentToken;
-    if (changedDocument && message.type !== 'page-observed') {
+    // A validated page-observed arrival already fences the new native document;
+    // its consent read may finish after recognition's independent consent read.
+    const pendingNavigation = receipt?.message.type === 'page-observed';
+    if (changedDocument && message.type !== 'page-observed' && !pendingNavigation) {
       current.lastRejectReason = 'stale_navigation';
       return;
     }
-    if (message.type === 'page-observed'
-      && (changedDocument || (current.pageUrl && current.pageUrl !== message.url))) {
+    if ((message.type === 'page-observed' || pendingNavigation)
+      && (changedDocument || (current.pageUrl && current.pageUrl !== documentUrl))) {
       invalidateWatchController();
       invalidateActionPresentation(tabId);
       current = { players: {}, frames: [], frameReports: {}, documents: {} };
+      current.tabId = Number(tabId);
+      current.pageNavigationAt = receipt?.message.observedAt || message.observedAt;
+      stateByTab[tabId] = current;
     }
     current.navigationToken = messageContext.documentToken;
     current.sourceOrigin = messageContext.topOrigin;
@@ -2571,6 +2626,8 @@ async function updateTabState(message, sender, messageContext, writeBinding = ca
     current.pageUrl ||= message.url;
   }
   if (message.type === 'recognition') {
+    const latestRecognition = latestRecognitionByTab.get(String(tabId));
+    if (latestRecognition && latestRecognition !== message) return;
     if (current.recognition?.url && current.recognition.url !== message.url) {
       invalidateWatchController();
       invalidateActionPresentation(tabId);
@@ -2593,11 +2650,22 @@ async function updateTabState(message, sender, messageContext, writeBinding = ca
       delete current.playerInteractionNavigationAt;
       current.pageNavigationAt = message.observedAt;
     }
+    const nextSearchIdentity = recognitionSearchIdentity(message.title, message.alternativeTitles);
+    const previousSearchIdentity = recognitionSearchIdentity(current.recognition?.title, current.recognition?.alternativeTitles);
+    if (nextSearchIdentity !== previousSearchIdentity) {
+      invalidateWatchController();
+      invalidateActionPresentation(tabId);
+      current.match = null;
+    }
     current.recognition = message;
     current.pageUrl = message.url;
-    if (titleSearchKey(current.match?.query) !== titleSearchKey(message.title)) {
-      current.match = await resolveAnimeMatch(message.title, { writeBinding });
+    if ((current.match?.searchIdentity || titleSearchKey(current.match?.query)) !== nextSearchIdentity) {
+      const resolved = await resolveAnimeMatch(message.title, { alternativeTitles: message.alternativeTitles, writeBinding });
       requireLocalWrite(writeBinding);
+      if ((stateByTab[tabId] && stateByTab[tabId] !== current) || current.recognition !== message
+        || current.pageUrl !== message.url
+        || (latestRecognition && latestRecognitionByTab.get(String(tabId)) !== message)) return;
+      current.match = resolved;
     }
   }
   if (message.type === 'player-interaction') {
@@ -2714,15 +2782,22 @@ async function updateTabState(message, sender, messageContext, writeBinding = ca
     && current.match.completionMetadataReady !== true
     && matchAge > SEARCH_TTL_PARTIAL_MS;
   if (current.recognition?.title && (retryMatch || retryCompletionMetadata)) {
-    current.match = await resolveAnimeMatch(current.recognition.title, { writeBinding });
+    const recognition = current.recognition;
+    const resolved = await resolveAnimeMatch(recognition.title, { alternativeTitles: recognition.alternativeTitles, writeBinding });
+    requireLocalWrite(writeBinding);
+    if (stateByTab[tabId] !== current || current.recognition !== recognition
+      || (latestRecognitionByTab.has(tabId) && latestRecognitionByTab.get(tabId) !== recognition)) return;
+    current.match = resolved;
     requireLocalWrite(writeBinding);
   }
   // Taste match% for the badge/popup. Guest/error answers re-checked every
   // 5 min (login can happen anytime); ok/no-data served from cache (15 min).
   if (current.match?.status === 'ok' && current.match.animeId) {
+    const tasteMatch = current.match;
     const now = Date.now();
     const userKey = sessionIdentityKey(await currentSessionInfo(false, writeBinding));
     requireLocalWrite(writeBinding);
+    if (current.match !== tasteMatch || !stateMatchesLatestReceipt(tabId, current)) return;
     const taste = current.taste;
     const stale = !taste
       || taste.animeId !== current.match.animeId
@@ -2732,11 +2807,13 @@ async function updateTabState(message, sender, messageContext, writeBinding = ca
     if (stale) {
       const freshTaste = await resolveTasteMatch(current.match.animeId, userKey, writeBinding);
       requireLocalWrite(writeBinding);
+      if (current.match !== tasteMatch || !stateMatchesLatestReceipt(tabId, current)) return;
       current.taste = freshTaste;
     }
   } else {
     current.taste = null;
   }
+  if (!stateMatchesLatestReceipt(tabId, current)) return;
   const detectedPlayer = activePlayer(current);
   current.player = detectedPlayer
     && AniRekoTrust.playerVisibilityConfirmed(detectedPlayer)
@@ -2748,6 +2825,7 @@ async function updateTabState(message, sender, messageContext, writeBinding = ca
     || null;
   if (updatedPlayerKey && current.player === current.players[updatedPlayerKey]) {
     await queueHistoryUpdate(current, current.player, previousPlayer, writeBinding);
+    if (!stateMatchesLatestReceipt(tabId, current)) return;
     // Fire-and-forget: не блокируем очередь сообщений таба.
     const urgentSync = message.reason === 'pause' || message.reason === 'ended'
       || Boolean(message.watched && !previousPlayer?.watched)
@@ -2795,15 +2873,19 @@ async function popupTabState(tabId, writeBinding = captureLocalWrite()) {
   requireLocalWrite(writeBinding);
   if (!Number.isInteger(tabId) || tabId < 1) return null;
   const memoryState = stateByTab[String(tabId)];
-  if (memoryState) return memoryState;
+  if (memoryState) return stateMatchesLatestReceipt(tabId, memoryState) ? memoryState : null;
   const storageKey = `tab:${tabId}`;
   const stored = await chrome.storage.session.get(storageKey);
   requireLocalWrite(writeBinding);
   // Native/session recovery cannot replace a newer sensor publication. Admit
   // the exact persisted predecessor before sync captures its live ownership.
-  if (stateByTab[String(tabId)]) return stateByTab[String(tabId)];
+  if (stateByTab[String(tabId)]) {
+    const live = stateByTab[String(tabId)];
+    return stateMatchesLatestReceipt(tabId, live) ? live : null;
+  }
   const state = stored[storageKey];
   if (!state || (state.tabId !== undefined && state.tabId !== tabId)) return null;
+  if (!stateMatchesLatestReceipt(tabId, state)) return null;
   state.tabId = tabId;
   stateByTab[String(tabId)] = state;
   return state;
@@ -2825,6 +2907,7 @@ async function persistPopupTabState(tabId, state, writeBinding = captureLocalWri
     return false;
   }
   requireLocalWrite(writeBinding);
+  if (!stateMatchesLatestReceipt(tabId, state)) return false;
   state.updatedAt = Date.now();
   stateByTab[String(tabId)] = state;
   await setSession(writeBinding, { [`tab:${tabId}`]: state });
@@ -2928,8 +3011,16 @@ async function unbindPopupAnime(message, writeBinding = captureLocalWrite()) {
     return { ok: false, status: 404, payload: { error: 'tab_not_found' } };
   }
   await removeManualMatchBinding(wanted, writeBinding);
-  state.match = await resolveAnimeMatch(recognizedTitle, { forceRefresh: true, writeBinding });
+  const recognition = state.recognition;
+  const refreshed = await resolveAnimeMatch(recognizedTitle, {
+    forceRefresh: true, alternativeTitles: recognition?.alternativeTitles, writeBinding,
+  });
   requireLocalWrite(writeBinding);
+  if (state.recognition !== recognition
+    || (latestRecognitionByTab.has(String(tabId)) && latestRecognitionByTab.get(String(tabId)) !== recognition)) {
+    return { ok: false, status: 409, payload: { error: 'recognition_state_changed' } };
+  }
+  state.match = refreshed;
   state.taste = confirmedAnimeMatch(state.match)
     ? await resolveTasteMatch(state.match.animeId, sessionIdentityKey(await currentSessionInfo(false, writeBinding)), writeBinding)
     : null;
@@ -3143,8 +3234,75 @@ async function handlePopupRequest(message, writeBinding = captureLocalWrite()) {
   }
 }
 
-function queueSensorMessage(message, sender, messageContext, writeBinding = captureLocalWrite()) {
+function sameTopDocument(receipt, context, url) {
+  return receipt.documentId === context.documentId
+    && receipt.documentToken === context.documentToken && receipt.url === url;
+}
+
+function stateMatchesLatestReceipt(tabId, state) {
+  const receipt = latestTopDocumentByTab.get(String(tabId));
+  if (receipt && !sameTopDocument(receipt,
+    { documentId: state.topDocumentId, documentToken: state.navigationToken }, state.pageUrl)) return false;
+  const recognition = latestRecognitionByTab.get(String(tabId));
+  return !recognition || (recognition.url === state.recognition?.url
+    && recognitionSearchIdentity(recognition.title, recognition.alternativeTitles)
+      === recognitionSearchIdentity(state.recognition?.title, state.recognition?.alternativeTitles));
+}
+
+function captureRecognitionReceipt(message, sender, messageContext) {
   const tabId = String(sender.tab.id);
+  const current = stateByTab[tabId];
+  const receipt = latestTopDocumentByTab.get(tabId);
+  if (messageContext.topFrame && message.type === 'page-observed') {
+    // Old navigation arrivals cannot roll a newer native document back. The
+    // detector's observation time orders navigation, not same-document titles.
+    const navigationAt = receipt?.message.observedAt || current?.pageNavigationAt || 0;
+    if (message.observedAt < navigationAt) return false;
+    latestTopDocumentByTab.set(tabId, { ...messageContext, url: message.url, message });
+    if (current && (current.topDocumentId !== messageContext.documentId
+      || current.navigationToken !== messageContext.documentToken || current.pageUrl !== message.url)) {
+      latestRecognitionByTab.delete(tabId);
+      current.match = null;
+      invalidateWatchController();
+      invalidateActionPresentation(Number(tabId));
+    }
+  }
+  if (message.type === 'recognition') {
+    const top = receipt || (current?.navigationToken ? {
+      documentId: current.topDocumentId, documentToken: current.navigationToken, url: current.pageUrl,
+    } : null);
+    if (top && !sameTopDocument(top, messageContext, message.url)) {
+      // Same native document may change its hash/SPA URL without page-observed.
+      // A different native document still requires a navigation receipt first.
+      if (top.documentId !== messageContext.documentId || top.documentToken !== messageContext.documentToken
+        || message.observedAt < (receipt?.message.observedAt || current?.pageNavigationAt || 0)) return false;
+      latestTopDocumentByTab.set(tabId, { ...messageContext, url: message.url, message });
+    }
+    const known = current?.documents?.[messageContext.documentId];
+    if (known && known.token !== messageContext.documentToken) return false;
+    if (current?.topDocumentId === messageContext.documentId && current.navigationToken
+      && current.navigationToken !== messageContext.documentToken) return false;
+    latestRecognitionByTab.set(tabId, message);
+    if (!receipt) latestTopDocumentByTab.set(tabId, { ...messageContext, url: message.url, message });
+    // Revoke old mapping immediately, before the serialized queue finishes a
+    // delayed old tuple. Subsequent player writes cannot use that mapping.
+    if (current?.recognition && (current.recognition.url !== message.url
+      || recognitionSearchIdentity(current.recognition.title, current.recognition.alternativeTitles)
+        !== recognitionSearchIdentity(message.title, message.alternativeTitles))) {
+      current.match = null;
+      invalidateWatchController();
+      invalidateActionPresentation(Number(tabId));
+    }
+  }
+  return true;
+}
+
+function queueSensorMessage(message, sender, messageContext, writeBinding = captureLocalWrite(), receiptCaptured = false) {
+  const tabId = String(sender.tab.id);
+  if (!receiptCaptured && !captureRecognitionReceipt(message, sender, messageContext)) return;
+  if (message.type === 'recognition') {
+    if (latestRecognitionByTab.get(tabId) !== message) return;
+  }
   const previous = tabQueues[tabId] || Promise.resolve();
   let queue;
   queue = previous
@@ -3168,8 +3326,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!messageContext.ok) return;
   let writeBinding;
   try { writeBinding = captureLocalWrite(); } catch { return; }
+  // Record arrival order synchronously, not consent-read completion order.
+  if (!captureRecognitionReceipt(message, sender, messageContext)) return;
   authorizedDocument(messageContext)
-    .then((allowed) => { if (allowed && localWriteCurrent(writeBinding)) queueSensorMessage(message, sender, messageContext, writeBinding); })
+    .then((allowed) => {
+      if (message.type === 'recognition' && latestRecognitionByTab.get(String(sender.tab.id)) !== message) return;
+      if (allowed && localWriteCurrent(writeBinding)) queueSensorMessage(message, sender, messageContext, writeBinding, true);
+    })
     .catch(() => {});
 });
 
@@ -3186,6 +3349,7 @@ async function finalizeRemovedTab(tabId, writeBinding = captureLocalWrite()) {
       // published state wins; an inconsistent embedded tab ID cannot be adopted.
       state = stateByTab[id] || stored[storageKey];
       if (state && state.tabId !== undefined && state.tabId !== tabId) state = null;
+      if (state && !stateMatchesLatestReceipt(tabId, state)) state = null;
       if (state && !stateByTab[id]) {
         state.tabId = tabId;
         stateByTab[id] = state;
@@ -3196,6 +3360,8 @@ async function finalizeRemovedTab(tabId, writeBinding = captureLocalWrite()) {
   } finally {
     delete stateByTab[id];
     delete tabQueues[id];
+    latestRecognitionByTab.delete(id);
+    latestTopDocumentByTab.delete(id);
     delete tabStateFlushAt[id];
     invalidateActionPresentation(tabId);
     if (localWriteCurrent(writeBinding)) {

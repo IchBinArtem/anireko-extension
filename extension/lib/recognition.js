@@ -171,6 +171,42 @@
     ]);
   }
 
+  function normalizeAlternativeTitles(values, title = '') {
+    if (!Array.isArray(values)) return [];
+    const key = (value) => value.normalize('NFKC').toLocaleLowerCase('ru').replace(/ё/gu, 'е');
+    const seen = new Set([key(cleanText(title))]);
+    const result = [];
+    for (const value of values.slice(0, 20)) {
+      if (typeof value !== 'string') continue;
+      const text = cleanText(value);
+      if (text.length < 2 || text.length > 180 || !/[\p{L}\p{N}]/u.test(text)
+        || /(?:https?:|www\.|[<>])/iu.test(text) || seen.has(key(text))) continue;
+      seen.add(key(text));
+      result.push(text);
+      if (result.length === 4) break;
+    }
+    return result;
+  }
+
+  // Only the unique current H1 and its immediately adjacent title list.
+  // No document-wide list/text harvesting, linked recommendations or nested text.
+  function currentTitleAlternatives(document, title) {
+    const ancillary = 'aside, nav, footer, [role="complementary"], .recommendations, .comments, #comments, [class*="recommend"], [class*="comment"]';
+    const primaryHeadings = [...document.querySelectorAll('main h1, article h1')]
+      .filter((heading) => !heading.closest(ancillary)
+        && normalizeTitle(heading.textContent) === normalizeTitle(title));
+    const headings = [...document.querySelectorAll('.titles > h1')]
+      .filter((heading) => !heading.closest(ancillary)
+        && normalizeTitle(heading.textContent) === normalizeTitle(title));
+    if (headings.length !== 1) return [];
+    if (primaryHeadings.length && (primaryHeadings.length !== 1 || primaryHeadings[0] !== headings[0])) return [];
+    const list = headings[0].nextElementSibling;
+    if (!list?.matches('ul.alt-names-list')) return [];
+    return normalizeAlternativeTitles([...list.children]
+      .filter((node) => node.tagName === 'LI' && node.children.length === 0)
+      .map((node) => node.textContent), title);
+  }
+
   global.AniRekoRecognition = {
     cleanText,
     hasEpisodeMarker,
@@ -181,6 +217,8 @@
     normalizeVoiceLabel,
     normalizeTitle,
     chooseTitle,
-    choosePageTitle
+    choosePageTitle,
+    normalizeAlternativeTitles,
+    currentTitleAlternatives
   };
 })(typeof globalThis !== 'undefined' ? globalThis : window);

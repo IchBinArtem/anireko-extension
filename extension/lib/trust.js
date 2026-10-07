@@ -175,6 +175,12 @@
       && (typeof message.title !== 'string' || message.title.length < 2 || message.title.length > 180)) {
       return { ok: false, reason: 'payload_invalid' };
     }
+    if (message.type === 'recognition' && message.alternativeTitles != null
+      && (!Array.isArray(message.alternativeTitles) || message.alternativeTitles.length > 4
+        || message.alternativeTitles.some((title) => typeof title !== 'string'
+          || title.length < 2 || title.length > 180))) {
+      return { ok: false, reason: 'payload_invalid' };
+    }
     if (message.type === 'scout-observed'
       && (typeof message.url !== 'string' || message.url.length > 2000
         || typeof message.title !== 'string' || message.title.length > 180

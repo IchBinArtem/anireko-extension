@@ -1183,6 +1183,47 @@ test('prefers a later episode H1 over duplicated site-brand headings', async () 
   await page.close();
 });
 
+test('current-title aliases hydrate on the same URL, exclude recommendations, and revoke ambiguous scope', async () => {
+  const page = await context.newPage();
+  await page.goto(`${siteBase}/title-alternatives.html`);
+  const tabId = await extensionTabId(`${siteBase}/title-alternatives.html`);
+  await expect.poll(async () => (await storedTabState(tabId))?.match?.status).toBe('none');
+  // Even a same-title .titles block inside recommendations cannot authorize aliases.
+  await page.locator('aside').evaluate(block => {
+    block.innerHTML = '<div class="titles"><h1>Водное поло на грани фола</h1>'
+      + '<ul class="alt-names-list"><li>Hantsu x Trash</li></ul></div>';
+  });
+  await expect.poll(async () => (await storedTabState(tabId))?.recognition?.alternativeTitles).toEqual([]);
+  await page.locator('.content-page .titles .alt-names-list').evaluate((list) => {
+    list.innerHTML = '<li>Hantsu x Torasshu</li><li>Hantsu x Trash</li><li>…</li>'
+      + '<li><a href="/other">Linked recommendation</a></li><li>ハンツー×トラッシュ</li>';
+  });
+  await expect.poll(async () => (await storedTabState(tabId))?.match?.animeId).toBe(11758);
+  expect((await storedTabState(tabId)).recognition.alternativeTitles)
+    .toEqual(['Hantsu x Torasshu', 'Hantsu x Trash', 'ハンツー×トラッシュ']);
+  // Several unchanged DOM rescans must not issue another search.
+  const before = await page.request.get(`${apiBase}/__test/request-counts`).then(r => r.json());
+  for (let index = 0; index < 3; index++) await page.evaluate(() => document.body.append(document.createElement('span')));
+  expect(await page.request.get(`${apiBase}/__test/request-counts`).then(r => r.json())).toMatchObject({ searchQueries: before.searchQueries });
+  expect(before.searchQueries).toEqual(['Водное поло на грани фола', 'Водное поло на грани фола',
+    'Hantsu x Torasshu', 'Hantsu x Trash', 'ハンツー×トラッシュ']);
+  await page.locator('.content-page .titles').evaluate(block => block.after(block.cloneNode(true)));
+  await expect.poll(async () => (await storedTabState(tabId))?.recognition?.alternativeTitles).toEqual([]);
+  await expect.poll(async () => (await storedTabState(tabId))?.match?.status).toBe('none');
+  await page.close();
+});
+
+test('same-title recommendation block cannot supply aliases for the actual primary H1', async () => {
+  const page = await context.newPage();
+  await page.goto(`${siteBase}/title-alternatives-decoy.html`);
+  const tabId = await extensionTabId(`${siteBase}/title-alternatives-decoy.html`);
+  await expect.poll(async () => (await storedTabState(tabId))?.match?.status).toBe('none');
+  expect((await storedTabState(tabId)).recognition.alternativeTitles).toEqual([]);
+  const counts = await page.request.get(`${apiBase}/__test/request-counts`).then(r => r.json());
+  expect(counts.searchQueries).toEqual(['Водное поло на грани фола']);
+  await page.close();
+});
+
 test('does not promote a recommendation episode H1 over the primary title', async () => {
   const page = await context.newPage();
   await page.goto(`${siteBase}/primary-title-with-decoy-episode.html`);
@@ -1838,6 +1879,11 @@ test('serializes progress writes and restores the final state after a cold worke
       'sync-account': { id: 18, name: 'TestUser' },
     });
     await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/session?on=1&user=18');
+    // A preceding closed tab can observe the fixture's reset guest session.
+    // Observe the new account through the production read/epoch path before
+    // capturing direct-writer bindings; never suppress write_binding_changed.
+    const session = await (globalThis as any).handlePopupRequest({ type: 'popup-session-info' });
+    if (!session.ok || session.payload?.user?.id !== 18) throw new Error('fixture_account_not_ready');
     const state = {
       sourceOrigin: (globalThis as any).AniRekoRuntimeConfig.apiBase.replace('127.0.0.1', '127.0.0.2'),
       match: { status: 'ok', exact: true, animeId: 4242 },

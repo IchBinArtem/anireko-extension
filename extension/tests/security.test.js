@@ -45,6 +45,10 @@ test('sensor messages require the real sender origin, top frame and fresh docume
   assert.equal(trust.validateSensorMessage({ ...message, documentUrl: 'https://evil.example' }, sender, 'extension-id').ok, false);
   assert.equal(trust.validateSensorMessage(message, { ...sender, frameId: 2 }, 'extension-id').reason, 'top_frame_required');
   assert.equal(trust.validateSensorMessage({ ...message, observedAt: now - 300_001 }, sender, 'extension-id').ok, false);
+  assert.equal(trust.validateSensorMessage({ ...message, alternativeTitles: ['ハンツー×トラッシュ'] }, sender, 'extension-id').ok, true);
+  for (const alternativeTitles of [{}, ['x'], ['x'.repeat(181)], Array(5).fill('Title'), [42]]) {
+    assert.equal(trust.validateSensorMessage({ ...message, alternativeTitles }, sender, 'extension-id').ok, false);
+  }
 });
 
 test('episode and voice signals reject malformed cross-frame payloads', () => {
@@ -320,7 +324,7 @@ test('search cache invalidates pre-completion metadata and retries partial match
   assert.equal(worker.includes("['type', 'episodes', 'release_status']"), true);
   assert.equal(worker.includes('match.completionMetadataReady ? SEARCH_TTL_OK_MS : SEARCH_TTL_PARTIAL_MS'), true);
   assert.equal(worker.includes('current.match.completionMetadataReady !== true'), true);
-  assert.equal(worker.includes("{ forceRefresh: true, writeBinding }"), true);
+  assert.match(worker, /forceRefresh: true, alternativeTitles: event\.recognition\?\.alternativeTitles, writeBinding/u);
   assert.equal(worker.includes('completionMetadataRefreshedInSession.add(refreshKey)'), true);
 });
 
