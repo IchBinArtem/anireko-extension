@@ -594,6 +594,7 @@
   async function renderWatchCycle() {
     if (!matchConfirmed || !syncAccountActive) return;
     watchCard.hidden = false;
+    const manualWasOpen = Array.from(watchActions.children).some(node => node.tagName === 'DETAILS' && node.open);
     watchActions.replaceChildren();
     try {
       const response = await requestBackground('popup-watch-history', { tabId: tab?.id });
@@ -606,17 +607,13 @@
         legacyResume.hidden = true;
         legacyResume.textContent = '';
       }
-      const state = snapshot.start_state;
       const origins = [...(snapshot.origins || []), ...(snapshot.selected_origin ? [snapshot.selected_origin] : [])];
       const currentOrigin = origins.find((origin) => origin.state?.current?.cycle_id === snapshot.foreground?.cycle_id);
-      const countState = currentOrigin?.state || state;
       let completion = snapshot.previously_completed ? t('watchPreviouslyCompleted') : t('watchNotCompleted');
-      const count = countState?.lifetime_completed_count ?? countState?.completed_count_lower_bound;
-      if (Number.isSafeInteger(count) && count >= 0) {
-        // Scope is a ledger (history + anime), not an account namespace or visible page.
-        completion += ` · ${t(currentOrigin ? 'watchCurrentHistoryCount' : 'watchStartHistoryCount')}`;
-        completion += ` · ${t(countState?.lifetime_completed_count == null
-          ? 'watchCompletedLowerBound' : 'watchCompletedCount', String(count))}`;
+      // Component totals are tracked completions, not an invented lifetime total.
+      const count = snapshot.totals?.completed;
+      if (Number.isSafeInteger(count) && count > 0) {
+        completion += ` · ${t('watchTrackedCompletions', String(count))}`;
       }
       set('watch-completion', completion);
       const current = currentOrigin?.state?.current;
@@ -624,8 +621,6 @@
       if (snapshot.readiness !== 'ready') parts.push(t('watchReconciliation'));
       else if (current) {
         parts.push(t(current.kind === 'rewatching' ? 'watchRewatching' : 'statusWatching'));
-        // Ordinals describe tracked starts, never an invented lifetime count.
-        parts.push(t('watchTrackedCycle', String(current.tracked_start_ordinal)));
         if (current.episode != null) parts.push(t('episodeLabel', String(current.episode)));
         if (currentOrigin.anime_id !== snapshot.requested_anime_id) parts.push(t('watchOtherTitle'));
       } else {
@@ -636,11 +631,10 @@
           const cycle = origin.state.current;
           if (seenPaused.has(cycle.cycle_id)) continue;
           seenPaused.add(cycle.cycle_id);
-          parts.push(`${t('watchPaused')} · ${t('watchTrackedCycle', String(cycle.tracked_start_ordinal))}`
+          parts.push(t('watchPaused')
             + (cycle.episode == null ? '' : ` · ${t('episodeLabel', String(cycle.episode))}`));
         }
       }
-      if (countState?.history_before_tracking_unknown) parts.push(t('watchEarlierCountUnknown'));
       set('watch-current', parts.join(' · '));
       const run = async (type, input) => {
         for (const button of watchActions.querySelectorAll('button')) button.disabled = true;
@@ -677,6 +671,7 @@
         }
       } else {
         if (watchProjection.repairComplete === false) watchFeedback.textContent = t('watchChoicesIncomplete');
+        let manualActions = null;
         for (const action of watchProjection.actions || []) {
           if (action.command === 'reconcile') {
             const selected = new Map();
@@ -730,7 +725,19 @@
           }
           const label = t(`watchAction_${action.command}`);
           const suffix = action.ordinal == null ? '' : ` · ${t('watchTrackedCycle', String(action.ordinal))}`;
-          addButton(label + suffix, 'popup-watch-command', { capabilityId: action.capabilityId });
+          if (!manualActions) {
+            manualActions = document.createElement('details');
+            manualActions.open = manualWasOpen;
+            const summary = document.createElement('summary');
+            summary.textContent = t('watchManualControls');
+            manualActions.append(summary);
+            watchActions.append(manualActions);
+          }
+          const button = document.createElement('button');
+          button.type = 'button';
+          button.textContent = label + suffix;
+          button.addEventListener('click', () => run('popup-watch-command', { capabilityId: action.capabilityId }));
+          manualActions.append(button);
         }
       }
     } catch {

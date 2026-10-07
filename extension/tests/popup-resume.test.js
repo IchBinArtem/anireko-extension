@@ -119,13 +119,13 @@ test('late legacy bulk response cannot restore resume after adoption', async () 
   assert.equal(result.textContent, '');
 });
 
-test('actual cycle renderer retains completion and labels unknown lifetime as tracked, not second watch', async () => {
+test('actual cycle renderer retains completion and shows only component tracked completions, not invented lifetime', async () => {
   const source = fs.readFileSync(path.join(__dirname, '..', 'popup.js'), 'utf8').replace(/\r\n/g, '\n');
   const start = source.indexOf('  async function renderWatchCycle() {');
   const end = source.indexOf('\n  await renderWatchCycle();\n', start);
   assert.ok(start >= 0 && end > start);
   const elements = new Map();
-  const element = () => ({ hidden: true, textContent: '', children: [],
+  const element = tag => ({ tagName: String(tag).toUpperCase(), hidden: true, textContent: '', children: [],
     replaceChildren(...children) { this.children = children; },
     append(child) { this.children.push(child); }, addEventListener() {}, querySelectorAll() { return this.children; } });
   for (const id of ['watch-completion', 'watch-current', 'watch-actions', 'watch-feedback', 'watch-cycle-card', 'resume-label', 'resume']) elements.set(id, element());
@@ -152,21 +152,23 @@ test('actual cycle renderer retains completion and labels unknown lifetime as tr
   assert.equal(elements.get('watch-completion').textContent, 'watchPreviouslyCompleted');
   const displayed = elements.get('watch-current').textContent;
   assert.ok(displayed.includes('watchRewatching'));
-  assert.ok(displayed.includes('watchTrackedCycle:2'));
-  assert.ok(displayed.includes('watchEarlierCountUnknown'));
+  assert.equal(displayed.includes('watchTrackedCycle:2'), false);
+  assert.equal(displayed.includes('watchEarlierCountUnknown'), false);
   assert.ok(displayed.includes('episodeLabel:3'));
   assert.equal(displayed.includes('SUMMER'), false, 'calendar season is not a season number');
   snapshot.start_state.completed_count_lower_bound = 1;
   snapshot.foreground.cycle_id = null;
   current.status = 'paused';
   await context.run();
-  assert.ok(elements.get('watch-completion').textContent.includes('watchCompletedLowerBound:1'));
+  assert.equal(elements.get('watch-completion').textContent, 'watchPreviouslyCompleted');
   assert.ok(elements.get('watch-current').textContent.includes('watchPaused'));
   assert.ok(elements.get('watch-current').textContent.includes('episodeLabel:3'));
   snapshot.start_state.lifetime_completed_count = 5;
   await context.run();
-  assert.ok(elements.get('watch-completion').textContent.includes('watchCompletedCount:5'));
-  assert.equal(elements.get('watch-completion').textContent.includes('watchCompletedLowerBound'), false);
+  assert.equal(elements.get('watch-completion').textContent, 'watchPreviouslyCompleted', 'unknown tracking totals are not lifetime estimates');
+  snapshot.totals = { completed: 1 };
+  await context.run();
+  assert.equal(elements.get('watch-completion').textContent, 'watchPreviouslyCompleted · watchTrackedCompletions:1');
   const retainedCurrent = { ...current, status: 'active', tracked_start_ordinal: 6 };
   snapshot.start_state.lifetime_completed_count = 1;
   snapshot.foreground.cycle_id = 'retained';
@@ -174,13 +176,25 @@ test('actual cycle renderer retains completion and labels unknown lifetime as tr
   snapshot.origins.push({ history_id: 'same-history', anime_id: 202, state: { current: retainedCurrent,
     lifetime_completed_count: 5, completed_count_lower_bound: 5 } });
   await context.run();
-  assert.ok(elements.get('watch-completion').textContent.includes('watchCompletedCount:5'),
-    'foreground history counter, not unrelated primary history count');
-  assert.ok(elements.get('watch-completion').textContent.includes('watchCurrentHistoryCount'), 'scope explicitly labelled');
+  assert.equal(elements.get('watch-completion').textContent, 'watchPreviouslyCompleted · watchTrackedCompletions:1',
+    'one component total, not a sum of overlapping lifetime counters');
   snapshot.origins[1].state.lifetime_completed_count = null;
   await context.run();
-  assert.ok(elements.get('watch-completion').textContent.includes('watchCompletedLowerBound:5'));
+  assert.ok(elements.get('watch-completion').textContent.includes('watchTrackedCompletions:1'));
   assert.equal(elements.get('watch-completion').textContent.includes('watchCompletedCount:'), false, 'no invented lifetime sum');
+  projection.actions = [{ command: 'pause', capabilityId: 'pause-action' }];
+  await context.run();
+  let manual = elements.get('watch-actions').children[0];
+  assert.equal(manual.open, false, 'optional controls initially closed');
+  manual.open = true;
+  projection.actions = [{ command: 'resume', capabilityId: 'resume-action' }];
+  await context.run();
+  manual = elements.get('watch-actions').children[0];
+  assert.equal(manual.open, true, 'user disclosure choice survives command/state refresh');
+  assert.equal(manual.children[1].textContent, 'watchAction_resume');
+  manual.open = false;
+  await context.run();
+  assert.equal(elements.get('watch-actions').children[0].open, false, 'user collapse is also preserved');
   projection.pending = true;
   projection.pendingIntent = { animeId: 303, action: 'start', commandId: 'original-id' };
   await context.run();

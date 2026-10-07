@@ -343,6 +343,7 @@
       playing: !video.paused && !video.ended,
       paused: video.paused,
       ended: video.ended,
+      seeking: video.seeking,
       muted: video.muted,
       volume: video.volume,
       playbackRate: Number.isFinite(video.playbackRate) ? video.playbackRate : 1,

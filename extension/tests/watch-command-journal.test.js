@@ -10,6 +10,69 @@ const binding = { document_id: 'document-1', navigation_token: 'navigation-1', r
 const ack = { history_id: uuid, anime_id: 10, foreground: { anime_id: 10, generation: 1, cycle_id: uuid }, state: { anime_id: 10, version: 1 } };
 const freshCycle = '22345678-1234-4234-8234-123456789abc';
 const copy = (value) => structuredClone(value);
+test('Complete admission retains strict original local lineage without changing wire intent or legacy records', async () => {
+  const complete = { ...request, command: 'complete', cycle_id: uuid,
+    episode: null, position_sec: 1000, duration_sec: 1200, voice: null };
+  const subject = fixture();
+  const intent = subject.journal.capture('history-command', complete, binding);
+  const originalHash = await subject.hash('history-command', intent.request);
+  await subject.journal.admit(intent, 'a'.repeat(64));
+  assert.equal(intent.binding.media_lineage, undefined, 'captured immutable intent is not rewritten');
+  assert.equal(subject.data[subject.key].binding.media_lineage, 'a'.repeat(64));
+  assert.deepEqual(subject.data[subject.key].request, complete);
+  assert.equal(await subject.hash('history-command', subject.data[subject.key].request), originalHash);
+  await subject.journal.deliver(1);
+  const wire = JSON.parse(subject.calls[0].init.body);
+  assert.deepEqual(wire, { operation: 'command', ...complete });
+  assert.equal(wire.media_lineage, undefined);
+  assert.equal((await subject.journal.pending()).binding.media_lineage, 'a'.repeat(64));
+  const legacy = copy(subject.data); delete legacy[subject.key].binding.media_lineage;
+  const old = fixture({ data: legacy });
+  assert.equal((await old.journal.pending()).binding.media_lineage, undefined, 'old exact binding stays valid without backfill');
+});
+
+test('Complete top context is strict, local-only, immutable and absent in legacy receipts', async () => {
+  const complete = { ...request, command: 'complete', cycle_id: uuid,
+    episode: null, position_sec: 1000, duration_sec: 1200, voice: null };
+  const subject = fixture();
+  const intent = subject.journal.capture('history-command', complete, binding);
+  await subject.journal.admit(intent, 'a'.repeat(64), 'b'.repeat(64));
+  assert.equal(intent.binding.top_context, undefined);
+  assert.equal((await subject.journal.pending()).binding.top_context, 'b'.repeat(64));
+  await subject.journal.deliver(1);
+  assert.deepEqual(JSON.parse(subject.calls[0].init.body), { operation: 'command', ...complete });
+  const legacy = copy(subject.data); delete legacy[subject.key].binding.top_context;
+  assert.equal((await fixture({ data: legacy }).journal.pending()).binding.top_context, undefined);
+  for (const context of [null, '', 'B'.repeat(64), 'b'.repeat(63), {}, 'https://example.org']) {
+    const bad = fixture();
+    assert.throws(() => bad.journal.admit(bad.journal.capture('history-command', complete, binding),
+      undefined, context), /journal_invalid/);
+    assert.deepEqual(bad.data, {});
+  }
+  assert.throws(() => subject.journal.capture('history-command', request,
+    { ...binding, top_context: 'b'.repeat(64) }), /journal_invalid/);
+});
+
+test('local Complete lineage rejects malformed fields and preserves original capture invalidation', async () => {
+  const complete = { ...request, command: 'complete', cycle_id: uuid,
+    episode: null, position_sec: 1000, duration_sec: 1200, voice: null };
+  for (const lineage of [null, '', 'A'.repeat(64), 'a'.repeat(63), 'a'.repeat(65), 42, {}, 'https://player.example/watch']) {
+    const subject = fixture();
+    assert.throws(() => subject.journal.capture('history-command', complete,
+      { ...binding, media_lineage: lineage }), /journal_invalid/);
+    const intent = subject.journal.capture('history-command', complete, binding);
+    assert.throws(() => subject.journal.admit(intent, lineage), /journal_invalid/);
+    assert.deepEqual(subject.data, {});
+  }
+  const subject = fixture();
+  assert.throws(() => subject.journal.capture('history-command', request,
+    { ...binding, media_lineage: 'a'.repeat(64) }), /journal_invalid/);
+  const intent = subject.journal.capture('history-command', complete, binding);
+  subject.journal.invalidate();
+  assert.throws(() => subject.journal.admit(intent, 'a'.repeat(64)), /journal_binding_changed/);
+  assert.deepEqual(subject.data, {});
+});
+
 test('fresh read without authoritative boolean adoption retains acknowledged intent', async () => {
   for (const adoption of [undefined, null, 'false', 0, {}, []]) {
     const data = {};

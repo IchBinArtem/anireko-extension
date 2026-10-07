@@ -30,6 +30,12 @@ const watchPreparedSnapshots = new WeakMap();
 let watchControllerGeneration = 0;
 let watchMutation = null;
 let watchSettlementCapability = null;
+const WATCH_TERMINAL_KEY = 'watch-terminal-barriers-v1';
+const watchObservationScopes = new WeakMap();
+const watchPlayObservations = new WeakMap();
+let watchTerminalQueue = Promise.resolve();
+// An opening window is only a candidate filter, never a terminal-barrier timeout.
+const WATCH_OPENING_SECONDS = 60;
 let localWriteBarrier = AniRekoWatchWriteBarrier.create();
 let localWriteRevision = crypto.randomUUID();
 let localControlInFlight = null;
@@ -1120,6 +1126,7 @@ async function trustedWriteContext(state) {
 
 function watchHistoryBindingCurrent(entry, event, writeBinding, userId) {
   return entry?.userId === userId && entry.animeId === event.match.animeId
+    && entry.generation === watchControllerGeneration
     && entry.revision === writeBinding.revision && entry.pageUrl === event.pageUrl
     && entry.documentId === event.topDocumentId && entry.navigationToken === event.navigationToken
     && entry.sourceOrigin === event.sourceOrigin
@@ -1143,6 +1150,7 @@ async function readWatchHistory(event, writeBinding, userId, refresh = false) {
   let entry = watchHistoryReads.get(event.liveState);
   if (refresh || !watchHistoryBindingCurrent(entry, event, writeBinding, userId)) {
     entry = { userId, animeId: event.match.animeId, revision: writeBinding.revision,
+      generation: watchControllerGeneration,
       pageUrl: event.pageUrl, documentId: event.topDocumentId, navigationToken: event.navigationToken,
       sourceOrigin: event.sourceOrigin,
       snapshot: null, blocked: false, pending: null };
@@ -1152,7 +1160,8 @@ async function readWatchHistory(event, writeBinding, userId, refresh = false) {
         const response = await apiClient.request('history-read', {
           anime_id: entry.animeId, expected_user_id: userId,
         });
-        if (watchHistoryReads.get(event.liveState) !== entry || !localWriteCurrent(writeBinding)) return;
+        if (watchHistoryReads.get(event.liveState) !== entry
+          || !watchHistoryBindingCurrent(entry, event, writeBinding, userId)) return;
         if (response?.ok === true && response.status === 200
           && validWatchHistorySnapshot(response.payload, userId, entry.animeId)) {
           // Copy to prevent an async consumer or popup from changing admission.
@@ -1224,12 +1233,31 @@ function createWatchJournal(binding, event = null, mediaEvent = false) {
       const account = await activeSyncAccount(binding);
       return localWriteCurrent(binding) && account?.userId === userId;
     },
-    client: { request: async (action, request) => {
+    client: { request: async (action, request, originalBinding) => {
       requireLocalWrite(binding);
       if (event && !await verifyWatchDocument(event, binding)) throw new Error('current_document_required');
       requireLocalWrite(binding);
       if (mediaEvent && action === 'history-command' && !progressEventCurrent(event, binding)) {
         throw new Error('media_binding_changed');
+      }
+      if (action === 'history-command' && request.command === 'cancel') {
+        // Session storage survives MV3 worker suspension without borrowing a
+        // persisted playback sample as natural proof. Retry without the original
+        // live document records a conservative stop requiring a new real play.
+        await setSession(binding, { [watchManualStopKey(request.expected_user_id,
+          request.expected_effective_anime_id, event?.tabId)]: {
+          documentId: event?.topDocumentId || null, navigationToken: event?.navigationToken || null,
+          observedAt: Date.now(),
+        } });
+        if (event && !await verifyWatchDocument(event, binding)) throw new Error('current_document_required');
+      }
+      if (action === 'history-command' && request.command === 'complete') {
+        // Covers automatic Complete, manual Complete and explicit original retry.
+        // Failed persistence must prevent POST, not merely lose a local hint.
+        await rememberWatchTerminal(binding, request, event, originalBinding?.media_lineage, originalBinding?.top_context);
+        requireLocalWrite(binding);
+        if (event && !await verifyWatchDocument(event, binding)) throw new Error('current_document_required');
+        if (mediaEvent && !progressEventCurrent(event, binding)) throw new Error('media_binding_changed');
       }
       return apiClient.request(action, request);
     } },
@@ -1288,7 +1316,9 @@ function publishWatchCapabilities(event, binding, userId, snapshot, repair = nul
       seen.add(current.cycle_id);
       const base = { ...identity(origin.history_id, origin.anime_id, state.version), cycle_id: current.cycle_id };
       if (current.status === 'active' && foreground.cycle_id === current.cycle_id) {
-        for (const command of ['pause', 'cancel', 'complete']) add(command, { ...base, command,
+        const commands = Number.isSafeInteger(current.duration_sec) && current.duration_sec >= 300
+          ? ['pause', 'cancel', 'complete'] : ['pause', 'cancel'];
+        for (const command of commands) add(command, { ...base, command,
           ...(command === 'complete' ? { episode: current.episode, position_sec: current.position_sec,
             duration_sec: current.duration_sec, voice: current.voice } : {}) }, state);
       } else if (current.status === 'paused' && foreground.cycle_id === null) {
@@ -1373,6 +1403,7 @@ async function loadWatchRepairChoices(event, binding, userId, snapshot) {
 }
 
 async function loadWatchController(event, binding, userId, suppliedSnapshot = null) {
+  const generation = watchControllerGeneration;
   const prepared = watchPreparedSnapshots.get(event.liveState);
   if (suppliedSnapshot && prepared?.snapshot === suppliedSnapshot && prepared.userId === userId
     && prepared.generation === watchControllerGeneration && prepared.revision === binding.revision
@@ -1396,13 +1427,14 @@ async function loadWatchController(event, binding, userId, suppliedSnapshot = nu
   const repair = snapshot.readiness === 'reconciliation_required'
     ? await loadWatchRepairChoices(event, binding, userId, snapshot) : null;
   if (!await verifyWatchDocument(event, binding)) throw new Error('current_document_required');
+  if (generation !== watchControllerGeneration) throw new Error('history_capability_changed');
   const projection = publishWatchCapabilities(event, binding, userId, snapshot, repair);
   watchPreparedSnapshots.set(event.liveState, { snapshot, projection, userId,
     generation: watchControllerGeneration, revision: binding.revision });
   return projection;
 }
 
-async function executeWatchCapability(id, binding, choiceCycleIds) {
+async function executeWatchCapability(id, binding, choiceCycleIds, automaticEvent = null) {
   const capability = watchCycleCapabilities.get(id);
   if (watchMutation || !capability || capability.generation !== watchControllerGeneration
     || capability.binding.revision !== binding.revision || !watchDocumentCurrent(capability.event, binding)) {
@@ -1411,7 +1443,12 @@ async function executeWatchCapability(id, binding, choiceCycleIds) {
   const reservation = Object.freeze({});
   watchMutation = reservation;
   watchCycleCapabilities.delete(id);
-  const journal = createWatchJournal(binding, capability.event);
+  const commandEvent = automaticEvent || capability.event;
+  if (automaticEvent && !progressEventCurrent(automaticEvent, binding)) {
+    watchMutation = null;
+    throw new Error('media_binding_changed');
+  }
+  const journal = createWatchJournal(binding, commandEvent, Boolean(automaticEvent));
   // Capture body, UUID and CAS synchronously, before any storage/session await.
   try {
     let choices = null;
@@ -1434,17 +1471,31 @@ async function executeWatchCapability(id, binding, choiceCycleIds) {
     if (account?.userId !== capability.userId || !await verifyWatchDocument(capability.event, binding)) {
       throw new Error('history_capability_changed');
     }
+    if (automaticEvent && !progressEventCurrent(automaticEvent, binding)) throw new Error('media_binding_changed');
     if (capability.command === 'initialize') {
       const response = await apiClient.request('history-initialize', { expected_user_id: capability.userId });
       if (!response.ok) return response;
     } else {
-      await journal.admit(intent);
+      const lineage = intent.request.command === 'complete'
+        ? await watchMediaLineage(commandEvent, binding, intent.request.episode, intent.request.duration_sec) : null;
+      const topContext = intent.request.command === 'complete'
+        ? await watchTopContext(commandEvent, binding) : null;
+      await journal.admit(intent, lineage || undefined, topContext || undefined);
       const delivered = await journal.deliver(capability.userId);
       if (!delivered.acknowledged) return { ok: false, status: 409, payload: { pending: true } };
       const refreshed = await journal.refresh(capability.userId);
       if (!refreshed.refreshed) return { ok: false, status: 409, payload: { pending: true, acknowledged: true } };
     }
-    const projection = await loadWatchController(capability.event, binding, capability.userId);
+    // Accepted mutations retire every pre-command read, including other tabs and
+    // GETs started while the command held its reservation.
+    invalidateWatchController();
+    if (capability.command === 'start' || capability.command === 'resume') {
+      await removeSession(binding, [watchManualStopKey(capability.userId,
+        capability.request.expected_effective_anime_id, capability.event.tabId),
+      watchManualStopKey(capability.userId, capability.request.expected_effective_anime_id)]);
+      watchPlayObservations.delete(capability.event.liveState);
+    }
+    const projection = await loadWatchController(commandEvent, binding, capability.userId);
     return { ok: true, status: 200, payload: projection };
   } finally {
     watchCycleJournals.delete(journal);
@@ -1452,10 +1503,204 @@ async function executeWatchCapability(id, binding, choiceCycleIds) {
   }
 }
 
+function recordWatchObservation(event, binding) {
+  const scope = JSON.stringify([binding.revision, watchControllerGeneration, event.match.animeId, event.pageUrl,
+    event.navigationToken, event.topDocumentId, event.sourceOrigin]);
+  if (event.playerIsLive && event.playerReference && localWriteCurrent(binding)) {
+    watchObservationScopes.set(event.playerReference, scope);
+  }
+  const player = event.player;
+  const identity = JSON.stringify([player.documentId, player.playerInstanceId, player.frameUrl, player.episode]);
+  const oldPlay = watchPlayObservations.get(event.liveState);
+  if (!event.playerIsLive || !localWriteCurrent(binding) || !player.playing || player.paused !== false
+    || player.ended || player.watched || player.seeking !== false
+    || /pause|seek|episode-change|ended/iu.test(player.reason || '')
+    || oldPlay?.scope !== scope || oldPlay?.identity !== identity) {
+    watchPlayObservations.delete(event.liveState);
+  }
+  if (event.playerIsLive && localWriteCurrent(binding) && player.reason === 'play'
+    && player.playing && player.paused === false && !player.ended && !player.watched
+    && player.seeking === false && Number.isFinite(player.observedAt)) {
+    watchPlayObservations.set(event.liveState, { scope, identity, observedAt: player.observedAt });
+  }
+  return scope;
+}
+
+function naturalWatchInterval(event, previous, binding = captureLocalWrite()) {
+  const previousScope = previous && watchObservationScopes.get(previous);
+  const currentScope = recordWatchObservation(event, binding);
+  const player = event.player;
+  if (!event.playerIsLive || !previous || previousScope !== currentScope || !player.playing || !previous.playing
+    || player.paused !== false || previous.paused !== false || player.ended || previous.ended
+    || player.seeking !== false || previous.seeking !== false
+    || /seek|episode-change/iu.test(player.reason || '') || /seek|episode-change/iu.test(previous.reason || '')
+    || !player.documentId || player.documentId !== previous.documentId
+    || !player.playerInstanceId || player.playerInstanceId !== previous.playerInstanceId
+    || player.frameUrl !== previous.frameUrl || player.episode !== previous.episode
+    || !Number.isFinite(player.duration) || player.duration < 300
+    || Math.round(player.duration) !== Math.round(previous.duration)
+    || player.watched || previous.watched) return null;
+  const wall = (player.observedAt - previous.observedAt) / 1000;
+  const media = player.currentTime - previous.currentTime;
+  if (!(wall > 0 && wall <= 15 && media > 0 && media <= 20)) return null;
+  const play = watchPlayObservations.get(event.liveState);
+  const afterPlay = Boolean(play && play.observedAt <= previous.observedAt);
+  return Object.freeze({ opening: previous.currentTime >= 0
+    && previous.currentTime <= WATCH_OPENING_SECONDS && player.currentTime <= WATCH_OPENING_SECONDS,
+    afterPlay, playObservedAt: afterPlay ? play.observedAt : null });
+}
+
+function watchManualStopKey(userId, animeId, tabId = null) {
+  return `watch-manual-stop:${userId}:${animeId}:${Number.isSafeInteger(tabId) && tabId > 0 ? tabId : 'retry'}`;
+}
+
+async function watchMediaLineage(event, binding, episode, duration) {
+  if (!event || !event.playerIsLive || !progressEventCurrent(event, binding)
+    || (event.player.episode ?? null) !== episode || Math.round(event.player.duration) !== duration
+    || !event.topDocumentId || !event.navigationToken || !event.player.documentId
+    || !event.player.playerInstanceId || !event.player.frameUrl) return null;
+  const bytes = new TextEncoder().encode(JSON.stringify([event.topDocumentId, event.navigationToken,
+    event.player.documentId, event.player.frameUrl, event.player.playerInstanceId]));
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  if (!progressEventCurrent(event, binding)) throw new Error('media_binding_changed');
+  return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
+async function watchTopContext(event, binding) {
+  if (!event || !progressEventCurrent(event, binding) || !event.topDocumentId || !event.navigationToken) return null;
+  // Separate hash domain: a replacement player in the same top document is not
+  // a new viewing context. The local proof contains no URL and is never uploaded.
+  const bytes = new TextEncoder().encode(JSON.stringify(['anireko-watch-top-context-v1',
+    event.topDocumentId, event.navigationToken]));
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  if (!progressEventCurrent(event, binding)) throw new Error('media_binding_changed');
+  return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
+async function readWatchTerminals(binding) {
+  requireLocalWrite(binding);
+  const stored = (await chrome.storage.local.get(WATCH_TERMINAL_KEY))[WATCH_TERMINAL_KEY];
+  requireLocalWrite(binding);
+  if (stored === undefined) return {};
+  if (stored?.version !== 1 || !stored.byScope || typeof stored.byScope !== 'object'
+    || Array.isArray(stored.byScope) || Object.keys(stored.byScope).length > 500) throw new Error('terminal_barrier_invalid');
+  for (const [key, value] of Object.entries(stored.byScope)) {
+    if (!/^\d+:\d+$/u.test(key) || !value || typeof value.ended !== 'boolean'
+      || !(value.episode === null || (Number.isSafeInteger(value.episode) && value.episode > 0))
+      || !Number.isSafeInteger(value.duration) || value.duration < 300
+      || !(value.lineage === null || /^[a-f0-9]{64}$/u.test(value.lineage))
+      || (Object.hasOwn(value, 'topContext') && (typeof value.topContext !== 'string'
+        || !/^[a-f0-9]{64}$/u.test(value.topContext)))) throw new Error('terminal_barrier_invalid');
+  }
+  return stored.byScope;
+}
+
+function rememberWatchTerminal(binding, request, event = null, originalLineage, originalTopContext) {
+  if (originalLineage !== undefined && (typeof originalLineage !== 'string'
+    || !/^[a-f0-9]{64}$/u.test(originalLineage))) return Promise.reject(new Error('terminal_barrier_invalid'));
+  if (originalTopContext !== undefined && (typeof originalTopContext !== 'string'
+    || !/^[a-f0-9]{64}$/u.test(originalTopContext))) return Promise.reject(new Error('terminal_barrier_invalid'));
+  if (!Number.isSafeInteger(request.duration_sec) || request.duration_sec < 300
+    || !(request.episode === null || (Number.isSafeInteger(request.episode) && request.episode > 0))) {
+    return Promise.reject(new Error('complete_media_ineligible'));
+  }
+  const queued = watchTerminalQueue.catch(() => {}).then(async () => {
+    const byScope = await readWatchTerminals(binding);
+    const key = `${request.expected_user_id}:${request.expected_effective_anime_id}`;
+    if (!Object.hasOwn(byScope, key) && Object.keys(byScope).length >= 500) throw new Error('terminal_barrier_full');
+    const old = byScope[key];
+    if (request.command_id && old?.commandId === request.command_id) return;
+    const observedLineage = await watchMediaLineage(event, binding, request.episode, request.duration_sec);
+    const lineage = originalLineage || observedLineage;
+    const same = lineage !== null && old?.lineage === lineage && old.episode === request.episode
+      && old.duration === request.duration_sec;
+    // A replacement player ending must not confirm the old terminal media.
+    // Only a new admitted Complete intent may replace that durable binding.
+    if (!request.command_id && old && !same) return;
+    byScope[key] = { episode: request.episode, duration: request.duration_sec, lineage,
+      ...(originalTopContext ? { topContext: originalTopContext }
+        : same && old.topContext ? { topContext: old.topContext } : {}),
+      commandId: request.command_id || (same ? old.commandId : null), ended: Boolean(same && old.ended)
+        || Boolean(observedLineage && observedLineage === lineage
+          && event.player.ended === true && event.player.reason === 'ended') };
+    await setLocal(binding, { [WATCH_TERMINAL_KEY]: { version: 1, byScope } });
+  });
+  watchTerminalQueue = queued;
+  return queued;
+}
+
+function completeOriginPage(snapshot) {
+  return snapshot?.readiness === 'ready' && Array.isArray(snapshot.origins)
+    && snapshot.page?.has_more === false && snapshot.page.next === null
+    && Number.isSafeInteger(snapshot.page.origins_total)
+    && snapshot.page.origins_total === snapshot.origins.length;
+}
+
+async function automaticWatchLifecycle(event, binding, userId, natural, snapshot) {
+  if (!natural || watchMutation || !progressEventCurrent(event, binding)
+    || !completeOriginPage(snapshot) || snapshot.foreground.cycle_id !== null) return false;
+  const stopKeys = [watchManualStopKey(userId, snapshot.effective_anime_id, event.tabId),
+    watchManualStopKey(userId, snapshot.effective_anime_id)];
+  const storedStops = await chrome.storage.session.get(stopKeys);
+  if (!progressEventCurrent(event, binding)) return false;
+  for (const stop of Object.values(storedStops)) {
+    if (stop === undefined) continue;
+    if (!stop || !Number.isFinite(stop.observedAt)
+      || !(stop.documentId === null || typeof stop.documentId === 'string')
+      || !(stop.navigationToken === null || typeof stop.navigationToken === 'string')) return false;
+    const sameDocument = stop.documentId === null || (stop.documentId === event.topDocumentId
+      && stop.navigationToken === event.navigationToken);
+    if (sameDocument && !(natural.afterPlay && natural.playObservedAt > stop.observedAt)) return false;
+  }
+  const open = snapshot.origins.filter(origin => origin.state?.current);
+  if (snapshot.totals?.open !== open.length) return false;
+  // Incomplete multi-page origins conservatively require explicit repair/control.
+  // Never start another cycle beside a paused one, even in another history.
+  const command = snapshot.primary_history_id === null && open.length === 0 ? 'initialize'
+    : open.length === 0 ? 'start'
+      : open.length === 1 && natural.afterPlay && open[0].anime_id === event.match.animeId
+        && open[0].state.current.status === 'paused' ? 'resume' : null;
+  if (!command) return false;
+  // Resume continues an existing cycle; only a new Start needs opening proof.
+  if (command !== 'resume') {
+    const barriers = await readWatchTerminals(binding);
+    if (!progressEventCurrent(event, binding)) return false;
+    const barrier = barriers[`${userId}:${snapshot.effective_anime_id}`];
+    // Capacity itself is durable unknown evidence for an unrecorded title.
+    if (!barrier && Object.keys(barriers).length >= 500) return false;
+    if (barrier) {
+      const multiSeries = event.match.type === 'TV' && event.match.releaseStatus === 'FINISHED'
+        && event.match.completionMetadataReady === true && event.match.totalEpisodes >= 2;
+      const currentTopContext = !multiSeries && barrier.topContext && natural.afterPlay
+        ? await watchTopContext(event, binding) : null;
+      if (!progressEventCurrent(event, binding)) return false;
+      const newPlaybackContext = Boolean(currentTopContext && currentTopContext !== barrier.topContext
+        && natural.afterPlay);
+      const release = multiSeries
+        ? Number.isInteger(event.player.episode) && event.player.episode < barrier.episode
+        : (event.match.type === 'MOVIE' || event.match.totalEpisodes === 1)
+          && (barrier.ended || newPlaybackContext);
+      if (!natural.opening || !release) return false;
+    } else if (snapshot.previously_completed) {
+      if (!natural.opening || (event.match.type !== 'MOVIE' && event.player.episode !== 1)) return false;
+    }
+  }
+  const projection = await loadWatchController(event, binding, userId, snapshot);
+  if (!progressEventCurrent(event, binding)) return false;
+  const actions = projection.actions.filter(action => action.command === command);
+  if (actions.length !== 1) return false;
+  await executeWatchCapability(actions[0].capabilityId, binding, undefined, event);
+  // No old observation is progress/Complete in the newly admitted cycle.
+  return true;
+}
+
 async function retryWatchCommand(binding, expectedCommandId) {
   if (watchMutation) throw new Error('history_capability_changed');
   const reservation = Object.freeze({});
   watchMutation = reservation;
+  // An original command receipt cannot leave pre-retry cycle capabilities live.
+  // Revoke them before replay; publication still requires an explicit fresh read.
+  invalidateWatchController();
   // Retry is authorized for the saved original target, not the currently shown anime.
   const journal = createWatchJournal(binding);
   try {
@@ -1469,6 +1714,7 @@ async function retryWatchCommand(binding, expectedCommandId) {
     const delivered = await journal.deliver(account.userId);
     if (!delivered.acknowledged && !delivered.settled) return { ok: false, status: 409, payload: { pending: true } };
     const refreshed = await journal.refresh(account.userId);
+    if (refreshed.refreshed) invalidateWatchController();
     // This receipt is never a current-document projection. UI must explicitly reread.
     return { ok: refreshed.refreshed, status: refreshed.refreshed ? 200 : 409,
       payload: { acknowledged: true, pending: !refreshed.refreshed, originalAnimeId: pending.request.anime_id } };
@@ -1486,18 +1732,22 @@ async function settleWatchCommand(binding, capabilityId) {
   }
   const reservation = Object.freeze({});
   watchMutation = reservation;
-  watchSettlementCapability = null;
+  invalidateWatchController();
+  // The saved capability authorized this reservation before revocation. Track
+  // the new generation so a subsequent account/controller change still fences it.
+  const settlementGeneration = watchControllerGeneration;
   const journal = createWatchJournal(binding);
   try {
     const pending = await journal.pending();
     if (!pending || pending.request.command_id !== capability.commandId) throw new Error('journal_intent_changed');
     const account = await activeSyncAccount(binding);
-    if (account?.userId !== capability.userId || capability.generation !== watchControllerGeneration) {
+    if (account?.userId !== capability.userId || settlementGeneration !== watchControllerGeneration) {
       throw new Error('journal_account_changed');
     }
     const settled = await journal.settle(account.userId);
     if (!settled.settled) return { ok: false, status: 409, payload: { pending: true } };
     const refreshed = await journal.refresh(account.userId);
+    if (refreshed.refreshed) invalidateWatchController();
     // This proves only the saved original command. Never publish it as the
     // currently open document's state or disclose another login's old target.
     return { ok: refreshed.refreshed, status: refreshed.refreshed ? 200 : 409,
@@ -1549,11 +1799,16 @@ async function deliverCapturedCycle(captured, event, binding, userId) {
   try {
     if (await captured.journal.pending()) return false;
     if (!progressEventCurrent(event, binding)) return false;
-    await captured.journal.admit(captured.intent);
+    const request = captured.intent.request;
+    const lineage = request.command === 'complete'
+      ? await watchMediaLineage(event, binding, request.episode, request.duration_sec) : null;
+    const topContext = request.command === 'complete' ? await watchTopContext(event, binding) : null;
+    await captured.journal.admit(captured.intent, lineage || undefined, topContext || undefined);
     const delivered = await captured.journal.deliver(userId);
     if (!delivered.acknowledged) return false;
     const refreshed = await captured.journal.refresh(userId);
     if (!refreshed.refreshed) return false;
+    invalidateWatchController();
     await loadWatchController(event, binding, userId);
     return true;
   } finally {
@@ -1755,7 +2010,7 @@ function progressEventCurrent(event, writeBinding, allowUnpublished = false) {
     && Object.is(Number(live.match?.animeId), Number(event.match.animeId));
 }
 
-async function syncProgressOnce(state, urgent, writeBinding = captureLocalWrite(), event = captureProgressEvent(state), cycleCapture = null) {
+async function syncProgressOnce(state, urgent, writeBinding = captureLocalWrite(), event = captureProgressEvent(state), cycleCapture = null, natural = null) {
   if (!progressEventCurrent(event, writeBinding)) return;
   const match = event.match;
   const player = event.player;
@@ -1765,10 +2020,11 @@ async function syncProgressOnce(state, urgent, writeBinding = captureLocalWrite(
   const now = Date.now();
   const sync = state.progressSync || {};
   const key = `${match.animeId}:${player.episode ?? 'full'}`;
-  if (!urgent && sync.key === key && now - (sync.at || 0) < PROGRESS_MIN_INTERVAL_MS) return;
+  const progressThrottled = (!urgent && sync.key === key && now - (sync.at || 0) < PROGRESS_MIN_INTERVAL_MS)
+    || (sync.key === key && sync.position === Math.round(player.currentTime) && now - (sync.at || 0) < 10_000);
   const position = Math.round(player.currentTime);
   // Дребезг pause/seeked с той же позицией — не дублировать.
-  if (sync.key === key && sync.position === position && now - (sync.at || 0) < 10_000) return;
+  if (progressThrottled && cycleCapture?.intent.request.command === 'progress' && !player.watched) return;
   const trust = await trustedWriteContext(event);
   if (!progressEventCurrent(event, writeBinding)) return;
   if (!trust.ok) {
@@ -1780,7 +2036,20 @@ async function syncProgressOnce(state, urgent, writeBinding = captureLocalWrite(
   requireLocalWrite(writeBinding);
   if (!progressEventCurrent(event, writeBinding)) return;
   if (!syncAccount) return;
+  const historySnapshot = await readWatchHistory(event, writeBinding, syncAccount.userId);
+  if (!progressEventCurrent(event, writeBinding)) return;
+  // An episode threshold is not anime completion. Only current terminal-eligible
+  // catalog/media observations can suppress a later false repeat of this title.
+  if (historySnapshot && player.watched === true
+    && (match.type === 'MOVIE' || match.completionMetadataReady === true)
+    && AniRekoAutoMark.desiredStatus(match, player.episode) === 'completed') {
+    await rememberWatchTerminal(writeBinding, { expected_user_id: syncAccount.userId,
+      expected_effective_anime_id: historySnapshot.effective_anime_id,
+      episode: player.episode ?? null, duration_sec: Math.round(player.duration) }, event);
+    if (!progressEventCurrent(event, writeBinding)) return;
+  }
   if (cycleCapture) {
+    if (progressThrottled && cycleCapture.intent.request.command === 'progress') return;
     try {
       if (await deliverCapturedCycle(cycleCapture, event, writeBinding, syncAccount.userId)
         && progressEventCurrent(event, writeBinding)) state.progressSync = { key, at: now, position };
@@ -1788,6 +2057,14 @@ async function syncProgressOnce(state, urgent, writeBinding = captureLocalWrite(
       if (progressEventCurrent(event, writeBinding)) state.syncWriteFailed = true;
     }
     return;
+  }
+  if (natural && historySnapshot && completeOriginPage(historySnapshot)) {
+    try {
+      if (await automaticWatchLifecycle(event, writeBinding, syncAccount.userId, natural, historySnapshot)) return;
+    } catch {
+      if (progressEventCurrent(event, writeBinding)) state.syncWriteFailed = true;
+      return;
+    }
   }
   if (!await legacyWatchWriteAllowed(event, writeBinding, syncAccount.userId)) {
     const snapshot = await readWatchHistory(event, writeBinding, syncAccount.userId);
@@ -1797,6 +2074,7 @@ async function syncProgressOnce(state, urgent, writeBinding = captureLocalWrite(
     }
     return;
   }
+  if (progressThrottled) return;
   // An awaited admission result can become stale in its caller's microtask.
   // Recheck synchronously before reserving progress and immediately entering POST.
   if (!legacyWatchWriteStillAllowed(event, writeBinding, syncAccount.userId)) return;
@@ -1842,14 +2120,15 @@ async function syncProgressOnce(state, urgent, writeBinding = captureLocalWrite(
   }
 }
 
-function maybeSyncProgress(state, urgent, writeBinding = captureLocalWrite(), liveState = state) {
+function maybeSyncProgress(state, urgent, writeBinding = captureLocalWrite(), liveState = state, previousPlayer = null) {
   const event = captureProgressEvent(state, liveState);
+  const natural = naturalWatchInterval(event, previousPlayer, writeBinding);
   const cycleCapture = captureCycleProgress(event, writeBinding);
   const previous = progressSyncQueues.get(state) || Promise.resolve();
   let queued;
   queued = previous
     .catch(() => {})
-    .then(() => { requireLocalWrite(writeBinding); return syncProgressOnce(state, urgent, writeBinding, event, cycleCapture); })
+    .then(() => { requireLocalWrite(writeBinding); return syncProgressOnce(state, urgent, writeBinding, event, cycleCapture, natural); })
     .finally(() => {
       if (cycleCapture) watchCycleJournals.delete(cycleCapture.journal);
       if (progressSyncQueues.get(state) === queued) progressSyncQueues.delete(state);
@@ -2474,7 +2753,7 @@ async function updateTabState(message, sender, messageContext, writeBinding = ca
       || Boolean(message.watched && !previousPlayer?.watched)
       || (previousPlayer?.episode != null && message.episode != null
         && message.episode !== previousPlayer.episode);
-    maybeSyncProgress(current, urgentSync, writeBinding).catch(() => {});
+    maybeSyncProgress(current, urgentSync, writeBinding, current, previousPlayer).catch(() => {});
   }
   // Fire-and-forget: auto-mark must never block the per-tab message queue.
   if (current.player?.watched) maybeAutoMark(current, writeBinding).catch(() => {});
@@ -2919,7 +3198,13 @@ async function finalizeRemovedTab(tabId, writeBinding = captureLocalWrite()) {
     delete tabQueues[id];
     delete tabStateFlushAt[id];
     invalidateActionPresentation(tabId);
-    if (localWriteCurrent(writeBinding)) await removeSession(writeBinding, storageKey);
+    if (localWriteCurrent(writeBinding)) {
+      await removeSession(writeBinding, storageKey);
+      const stored = await chrome.storage.session.get(null);
+      const ownedStops = Object.keys(stored).filter(key => /^watch-manual-stop:\d+:\d+:\d+$/u.test(key)
+        && key.endsWith(`:${tabId}`));
+      if (ownedStops.length) await removeSession(writeBinding, ownedStops);
+    }
   }
 }
 
@@ -2950,6 +3235,16 @@ if (AniRekoRuntimeConfig.testMode === true) {
       }
     },
     syncProgress: maybeSyncProgress,
+    seedLocalHistory(history) {
+      const binding = captureLocalWrite();
+      // Test fixtures use the real single writer, not an out-of-band storage race.
+      historyQueue = historyQueue.catch(() => {}).then(async () => {
+        await setLocal(binding, { 'watch-history': history });
+        historyCache = null;
+        historyLastFlushAt = 0;
+      });
+      return historyQueue;
+    },
     finalizeRemovedTab,
     stateForTab(tabId) {
       return stateByTab[String(tabId)] || null;

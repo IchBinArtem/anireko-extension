@@ -23,7 +23,10 @@
       || fields.some((key) => !Object.hasOwn(value, key))) throw new Error('journal_invalid');
   }
   function capture(action, request, binding) {
-    exact(binding, ['document_id', 'navigation_token', 'revision']);
+    const hasLineage = binding && Object.hasOwn(binding, 'media_lineage');
+    const hasContext = binding && Object.hasOwn(binding, 'top_context');
+    exact(binding, ['document_id', 'navigation_token', 'revision',
+      ...(hasLineage ? ['media_lineage'] : []), ...(hasContext ? ['top_context'] : [])]);
     for (const key of ['document_id', 'navigation_token']) {
       if (typeof binding[key] !== 'string' || !binding[key] || binding[key].length > 256)
         throw new Error('journal_invalid');
@@ -31,6 +34,10 @@
     if (!Number.isSafeInteger(binding.revision) || binding.revision < 0) throw new Error('journal_invalid');
     const record = { version: 1, action,
       request: global.AniRekoApiClient.historyIntent(action, request), binding: clone(binding), acknowledged: false };
+    if (hasLineage && (typeof binding.media_lineage !== 'string' || !HASH.test(binding.media_lineage)
+      || action !== 'history-command' || record.request.command !== 'complete')) throw new Error('journal_invalid');
+    if (hasContext && (typeof binding.top_context !== 'string' || !HASH.test(binding.top_context)
+      || action !== 'history-command' || record.request.command !== 'complete')) throw new Error('journal_invalid');
     if (new TextEncoder().encode(JSON.stringify(record)).length > MAX_BYTES) throw new Error('journal_full');
     return freeze(record);
   }
@@ -106,9 +113,14 @@
         return intent;
       },
       pending() { return serial(async () => { const value = await read(); return value && freeze(clone(value)); }); },
-      admit(intent) {
+      admit(intent, mediaLineage, topContext) {
         const captured = storedRecord(intent);
         if (captured.version !== 1 || captured.acknowledged) throw new Error('journal_invalid');
+        if (mediaLineage !== undefined) {
+          captured.binding.media_lineage = mediaLineage;
+        }
+        if (topContext !== undefined) captured.binding.top_context = topContext;
+        storedRecord(captured);
         const admittedEpoch = captures.get(intent);
         current(admittedEpoch);
         return serial(async () => {
@@ -134,7 +146,7 @@
           }
           await account(record, userId, admittedEpoch);
           if (record.acknowledged) return { acknowledged: true };
-          const response = await client.request(record.action, clone(record.request));
+          const response = await client.request(record.action, clone(record.request), clone(record.binding));
           current(admittedEpoch);
           const payload = response?.payload;
           const resultIds = record.request.command === 'start'

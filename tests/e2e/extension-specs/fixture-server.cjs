@@ -22,6 +22,8 @@ let failProgressPosts = false;
 let holdTasteResponses = false;
 const pendingTasteResponses = [];
 let cycleHistoryEnabled = false;
+let cycleMovie = false;
+let cycleCompleted = 1;
 let cycleRepairEnabled = false;
 let cycleLoseNextAck = false;
 let cycleLoseSettlementAck = false;
@@ -35,13 +37,15 @@ const cycleId = '33333333-3333-4333-8333-333333333333';
 function cycleSnapshot(animeId, page = null) {
   const state = { anime_id: animeId, version: cycleVersion, current: cycleCurrent,
     previously_completed: true, history_before_tracking_unknown: false,
-    lifetime_completed_count: 1, tracked_completed_count: 1, completed_count_lower_bound: 1 };
+    lifetime_completed_count: cycleCompleted, tracked_completed_count: cycleCompleted, completed_count_lower_bound: cycleCompleted };
   const snapshot = { user_id: sessionUser.id, requested_anime_id: animeId, effective_anime_id: animeId,
     history_adopted: cycleHistoryEnabled, readiness: 'ready',
     foreground: { anime_id: animeId, generation: cycleGeneration, cycle_id: cycleCurrent?.status === 'active' ? cycleId : null },
     ...(cycleHistoryEnabled ? { primary_history_id: cycleHistoryId, start_anime_id: animeId,
       start_state: state, previously_completed: true, reconciliation_token: 'a'.repeat(64),
-      origins: cycleCurrent ? [{ history_id: cycleHistoryId, anime_id: animeId, state }] : [] } : {}) };
+      origins: cycleCurrent ? [{ history_id: cycleHistoryId, anime_id: animeId, state }] : [],
+      totals: { started: cycleCurrent ? 2 : 1, completed: cycleCompleted, cancelled: 0, open: cycleCurrent ? 1 : 0 },
+      page: { has_more: false, next: null, origins_total: cycleCurrent ? 1 : 0 } } : {}) };
   if (cycleRepairEnabled) {
     const related = animeId + 1000;
     const rows = [animeId, related].flatMap((group, index) => [1, 2].map(number => ({
@@ -398,6 +402,7 @@ const server = http.createServer((request, response) => {
   if (request.url.startsWith('/__test/cycle-history')) {
     cycleHistoryEnabled = true;
     const settings = new URL(request.url, 'http://localhost').searchParams;
+    if (settings.get('movie') === '1') cycleMovie = true;
     if (settings.get('repair') === '1') cycleRepairEnabled = true;
     if (settings.get('lostAck') === '1') { cycleLoseNextAck = true; cycleLoseSettlementAck = true; }
     response.writeHead(200, { 'content-type': 'application/json' });
@@ -467,6 +472,12 @@ const server = http.createServer((request, response) => {
         cycleGeneration++;
       } else if (payload.command === 'pause' && cycleCurrent?.status === 'active') {
         cycleCurrent = { ...cycleCurrent, status: 'paused' }; cycleGeneration++;
+      } else if (payload.command === 'cancel' && cycleCurrent !== null) {
+        cycleCurrent = null; cycleGeneration++;
+      } else if (payload.command === 'complete' && cycleCurrent?.status === 'active') {
+        cycleCurrent = null; cycleGeneration++; cycleCompleted++;
+      } else if (payload.command === 'resume' && cycleCurrent?.status === 'paused') {
+        cycleCurrent = { ...cycleCurrent, status: 'active' }; cycleGeneration++;
       } else if (payload.command === 'progress' && cycleCurrent?.status === 'active') {
         cycleCurrent = { ...cycleCurrent, episode: payload.episode, position_sec: payload.position_sec,
           duration_sec: payload.duration_sec, voice: payload.voice };
@@ -499,7 +510,10 @@ const server = http.createServer((request, response) => {
       release_status: 'ONGOING',
       exact_alias_match: true,
     };
-    const data = /Honzuki no Gekokujou:.*4th Season$/iu.test(query)
+    const data = cycleMovie && /расхититель гробниц/iu.test(query)
+      ? [{ id: 4242, title: 'Расхититель гробниц', type: 'MOVIE', episodes: 1,
+        release_status: 'FINISHED', exact_alias_match: true }]
+      : /Honzuki no Gekokujou:.*4th Season$/iu.test(query)
       ? [bookwormFourth]
       : /власть книжного червя/iu.test(query)
         ? [
@@ -766,7 +780,8 @@ const server = http.createServer((request, response) => {
     return;
   }
   if (request.url.startsWith('/__test/reset')) {
-    cycleHistoryEnabled = false; cycleRepairEnabled = false; cycleCurrent = null; cycleVersion = 0; cycleGeneration = 0; cyclePosts.length = 0;
+    cycleHistoryEnabled = false; cycleMovie = false; cycleCompleted = 1;
+    cycleRepairEnabled = false; cycleCurrent = null; cycleVersion = 0; cycleGeneration = 0; cyclePosts.length = 0;
     cycleLoseNextAck = false; cycleLoseSettlementAck = false; cycleSettlementPosts.length = 0;
     releaseTasteResponses();
     sessionUser = null;
