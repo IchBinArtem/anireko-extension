@@ -4,7 +4,7 @@ const path = require('node:path');
 const vm = require('node:vm');
 const test = require('node:test');
 
-async function render({ match, records, playing = false, bulk = {}, syncAccountActive = false, watchProjection = null, transition = null, duringLoad = null }) {
+async function render({ match, records, playing = false, bulk = {}, syncAccountActive = false, currentUserId = 18, watchProjection = null, transition = null, duringLoad = null }) {
   const source = fs.readFileSync(path.join(__dirname, '..', 'popup.js'), 'utf8');
   const start = source.indexOf('  async function renderResume(force) {');
   const end = source.indexOf('  renderResume(false);', start);
@@ -18,6 +18,7 @@ async function render({ match, records, playing = false, bulk = {}, syncAccountA
     player: { playing },
     match,
     syncAccountActive,
+    currentUserId,
     watchProjection,
     recognition: { title: 'Naruto' },
     stored: { 'watch-history': { records } },
@@ -40,6 +41,117 @@ async function render({ match, records, playing = false, bulk = {}, syncAccountA
 }
 
 const history = (animeId, position = 600) => ({ animeId, position, episode: 3, lastWatchedAt: 1 });
+
+function cycleResumeProjection(status = 'paused') {
+  const current = { cycle_id: '33333333-3333-4333-8333-333333333333', status,
+    kind: 'rewatching', tracked_start_ordinal: 2, episode: 1, position_sec: 1371,
+    duration_sec: 1500, voice: 'Dream Cast' };
+  const origin = { history_id: '22222222-2222-4222-8222-222222222222', anime_id: 101,
+    state: { anime_id: 101, version: 3, current } };
+  return { pending: false, snapshot: { user_id: 18, requested_anime_id: 101, effective_anime_id: 101,
+    history_adopted: true, readiness: 'ready', origins: [origin],
+    foreground: { anime_id: 101, generation: 4, cycle_id: status === 'active' ? current.cycle_id : null },
+    page: { has_more: false, next: null, origins_total: 1 }, cycles: [{
+      history_id: origin.history_id, cycle: { ...current, anime_id: 101,
+        started_at: '2026-10-04T12:00:00Z', updated_at: '2026-10-05T12:00:00Z', ended_at: null },
+    }] } };
+}
+
+const renderCycleResume = (watchProjection, options = {}) => render({ match: { status: 'ok', animeId: 101 },
+  records: { 'naruto::old': history(101, 600) }, bulk: { 101: { episode: 99, position_sec: 900, voice: 'Old cycle' } },
+  syncAccountActive: true, watchProjection, ...options });
+
+test('current active and sole paused cycle restore episode, position and voice without borrowing legacy', async () => {
+  for (const status of ['active', 'paused']) {
+    const resume = await renderCycleResume(cycleResumeProjection(status));
+    assert.equal(resume.hidden, false);
+    assert.ok(resume.textContent.startsWith('episodeLabel:1 · 22:51 · Dream Cast'));
+    assert.ok(resume.textContent.includes('resumeCycleUpdated:'), 'date is explicitly cycle-update time');
+    assert.equal(resume.textContent.includes('Old cycle'), false);
+  }
+});
+
+test('cycle position survives an absent or mismatched historical timestamp row', async () => {
+  for (const mode of ['absent', 'voice', 'status', 'identity', 'invalidDate']) {
+    const projection = cycleResumeProjection();
+    if (mode === 'absent') projection.snapshot.cycles = [];
+    if (mode === 'voice') projection.snapshot.cycles[0].cycle.voice = 'Other voice';
+    if (mode === 'status') projection.snapshot.cycles[0].cycle.status = 'active';
+    if (mode === 'identity') projection.snapshot.cycles[0].history_id = '44444444-4444-4444-8444-444444444444';
+    if (mode === 'invalidDate') projection.snapshot.cycles[0].cycle.updated_at = '2026-02-30T12:00:00Z';
+    const resume = await renderCycleResume(projection);
+    assert.equal(resume.hidden, false, mode);
+    assert.equal(resume.textContent, 'episodeLabel:1 · 22:51 · Dream Cast', mode);
+  }
+});
+
+test('off-page active foreground can use its selected origin without requiring a historical page', async () => {
+  const projection = cycleResumeProjection('active');
+  projection.snapshot.selected_origin = projection.snapshot.origins[0];
+  projection.snapshot.origins = [];
+  projection.snapshot.page.has_more = true;
+  projection.snapshot.cycles = [];
+  const resume = await renderCycleResume(projection);
+  assert.equal(resume.hidden, false);
+  assert.equal(resume.textContent, 'episodeLabel:1 · 22:51 · Dream Cast');
+});
+
+test('unknown, foreign, pending and reconciliation snapshots clear cycle resume', async () => {
+  for (const mode of ['account', 'anime', 'related', 'pending', 'reconciliation', 'unknown', 'playing']) {
+    const projection = cycleResumeProjection('active');
+    if (mode === 'account') projection.snapshot.user_id = 953;
+    if (mode === 'anime') projection.snapshot.requested_anime_id = 202;
+    if (mode === 'related') {
+      projection.snapshot.origins[0].anime_id = 202;
+      projection.snapshot.origins[0].state.anime_id = 202;
+    }
+    if (mode === 'pending') projection.pending = true;
+    if (mode === 'reconciliation') projection.snapshot.readiness = 'reconciliation_required';
+    if (mode === 'unknown') delete projection.snapshot.history_adopted;
+    const resume = await renderCycleResume(projection, { playing: mode === 'playing' });
+    assert.equal(resume.hidden, true, mode);
+    assert.equal(resume.textContent, '', mode);
+  }
+});
+
+test('paused resume requires complete consistent origins and one unambiguous open cycle', async () => {
+  for (const mode of ['more', 'missingPage', 'total', 'missingTotal', 'next', 'multiple', 'conflictingDuplicate']) {
+    const projection = cycleResumeProjection();
+    if (mode === 'more') projection.snapshot.page.has_more = true;
+    if (mode === 'missingPage') delete projection.snapshot.page;
+    if (mode === 'total') projection.snapshot.page.origins_total = 2;
+    if (mode === 'missingTotal') delete projection.snapshot.page.origins_total;
+    if (mode === 'next') projection.snapshot.page.next = { after_origin: {} };
+    if (mode === 'multiple') {
+      projection.snapshot.origins.push({ ...projection.snapshot.origins[0],
+        history_id: '44444444-4444-4444-8444-444444444444',
+        state: { ...projection.snapshot.origins[0].state, current: {
+          ...projection.snapshot.origins[0].state.current, cycle_id: '55555555-5555-4555-8555-555555555555' } } });
+      projection.snapshot.page.origins_total = 2;
+    }
+    if (mode === 'conflictingDuplicate') projection.snapshot.selected_origin = {
+      ...projection.snapshot.origins[0], state: { ...projection.snapshot.origins[0].state,
+        current: { ...projection.snapshot.origins[0].state.current, position_sec: 80 } } };
+    const resume = await renderCycleResume(projection);
+    assert.equal(resume.hidden, true, mode);
+    assert.equal(resume.textContent, '', mode);
+  }
+  const duplicate = cycleResumeProjection();
+  duplicate.snapshot.selected_origin = JSON.parse(JSON.stringify(duplicate.snapshot.origins[0]));
+  assert.equal((await renderCycleResume(duplicate)).hidden, false, 'identical selected-origin duplication is not ambiguity');
+});
+
+test('cycle resume rejects malformed, terminal and zero-position current projections', async () => {
+  for (const [field, value] of [['position_sec', '1371'], ['position_sec', true], ['position_sec', 0],
+    ['position_sec', NaN], ['position_sec', -1], ['position_sec', 259201], ['episode', false],
+    ['status', 'completed'], ['status', 'cancelled'], ['cycle_id', 'not-a-cycle'], ['voice', {}]]) {
+    const projection = cycleResumeProjection();
+    projection.snapshot.origins[0].state.current[field] = value;
+    const resume = await renderCycleResume(projection);
+    assert.equal(resume.hidden, true, field + ':' + value);
+    assert.equal(resume.textContent, '');
+  }
+});
 
 test('actual repair renderer requires a human choice in every group and preserves text-only labels', async () => {
   const source = fs.readFileSync(path.join(__dirname, '..', 'popup.js'), 'utf8').replace(/\r\n/g, '\n');
@@ -66,7 +178,7 @@ test('actual repair renderer requires a human choice in every group and preserve
     repairComplete: true, actions: [{ command: 'reconcile', capabilityId: 'opaque-choice', groups }] };
   const mutations = [];
   const context = vm.createContext({ matchConfirmed: true, syncAccountActive: true, tab: { id: 71 },
-    watchProjection: null, pauseSessionStateReload: false,
+    watchProjection: null, pauseSessionStateReload: false, renderResume: async () => {},
     watchCard: elements.get('watch-cycle-card'), watchActions: elements.get('watch-actions'),
     watchFeedback: elements.get('watch-feedback'),
     set: (id, value) => { elements.get(id).textContent = value; },
@@ -137,7 +249,7 @@ test('actual cycle renderer retains completion and shows only component tracked 
   snapshot.origins[0].state = snapshot.start_state;
   const projection = { snapshot, actions: [] };
   const context = vm.createContext({ matchConfirmed: true, syncAccountActive: true, tab: { id: 71 },
-    watchProjection: null, pauseSessionStateReload: false,
+    watchProjection: null, pauseSessionStateReload: false, renderResume: async () => {},
     watchCard: elements.get('watch-cycle-card'), watchActions: elements.get('watch-actions'),
     watchFeedback: elements.get('watch-feedback'),
     set: (id, value) => { elements.get(id).textContent = value; },

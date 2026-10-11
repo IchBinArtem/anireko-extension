@@ -12,7 +12,7 @@ function deferred() {
   const promise = new Promise(done => { resolve = done; });
   return { promise, resolve };
 }
-function popup({ account, projection, staleDocument = false, tasteUser = 18, tasteAnime = 1, cooldownAt = 0 } = {}) {
+function popup({ account, projection, syncReply, staleDocument = false, tasteUser = 18, tasteAnime = 1, cooldownAt = 0 } = {}) {
   const elements = new Map();
   function element(id) {
     const node = { textContent: '', hidden: ['resume', 'resume-label', 'watch-cycle-card'].includes(id),
@@ -57,7 +57,8 @@ function popup({ account, projection, staleDocument = false, tasteUser = 18, tas
         if (message.type === 'popup-runtime-info') return { ok: true,
           payload: { siteBase: 'https://anireko.com', localWriteRevision: 'initial' } };
         if (message.type === 'popup-session-info') return typeof account === 'function' ? account() : account;
-        if (message.type === 'popup-watch-history') return projection;
+        if (message.type === 'popup-watch-history') return typeof projection === 'function' ? projection() : projection;
+        if (message.type === 'popup-sync-current') return typeof syncReply === 'function' ? syncReply() : syncReply;
         if (message.type === 'popup-progress-all') return { ok: true, payload: { progress_all: {} } };
         throw new Error('unexpected request ' + message.type);
       } },
@@ -164,5 +165,59 @@ test('unknown or malformed adopted history keeps legacy resume hidden on opening
     assert.equal(ui.get('resume').hidden, true);
     assert.equal(ui.get('resume').textContent, '');
     assert.ok(!ui.calls.some(call => call.type === 'popup-progress-all'));
+  }
+});
+
+function currentCycleHistory() {
+  const current = { cycle_id: '33333333-3333-4333-8333-333333333333', status: 'active',
+    kind: 'watching', tracked_start_ordinal: 1, episode: 1, position_sec: 1371,
+    duration_sec: 1500, voice: 'Dream Cast' };
+  return { ok: true, payload: { pending: false, actions: [], snapshot: {
+    user_id: 18, requested_anime_id: 1, effective_anime_id: 1, history_adopted: true,
+    readiness: 'ready', origins: [{ history_id: '22222222-2222-4222-8222-222222222222',
+      anime_id: 1, state: { anime_id: 1, version: 3, current } }],
+    foreground: { anime_id: 1, generation: 4, cycle_id: current.cycle_id },
+    page: { has_more: false, next: null, origins_total: 1 }, cycles: [],
+  } } };
+}
+
+test('full popup restores current resume after every no-write Sync terminal path by a fresh read', async () => {
+  for (const syncReply of [
+    { ok: true, payload: { progressSynced: false, statusSynced: false, writeFailed: false } },
+    { ok: true, payload: { confirmationRequired: true, animeTitle: 'Current anime' } },
+    { ok: true, payload: { writeFailed: true } },
+    { ok: false, payload: { error: 'offline' } },
+    () => Promise.reject(new Error('transport failed')),
+  ]) {
+    const ui = popup({ account: authorized(18), projection: currentCycleHistory(), syncReply });
+    await ui.done; await tick();
+    assert.equal(ui.get('resume').hidden, false);
+    await ui.get('resume-sync').events.click();
+    assert.equal(ui.get('resume').hidden, false, 'unchanged current cycle remains available');
+    assert.equal(ui.get('resume').textContent, 'episodeLabel:1 · 22:51 · Dream Cast');
+    assert.equal(ui.calls.filter(call => call.type === 'popup-watch-history').length, 2);
+    assert.equal(ui.calls.filter(call => call.type === 'popup-sync-current').length, 1);
+    assert.ok(!ui.calls.some(call => /command|retry|update-preferences/.test(call.type)));
+  }
+});
+
+test('no-write Sync does not restore a stale cycle when its fresh read becomes pending or foreign', async () => {
+  for (const mode of ['pending', 'foreign', 'offline']) {
+    let reads = 0;
+    const ui = popup({ account: authorized(18), syncReply: { ok: true, payload: {} },
+      projection: () => {
+        if (++reads === 1) return currentCycleHistory();
+        if (mode === 'offline') return Promise.reject(new Error('offline'));
+        const fresh = currentCycleHistory();
+        if (mode === 'pending') fresh.payload.pending = true;
+        if (mode === 'foreign') fresh.payload.snapshot.user_id = 953;
+        return fresh;
+      } });
+    await ui.done; await tick();
+    assert.equal(ui.get('resume').hidden, false);
+    await ui.get('resume-sync').events.click();
+    assert.equal(reads, 2, mode);
+    assert.equal(ui.get('resume').hidden, true, mode);
+    assert.equal(ui.get('resume').textContent, '', mode);
   }
 });

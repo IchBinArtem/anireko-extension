@@ -60,6 +60,7 @@
   "locally": { "message": "local" },
   "lastSevenDaysAria": { "message": "Viewing over the last 7 days" },
   "resumeLabel": { "message": "Continue from" },
+  "resumeCycleUpdated": { "message": "Cycle updated: $WHEN$", "placeholders": { "when": { "content": "$1" } } },
   "localHistoryHint": { "message": "Viewing history is stored locally. For recognition, AniReko receives a cleaned title, not the full page address." },
   "checkingAccount": { "message": "Checking account…" },
   "loginOnSite": { "message": "Sign in on the website" },

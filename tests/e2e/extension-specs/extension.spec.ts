@@ -243,6 +243,66 @@ async function localPopupPage() {
   return { page, tabId };
 }
 
+for (const status of ['active', 'paused', 'noDate'] as const) {
+  test(`popup current-cycle resume restores saved position and voice (${status})`, async ({}, testInfo) => {
+    const { page, tabId } = await localPopupPage();
+    let popup: Page | null = null;
+    try {
+      await worker.evaluate(async (mode) => {
+        const base = (globalThis as any).AniRekoRuntimeConfig.apiBase;
+        await fetch(base + '/__test/cycle-history?resume=' + (mode === 'noDate' ? 'paused&noDate=1' : mode));
+      }, status);
+      popup = await openPopup(tabId);
+      await expect(popup.locator('#resume-label')).toHaveText('Где остановился');
+      await expect(popup.locator('#resume')).toBeVisible();
+      await expect(popup.locator('#resume')).toContainText('Серия 1 · 22:51 · Dream Cast');
+      if (status === 'noDate') await expect(popup.locator('#resume')).toHaveText('Серия 1 · 22:51 · Dream Cast');
+      else await expect(popup.locator('#resume')).toContainText('Цикл обновлён:');
+      const commands = () => worker.evaluate(async () => (await (await fetch(
+        (globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/cycle-history')).json()).posts);
+      expect(await commands()).toEqual([], 'read-only resume opening cannot start, adopt or migrate');
+      await popup.setViewportSize({ width: 390, height: 850 });
+      await testInfo.attach('current-cycle-resume', { body: await popup.screenshot({ fullPage: true }), contentType: 'image/png' });
+      if (status === 'active') {
+        await popup.getByText('Управление вручную', { exact: true }).click();
+        await popup.getByRole('button', { name: /^Приостановить просмотр/ }).click();
+        await expect(popup.locator('#watch-current')).toContainText('Просмотр на паузе');
+        await expect(popup.locator('#resume')).toContainText('Серия 1 · 22:51 · Dream Cast');
+        expect((await commands()).map((item: any) => item.command)).toEqual(['pause']);
+      }
+      await popup.close();
+      popup = await openPopup(tabId);
+      await expect(popup.locator('#resume')).toContainText('Серия 1 · 22:51 · Dream Cast');
+    } finally {
+      await popup?.close();
+      await page.close();
+    }
+  });
+}
+
+test('popup manual Sync refreshes the authoritative cycle resume in the same popup', async () => {
+  const { page, tabId } = await localPopupPage();
+  let popup: Page | null = null;
+  try {
+    await worker.evaluate(async () => { await fetch(
+      (globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/cycle-history?resume=active'); });
+    popup = await openPopup(tabId);
+    await expect(popup.locator('#resume')).toContainText('22:51 · Dream Cast');
+    await expect(popup.locator('#resume-sync')).toBeEnabled();
+    await popup.locator('#resume-sync').click();
+    await expect(popup.locator('#resume-sync')).toHaveText('✓ обновлено');
+    await expect(popup.locator('#resume')).toContainText('Серия 2 · 0:01 · AniTime Voice');
+    await expect(popup.locator('#resume')).not.toContainText('Dream Cast');
+    const commands = await worker.evaluate(async () => (await (await fetch(
+      (globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/cycle-history')).json()).posts);
+    expect(commands.filter((item: any) => item.command === 'progress')).toHaveLength(1);
+    expect(commands.find((item: any) => item.command === 'progress')).toMatchObject({ episode: 2, position_sec: 1, voice: 'AniTime Voice' });
+  } finally {
+    await popup?.close();
+    await page.close();
+  }
+});
+
 for (const kind of ['session', 'history'] as const) {
   for (const warm of [false, true]) {
     test(`popup local fields precede held ${kind} HTTP response (${warm ? 'warm' : 'cold'})`, async ({}, testInfo) => {

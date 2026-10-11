@@ -60,6 +60,7 @@
   "locally": { "message": "локально" },
   "lastSevenDaysAria": { "message": "Просмотр за последние 7 дней" },
   "resumeLabel": { "message": "Где остановился" },
+  "resumeCycleUpdated": { "message": "Цикл обновлён: $WHEN$", "placeholders": { "when": { "content": "$1" } } },
   "localHistoryHint": { "message": "История просмотра хранится локально. Для распознавания AniReko получает очищенное название, но не полный адрес страницы." },
   "checkingAccount": { "message": "Проверяем аккаунт…" },
   "loginOnSite": { "message": "Войти на сайте" },

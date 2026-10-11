@@ -7,6 +7,15 @@ browser activity before waiting for account/history reads. Account checks remain
 fresh; personalized taste requires the matching freshly checked user/anime tuple.
 Account/history/resume phases remain ordered, with no new request, POST or retry on
 popup open. Unknown/adopted history still suppresses legacy resume.
+Adopted resume reads the existing account/anime-bound current-cycle projection:
+the exact active foreground, or one paused origin after a complete, count-consistent
+origin enumeration. Conflicts, pending commands and unknown history hide it.
+The optional exact matching historical row provides cycle update time, explicitly
+labelled as such; missing historical pagination does not hide current position.
+Cycle actions and every terminal manual Sync result (including no-op, cancellation
+and error) refresh the same history projection; failed reads keep resume cleared.
+the old projection is cleared before a command or read. No startup POST or
+cross-extension-ID migration is introduced.
 
 | Action | Data sent | Condition |
 |---|---|---|

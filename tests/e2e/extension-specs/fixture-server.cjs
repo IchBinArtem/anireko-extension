@@ -50,6 +50,8 @@ let cycleLoseNextAck = false;
 let cycleLoseSettlementAck = false;
 const cycleSettlementPosts = [];
 let cycleCurrent = null;
+let cycleUpdatedAt = null;
+let cycleOmitDate = false;
 let cycleVersion = 0;
 let cycleGeneration = 0;
 const cyclePosts = [];
@@ -67,6 +69,10 @@ function cycleSnapshot(animeId, page = null) {
       origins: cycleCurrent ? [{ history_id: cycleHistoryId, anime_id: animeId, state }] : [],
       totals: { started: cycleCurrent ? 2 : 1, completed: cycleCompleted, cancelled: 0, open: cycleCurrent ? 1 : 0 },
       page: { has_more: false, next: null, origins_total: cycleCurrent ? 1 : 0 } } : {}) };
+  if (cycleHistoryEnabled && cycleCurrent && !cycleOmitDate) {
+    snapshot.cycles = [{ history_id: cycleHistoryId, cycle: { ...cycleCurrent, anime_id: animeId,
+      started_at: '2026-10-04T12:00:00Z', updated_at: cycleUpdatedAt, ended_at: null } }];
+  }
   if (cycleRepairEnabled) {
     const related = animeId + 1000;
     const rows = [animeId, related].flatMap((group, index) => [1, 2].map(number => ({
@@ -440,6 +446,13 @@ const server = http.createServer((request, response) => {
   if (request.url.startsWith('/__test/cycle-history')) {
     cycleHistoryEnabled = true;
     const settings = new URL(request.url, 'http://localhost').searchParams;
+    if (['active', 'paused'].includes(settings.get('resume'))) {
+      cycleCurrent = { cycle_id: cycleId, status: settings.get('resume'), kind: 'rewatching',
+        tracked_start_ordinal: 2, episode: 1, position_sec: 1371, duration_sec: 1500, voice: 'Dream Cast' };
+      cycleVersion++; cycleGeneration++;
+      cycleUpdatedAt = '2026-10-05T12:00:00Z';
+      cycleOmitDate = settings.get('noDate') === '1';
+    }
     if (settings.get('movie') === '1') cycleMovie = true;
     if (settings.get('repair') === '1') cycleRepairEnabled = true;
     if (settings.get('lostAck') === '1') { cycleLoseNextAck = true; cycleLoseSettlementAck = true; }
@@ -525,6 +538,7 @@ const server = http.createServer((request, response) => {
         response.writeHead(409, { 'content-type': 'application/json' }); response.end('{}'); return;
       }
       cycleVersion++;
+      cycleUpdatedAt = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
       const snapshot = cycleSnapshot(payload.anime_id);
       if (cycleLoseNextAck) {
         cycleLoseNextAck = false; response.writeHead(500); response.end('{}'); return;
@@ -844,6 +858,7 @@ const server = http.createServer((request, response) => {
     }
     cycleHistoryEnabled = false; cycleMovie = false; cycleCompleted = 1;
     cycleRepairEnabled = false; cycleCurrent = null; cycleVersion = 0; cycleGeneration = 0; cyclePosts.length = 0;
+    cycleUpdatedAt = null; cycleOmitDate = false;
     cycleLoseNextAck = false; cycleLoseSettlementAck = false; cycleSettlementPosts.length = 0;
     releaseTasteResponses();
     sessionUser = null;

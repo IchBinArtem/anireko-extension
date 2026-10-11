@@ -614,6 +614,8 @@
   const watchActions = document.getElementById('watch-actions');
   async function renderWatchCycle() {
     if (!matchConfirmed || !syncAccountActive) return;
+    watchProjection = null;
+    await renderResume(false);
     watchCard.hidden = false;
     const manualWasOpen = Array.from(watchActions.children).some(node => node.tagName === 'DETAILS' && node.open);
     watchActions.replaceChildren();
@@ -661,6 +663,8 @@
         for (const button of watchActions.querySelectorAll('button')) button.disabled = true;
         pauseSessionStateReload = true;
         watchFeedback.textContent = t('syncUpdating');
+        watchProjection = null;
+        await renderResume(false);
         try {
           const result = await requestBackground(type, input);
           if (!result?.ok) throw new Error('command_unresolved');
@@ -668,6 +672,7 @@
         } catch { watchFeedback.textContent = t('watchCommandUnresolved'); }
         finally {
           await renderWatchCycle();
+          await renderResume(false);
           pauseSessionStateReload = false;
         }
       };
@@ -804,7 +809,6 @@
     document.getElementById('resume').hidden = true;
     document.getElementById('resume').textContent = '';
     if (!animeFound || player?.playing) return;
-    if (syncAccountActive && watchProjection?.snapshot?.history_adopted !== false) return;
     const confirmedAnimeId = match?.status === 'ok'
       ? (typeof match.animeId === 'number' || typeof match.animeId === 'string' ? Number(match.animeId) : NaN)
       : null;
@@ -825,7 +829,68 @@
       return new Date(ts).toLocaleDateString(dateLocale);
     };
     let resume = null;
-    if (confirmedAnimeId !== null) {
+    const cycleOwned = syncAccountActive && watchProjection?.snapshot?.history_adopted !== false;
+    if (cycleOwned) {
+      const snapshot = watchProjection?.snapshot;
+      if (confirmedAnimeId === null || snapshot?.history_adopted !== true
+        || snapshot.readiness !== 'ready' || watchProjection.pending
+        || snapshot.user_id !== currentUserId || snapshot.requested_anime_id !== confirmedAnimeId
+        || !Number.isSafeInteger(currentUserId) || currentUserId < 1
+        || !Array.isArray(snapshot.origins)) return;
+      const uuid = (value) => typeof value === 'string'
+        && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+      const origins = new Map();
+      for (const origin of [...snapshot.origins, ...(snapshot.selected_origin ? [snapshot.selected_origin] : [])]) {
+        if (!uuid(origin?.history_id) || !Number.isSafeInteger(origin.anime_id) || origin.anime_id < 1
+          || origin.state?.anime_id !== origin.anime_id || !Number.isSafeInteger(origin.state.version)
+          || origin.state.version < 0) return;
+        const current = origin.state.current;
+        if (current !== null && (!current || !uuid(current.cycle_id)
+          || !['active', 'paused'].includes(current.status)
+          || !['watching', 'rewatching'].includes(current.kind)
+          || !Number.isSafeInteger(current.position_sec) || current.position_sec < 0 || current.position_sec > 259200
+          || (current.episode !== null && (!Number.isSafeInteger(current.episode) || current.episode < 1 || current.episode > 5000))
+          || (current.voice !== null && (typeof current.voice !== 'string' || Array.from(current.voice).length > 100)))) return;
+        const key = origin.history_id + ':' + origin.anime_id;
+        const signature = JSON.stringify([origin.state.version, current && [
+          current.cycle_id, current.status, current.kind, current.tracked_start_ordinal,
+          current.episode, current.position_sec, current.duration_sec, current.voice]]);
+        if (origins.has(key) && origins.get(key).signature !== signature) return;
+        origins.set(key, { origin, signature });
+      }
+      const open = [...origins.values()].map(({ origin }) => origin).filter(origin => origin.state.current);
+      const foreground = snapshot.foreground?.cycle_id;
+      let selected = null;
+      if (uuid(foreground)) {
+        const matches = open.filter(origin => origin.anime_id === confirmedAnimeId
+          && origin.state.current.status === 'active' && origin.state.current.cycle_id === foreground);
+        if (matches.length !== 1) return;
+        selected = matches[0];
+      } else if (foreground === null) {
+        const page = snapshot.page;
+        if (page?.has_more !== false || page.next !== null || !Number.isSafeInteger(page.origins_total)
+          || page.origins_total !== origins.size || open.length !== 1
+          || open[0].anime_id !== confirmedAnimeId || open[0].state.current.status !== 'paused') return;
+        selected = open[0];
+      } else return;
+      const current = selected.state.current;
+      if (current.position_sec <= 0) return;
+      resume = { episode: current.episode, position: current.position_sec, voice: current.voice,
+        at: NaN, cycle: true };
+      // Historical pagination can omit this row. Its update time is not watch time.
+      const rows = (Array.isArray(snapshot.cycles) ? snapshot.cycles : []).filter(row =>
+        row?.history_id === selected.history_id && row.cycle?.anime_id === selected.anime_id
+        && row.cycle.cycle_id === current.cycle_id && row.cycle.status === current.status
+        && ['episode', 'position_sec', 'duration_sec', 'voice'].every(field => row.cycle[field] === current[field]));
+      const updatedAt = rows.length === 1 ? rows[0].cycle.updated_at : null;
+      if (typeof updatedAt === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(updatedAt)) {
+        const timestamp = Date.parse(updatedAt);
+        if (Number.isFinite(timestamp) && new Date(timestamp).toISOString().replace('.000Z', 'Z') === updatedAt) {
+          resume.at = timestamp;
+        }
+      }
+    }
+    if (!cycleOwned && confirmedAnimeId !== null) {
       const bulk = await loadResumeBulk(force);
       const progress = bulk.byAnime?.[confirmedAnimeId];
       if (progress) {
@@ -837,7 +902,7 @@
         };
       }
     }
-    if (!resume) {
+    if (!cycleOwned && !resume) {
       const titleKey = String(recognition.title).toLocaleLowerCase().replace(/\s+/gu, ' ').trim();
       const records = Object.entries(stored['watch-history']?.records || {})
         .filter(([recordKey, record]) => confirmedAnimeId !== null
@@ -857,14 +922,14 @@
       }
     }
     // A Start/adoption read can finish while the older bulk read awaits.
-    if (syncAccountActive && watchProjection?.snapshot?.history_adopted !== false) return;
+    if (!cycleOwned && syncAccountActive && watchProjection?.snapshot?.history_adopted !== false) return;
     if (!resume) return;
     const parts = [];
     if (resume.episode != null) parts.push(t('episodeLabel', String(resume.episode)));
     parts.push(fmtTime(resume.position));
     if (resume.voice) parts.push(resume.voice);
     const when = fmtWhen(resume.at);
-    if (when) parts.push(when);
+    if (when) parts.push(resume.cycle ? t('resumeCycleUpdated', when) : when);
     document.getElementById('resume-label').hidden = false;
     const resumeElement = document.getElementById('resume');
     resumeElement.hidden = false;
@@ -894,7 +959,10 @@
       pauseSessionStateReload = true;
       syncButton.disabled = true;
       syncButton.textContent = t('syncUpdating');
+      watchProjection = null;
+      await renderResume(false);
       const resumeSessionReload = () => setTimeout(() => { pauseSessionStateReload = false; }, 500);
+      let refreshLegacyBulk = false;
       try {
         let currentResponse = await requestBackground('popup-sync-current', {
           tabId: tab?.id,
@@ -908,7 +976,6 @@
             syncButton.textContent = t('syncButton');
             syncButton.disabled = syncButton.dataset.accountAllowed !== '1';
           }, 2500);
-          resumeSessionReload();
           return;
         }
         if (currentResponse.payload?.confirmationRequired === true) {
@@ -918,7 +985,6 @@
           if (!accepted) {
             syncButton.textContent = t('syncButton');
             syncButton.disabled = syncButton.dataset.accountAllowed !== '1';
-            resumeSessionReload();
             return;
           }
           currentResponse = await requestBackground('popup-sync-current', {
@@ -932,7 +998,6 @@
               syncButton.textContent = t('syncButton');
               syncButton.disabled = syncButton.dataset.accountAllowed !== '1';
             }, 2500);
-            resumeSessionReload();
             return;
           }
         }
@@ -944,7 +1009,6 @@
             syncButton.textContent = t('syncButton');
             syncButton.disabled = syncButton.dataset.accountAllowed !== '1';
           }, 2500);
-          resumeSessionReload();
           return;
         }
         if (!wroteData) {
@@ -953,24 +1017,26 @@
             syncButton.textContent = t('syncButton');
             syncButton.disabled = syncButton.dataset.accountAllowed !== '1';
           }, 2500);
-          resumeSessionReload();
           return;
         }
         await updatePreferences('mark-resume-sync', { expectedUserId: currentUserId });
-        try {
-          await loadResumeBulk(true);
-          await renderResume(false);
-        } catch { /* account writes succeeded; a read refresh must not invert their result */ }
+        refreshLegacyBulk = true;
         syncButton.textContent = t('syncUpdated');
-        resumeSessionReload();
       } catch {
         syncButton.textContent = t('syncFailed');
         setTimeout(() => {
           syncButton.textContent = t('syncButton');
           syncButton.disabled = syncButton.dataset.accountAllowed !== '1';
         }, 2500);
-        resumeSessionReload();
         return;
+      } finally {
+        try {
+          // Every terminal command result needs a fresh fenced projection, including no-op/cancel/error.
+          await renderWatchCycle();
+          if (refreshLegacyBulk && watchProjection?.snapshot?.history_adopted === false) await loadResumeBulk(true);
+          await renderResume(false);
+        } catch { /* Read failures keep resume cleared without changing the command outcome. */ }
+        resumeSessionReload();
       }
       setTimeout(() => {
         syncButton.textContent = t('syncButton');
