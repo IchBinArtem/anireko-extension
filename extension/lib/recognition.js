@@ -30,6 +30,21 @@
     return null;
   }
 
+  function dreamCastRelease(hostname, pathname) {
+    return String(hostname).toLowerCase() === 'dreamerscast.com'
+      && /^\/home\/release\/\d+-[^/]+\/?$/u.test(pathname);
+  }
+
+  function uniqueSelectedEpisode(labels) {
+    const values = labels.map((label) => {
+      const match = /^\s*Серия\s+(\d{1,4})\s*$/iu.exec(label);
+      return match ? Number(match[1]) : null;
+    });
+    if (!values.length || values.some((value) => value === null || value < 1 || value > 5000)) return null;
+    const unique = [...new Set(values)];
+    return unique.length === 1 ? unique[0] : null;
+  }
+
   function episodeFromEventDetail(detail) {
     const candidates = detail && typeof detail === 'object'
       ? [detail.episodeNumber, detail.episode_number, detail.episode, detail.number]
@@ -130,15 +145,9 @@
   function chooseTitle(candidates) {
     for (const candidate of candidates) {
       const title = normalizeTitle(candidate);
-      if (title.length >= 2 && title.length <= 180) {
-        // Dual-title aggregators: «Игра лжецов / Liar Game» — the RU part
-        // matches our catalog search best.
-        const segments = title.split(' / ');
-        if (segments.length > 1 && segments[0].trim().length >= 2) {
-          return segments[0].trim();
-        }
-        return title;
-      }
+      const selected = title.split(' / ')[0].trim();
+      if (selected.length >= 2 && selected.length <= 180) return selected;
+      if (selected.length < 2 && title.length >= 2 && title.length <= 180) return title;
     }
     return '';
   }
@@ -211,6 +220,8 @@
     cleanText,
     hasEpisodeMarker,
     parseEpisode,
+    dreamCastRelease,
+    uniqueSelectedEpisode,
     episodeFromEventDetail,
     episodeFromPlayerMessage,
     episodeFromPlayerUrl,

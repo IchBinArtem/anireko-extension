@@ -10,7 +10,7 @@ function load(file, extras = {}) {
   return context;
 }
 
-test('store manifest uses Chrome native host controls with one static all-frame detector', () => {
+test('store manifest retains native host controls and limits the Dream Cast MAIN observer', () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'manifest.json'), 'utf8'));
   assert.deepEqual(manifest.permissions, ['storage']);
   assert.deepEqual(manifest.host_permissions, ['<all_urls>']);
@@ -21,6 +21,12 @@ test('store manifest uses Chrome native host controls with one static all-frame 
   assert.equal(manifest.optional_host_permissions, undefined);
   assert.equal(manifest.incognito, 'not_allowed');
   assert.deepEqual(manifest.content_scripts, [{
+    matches: ['*://dreamerscast.com/home/release/*'],
+    js: ['content/dreamcast-main.js'],
+    world: 'MAIN',
+    all_frames: false,
+    run_at: 'document_start',
+  }, {
     matches: ['<all_urls>'],
     js: ['lib/recognition.js', 'lib/progress.js', 'content/media-detector.js'],
     all_frames: true,
@@ -376,6 +382,7 @@ test('public export contains every source and fixture used by release verificati
     '.github/dependabot.yml',
     '.github/workflows/extension-release.yml',
     'extension/api-contract.json',
+    'extension/content/dreamcast-main.js',
     'extension/scripts/cws_publish.py',
     'extension/tests/search-resolve.test.js',
     'extension/tests/popup-resume.test.js',
@@ -401,7 +408,7 @@ test('public export contains every source and fixture used by release verificati
     assert.equal(fs.existsSync(path.join(repo, relative)), true, `public source misses ${relative}`);
   }
 
-  assert.equal(listed.size, 61, 'public export allowlist changed without an explicit review');
+  assert.equal(listed.size, 62, 'public export allowlist changed without an explicit review');
   const exactSupportFiles = new Set([
     '.github/dependabot.yml',
     '.github/workflows/extension-release.yml',

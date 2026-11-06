@@ -18,6 +18,7 @@ const stateByTab = {};
 const tabQueues = {};
 const latestRecognitionByTab = new Map();
 const latestTopDocumentByTab = new Map();
+const latestDreamCastReceiptByTab = new Map();
 const tabStateFlushAt = {};
 const actionIconRenderKeyByTab = new Map();
 const actionBadgeRenderKeyByTab = new Map();
@@ -164,6 +165,7 @@ async function disableTab(tabId, writeBinding = captureLocalWrite()) {
   delete tabQueues[String(tabId)];
   latestRecognitionByTab.delete(String(tabId));
   latestTopDocumentByTab.delete(String(tabId));
+  latestDreamCastReceiptByTab.delete(String(tabId));
   delete tabStateFlushAt[String(tabId)];
   invalidateActionPresentation(tabId);
   if (writeBinding !== false) await removeSession(writeBinding, `tab:${tabId}`);
@@ -2050,7 +2052,31 @@ function progressEventCurrent(event, writeBinding, allowUnpublished = false) {
     && Object.is(live.player?.episode, event.playerIdentity.episode)
     && Object.is(live.player?.documentId, event.playerIdentity.documentId)
     && Object.is(live.player?.frameUrl, event.playerIdentity.frameUrl)
-    && Object.is(Number(live.match?.animeId), Number(event.match.animeId));
+    && Object.is(Number(live.match?.animeId), Number(event.match.animeId))
+    && dreamCastProgressReceiptCurrent(event);
+}
+
+function isDreamCastReleaseUrl(value) {
+  try { const url = new URL(value); return url.hostname === 'dreamerscast.com'
+    && /^\/home\/release\/\d+-[^/]+\/?$/u.test(url.pathname); } catch { return false; }
+}
+
+function dreamCastProgressReceiptCurrent(event) {
+  let origin;
+  try { origin = new URL(event.sourceOrigin); } catch { return true; }
+  if (origin.hostname !== 'dreamerscast.com') return true;
+  if (typeof event.pageUrl !== 'string') return false;
+  if (!isDreamCastReleaseUrl(event.pageUrl)) return true;
+  if (!event.playerIsLive && event.player?.reason === 'manual-history-sync') return true;
+  if (Number.isInteger(event.player?.frameId) && event.player.frameId > 0) return false;
+  const receipt = latestDreamCastReceiptByTab.get(String(event.tabId));
+  return Boolean(receipt && receipt.documentId === event.topDocumentId
+    && receipt.token === event.navigationToken && receipt.url === event.pageUrl
+    && receipt.sequence === event.player?.playerSequence
+    && receipt.playerId === event.player?.playerInstanceId
+    && receipt.mediaGeneration === event.player?.mediaGeneration
+    && event.player?.documentId === event.topDocumentId && event.player?.frameId === 0
+    && stateMatchesLatestReceipt(event.tabId, event.liveState));
 }
 
 async function syncProgressOnce(state, urgent, writeBinding = captureLocalWrite(), event = captureProgressEvent(state), cycleCapture = null, natural = null) {
@@ -2495,6 +2521,9 @@ function queueHistoryUpdate(state, player, previousPlayer, writeBinding = captur
   if (!recognition?.title || !Number.isFinite(player?.currentTime)) {
     return Promise.resolve();
   }
+  if (isDreamCastReleaseUrl(event.pageUrl) && player.frameId === 0 && !player.playbackStarted) {
+    return Promise.resolve();
+  }
   // Episode is optional (movies / players without episode markup) — but an
   // episode-less record requires an episode-length duration (5+ min), so
   // short clips and ads never pollute the history.
@@ -2513,7 +2542,12 @@ function queueHistoryUpdate(state, player, previousPlayer, writeBinding = captur
     const wallDelta = (player.observedAt - previousObservedAt) / 1000;
     const mediaDelta = player.currentTime - Number(previousPlayer?.currentTime);
     const isSeek = /seek|episode-change/iu.test(player.reason || '');
-    const watchedDelta = !isSeek
+    const sameDreamCastEpisode = !isDreamCastReleaseUrl(event.pageUrl) || player.frameId > 0
+      || (previousPlayer?.episode === player.episode && Number.isFinite(previousPlayer?.currentTime)
+        && Number.isSafeInteger(player.mediaGeneration) && player.mediaGeneration > 0
+        && previousPlayer?.mediaGeneration === player.mediaGeneration
+        && previousPlayer?.playerInstanceId === player.playerInstanceId && previousPlayer?.documentId === player.documentId);
+    const watchedDelta = !isSeek && sameDreamCastEpisode
       && previousPlayer?.playbackStarted
       && wallDelta > 0 && wallDelta <= 15
       && mediaDelta > 0 && mediaDelta <= 20
@@ -2738,6 +2772,10 @@ async function updateTabState(message, sender, messageContext, writeBinding = ca
     const playerKey = `${frameKey}:${message.playerInstanceId || 'video'}`;
     current.players ||= {};
     const previous = current.players[playerKey];
+    const dreamCast = messageContext.topFrame && isDreamCastReleaseUrl(message.frameUrl);
+    if (dreamCast && (!Number.isSafeInteger(message.mediaGeneration) || message.mediaGeneration < 1
+      || !Number.isSafeInteger(message.playerSequence) || message.playerSequence < 1
+      || (Number.isSafeInteger(previous?.playerSequence) && message.playerSequence <= previous.playerSequence))) return;
     updatedPlayerKey = playerKey;
     previousPlayer = previous || null;
     const advanced = Number.isFinite(message.currentTime)
@@ -2755,6 +2793,8 @@ async function updateTabState(message, sender, messageContext, writeBinding = ca
       resolvedFrame?.episode,
       frameNavigated,
     );
+    const sameDreamCastMedia = !dreamCast || (previous?.mediaGeneration === message.mediaGeneration
+      && previous?.episode === episodeResolution.episode);
     current.players[playerKey] = {
       ...previous,
       ...message,
@@ -2765,8 +2805,8 @@ async function updateTabState(message, sender, messageContext, writeBinding = ca
       frameId: sender.frameId ?? 0,
       documentId: sender.documentId || null,
       frameVisible: resolvedFrame?.visible ?? null,
-      playbackStarted: Boolean(previous?.playbackStarted || message.playbackStarted),
-      lastAdvancedAt: advanced ? message.observedAt : previous?.lastAdvancedAt || null
+      playbackStarted: Boolean((sameDreamCastMedia && previous?.playbackStarted) || message.playbackStarted),
+      lastAdvancedAt: sameDreamCastMedia ? (advanced ? message.observedAt : previous?.lastAdvancedAt || null) : null
     };
     const entries = Object.entries(current.players)
       .sort(([, left], [, right]) => right.observedAt - left.observedAt)
@@ -2831,7 +2871,12 @@ async function updateTabState(message, sender, messageContext, writeBinding = ca
       || Boolean(message.watched && !previousPlayer?.watched)
       || (previousPlayer?.episode != null && message.episode != null
         && message.episode !== previousPlayer.episode);
-    maybeSyncProgress(current, urgentSync, writeBinding, current, previousPlayer).catch(() => {});
+    const previousForSync = !isDreamCastReleaseUrl(current.pageUrl) || current.player.frameId > 0
+      || (previousPlayer?.episode === current.player.episode
+        && previousPlayer?.mediaGeneration === current.player.mediaGeneration
+        && previousPlayer?.playerInstanceId === current.player.playerInstanceId
+        && previousPlayer?.documentId === current.player.documentId) ? previousPlayer : null;
+    maybeSyncProgress(current, urgentSync, writeBinding, current, previousForSync).catch(() => {});
   }
   // Fire-and-forget: auto-mark must never block the per-tab message queue.
   if (current.player?.watched) maybeAutoMark(current, writeBinding).catch(() => {});
@@ -3212,6 +3257,7 @@ async function handlePopupRequest(message, writeBinding = captureLocalWrite()) {
       return reportRecognitionMiss(Number(message.tabId), writeBinding);
     case 'popup-delete-local-data': {
       await exclusiveLocalControl(async () => {
+      latestDreamCastReceiptByTab.clear();
       const tabIds = Object.keys(stateByTab).map(Number);
       await Promise.all(tabIds.map((tabId) => disableTab(tabId, false)));
       await chrome.storage.session.clear();
@@ -3307,12 +3353,37 @@ function queueSensorMessage(message, sender, messageContext, writeBinding = capt
   let queue;
   queue = previous
     .catch(() => {})
-    .then(() => { requireLocalWrite(writeBinding); return updateTabState(message, sender, messageContext, writeBinding); })
+    .then(() => { requireLocalWrite(writeBinding); if (!dreamCastMessageReceiptCurrent(message, sender, messageContext)) return; return updateTabState(message, sender, messageContext, writeBinding); })
     .catch((error) => console.error('[AniReko] state update failed', error))
     .finally(() => {
       if (tabQueues[tabId] === queue) delete tabQueues[tabId];
     });
   tabQueues[tabId] = queue;
+}
+
+function captureDreamCastReceipt(message, sender, context) {
+  if (message.type !== 'player-progress' || !context.topFrame || !isDreamCastReleaseUrl(context.documentUrl)) return true;
+  if (!Number.isSafeInteger(message.mediaGeneration) || message.mediaGeneration < 1
+    || !Number.isSafeInteger(message.playerSequence) || message.playerSequence < 1
+    || typeof message.playerInstanceId !== 'string' || !message.playerInstanceId) return false;
+  const key=String(sender.tab.id), previous=latestDreamCastReceiptByTab.get(key);
+  const top=latestTopDocumentByTab.get(key), current=stateByTab[key];
+  if (top ? !sameTopDocument(top,context,context.documentUrl)
+    : current && (current.topDocumentId !== context.documentId || current.navigationToken !== context.documentToken
+      || current.pageUrl !== context.documentUrl)) return false;
+  if (previous && previous.documentId === context.documentId && previous.token === context.documentToken
+    && message.playerSequence <= previous.sequence) return false;
+  latestDreamCastReceiptByTab.set(key,{documentId:context.documentId,token:context.documentToken,
+    url:context.documentUrl,sequence:message.playerSequence,playerId:message.playerInstanceId,mediaGeneration:message.mediaGeneration});
+  return true;
+}
+
+function dreamCastMessageReceiptCurrent(message, sender, context) {
+  if (message.type !== 'player-progress' || !context.topFrame || !isDreamCastReleaseUrl(context.documentUrl)) return true;
+  const receipt=latestDreamCastReceiptByTab.get(String(sender.tab.id));
+  return Boolean(receipt && receipt.documentId === context.documentId && receipt.token === context.documentToken
+    && receipt.url === context.documentUrl && receipt.sequence === message.playerSequence
+    && receipt.playerId === message.playerInstanceId && receipt.mediaGeneration === message.mediaGeneration);
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -3324,6 +3395,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   const messageContext = AniRekoTrust.validateSensorMessage(message, sender, chrome.runtime.id);
   if (!messageContext.ok) return;
+  if (!captureDreamCastReceipt(message, sender, messageContext)) return;
   let writeBinding;
   try { writeBinding = captureLocalWrite(); } catch { return; }
   // Record arrival order synchronously, not consent-read completion order.
@@ -3331,7 +3403,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   authorizedDocument(messageContext)
     .then((allowed) => {
       if (message.type === 'recognition' && latestRecognitionByTab.get(String(sender.tab.id)) !== message) return;
-      if (allowed && localWriteCurrent(writeBinding)) queueSensorMessage(message, sender, messageContext, writeBinding, true);
+      if (allowed && localWriteCurrent(writeBinding) && dreamCastMessageReceiptCurrent(message, sender, messageContext)) queueSensorMessage(message, sender, messageContext, writeBinding, true);
     })
     .catch(() => {});
 });
@@ -3362,6 +3434,7 @@ async function finalizeRemovedTab(tabId, writeBinding = captureLocalWrite()) {
     delete tabQueues[id];
     latestRecognitionByTab.delete(id);
     latestTopDocumentByTab.delete(id);
+    latestDreamCastReceiptByTab.delete(id);
     delete tabStateFlushAt[id];
     invalidateActionPresentation(tabId);
     if (localWriteCurrent(writeBinding)) {

@@ -12,6 +12,7 @@ extension/_locales/ru/messages.json
 extension/api-contract.json
 extension/brand-mark.svg
 extension/content/media-detector.js
+extension/content/dreamcast-main.js
 extension/lib/api-client.js
 extension/lib/activity.js
 extension/lib/auto-mark.js

@@ -11,6 +11,12 @@
     "service_worker": "service-worker.js"
   },
   "content_scripts": [{
+    "matches": ["*://dreamerscast.com/home/release/*"],
+    "js": ["content/dreamcast-main.js"],
+    "world": "MAIN",
+    "all_frames": false,
+    "run_at": "document_start"
+  }, {
     "matches": ["<all_urls>"],
     "js": ["lib/recognition.js", "lib/progress.js", "content/media-detector.js"],
     "all_frames": true,

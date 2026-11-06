@@ -7,6 +7,7 @@ popup.html
 popup.css
 popup.js
 content/media-detector.js
+content/dreamcast-main.js
 lib/api-client.js
 lib/activity.js
 lib/auto-mark.js

@@ -7,6 +7,106 @@ const test = require('node:test');
 const extensionDir = path.join(__dirname, '..');
 const serviceWorkerPath = process.env.ANIREKO_SW_UNDER_TEST || path.join(extensionDir, 'service-worker.js');
 
+test('Dream Cast newer sensor receipt fences old progress before consent completes', async () => {
+  const {context,storage,chrome}=loadServiceWorker({fetchImpl:async()=>({ok:true,status:200,json:async()=>({data:[]})})});
+  const url='https://dreamerscast.com/home/release/621-test',token='1234567890abcdef',now=Date.now();
+  const scope={topFrame:true,documentId:'top',documentToken:token,documentUrl:url,origin:'https://dreamerscast.com',topOrigin:'https://dreamerscast.com'};
+  const sender={id:chrome.runtime.id,documentId:'top',frameId:0,url,tab:{id:7,url}};
+  const player={episode:1,currentTime:100,duration:1200,playerSequence:1,mediaGeneration:1,playerInstanceId:'video-1',documentId:'top',frameId:0,frameUrl:url};
+  context.seedState={tabId:7,topDocumentId:'top',navigationToken:token,pageUrl:url,sourceOrigin:scope.topOrigin,recognition:{title:'Primary',url},
+    match:{status:'ok',exact:true,animeId:101},player,players:{'top:video-1':player},frames:[],frameReports:{},documents:{}};
+  vm.runInContext("stateByTab['7']=seedState",context);
+  assert.equal(context.captureDreamCastReceipt({type:'player-progress',playerSequence:1,mediaGeneration:1,playerInstanceId:'video-1'},sender,scope),true);
+  const event=context.captureProgressEvent(context.seedState),binding=context.captureLocalWrite();assert.equal(context.progressEventCurrent(event,binding),true);
+  const original=storage.local.get;let release;const blocked=new Promise(resolve=>{release=resolve});storage.local.get=async keys=>{if(keys==='privacy-consent')await blocked;return original(keys)};
+  chrome.runtime.onMessage.listener({type:'player-progress',documentUrl:url,documentToken:token,observedAt:now,frameUrl:url,playerInstanceId:'video-1',playerSequence:2,mediaGeneration:2,
+    episode:null,episodeAuthoritative:true,currentTime:null,duration:null,watched:false,paused:true,playing:false,locallyVisible:true,reason:'episode-change'},sender,()=>{});
+  assert.equal(context.progressEventCurrent(event,binding),false);
+  release();await new Promise(resolve=>setImmediate(resolve));await vm.runInContext("tabQueues['7']",context);
+  assert.equal(Object.keys((await storage.local.get('watch-history'))['watch-history']?.records||{}).length,0);
+});
+
+test('Dream Cast receipts reject old documents and unrelated child progress', async () => {
+  const {context}=loadServiceWorker({fetchImpl:async()=>({ok:true,status:200,json:async()=>({data:[]})})});
+  const url='https://dreamerscast.com/home/release/621-test',token='1234567890abcdef';
+  const scope={topFrame:true,documentId:'top-new',documentToken:token,documentUrl:url,origin:'https://dreamerscast.com',topOrigin:'https://dreamerscast.com'},sender={documentId:'top-new',frameId:0,tab:{id:7,url}};
+  const player={episode:1,currentTime:100,duration:1200,playerSequence:1,mediaGeneration:1,playerInstanceId:'video-1',documentId:'top-new',frameId:0,frameUrl:url};
+  context.seedState={tabId:7,topDocumentId:'top-new',navigationToken:token,pageUrl:url,sourceOrigin:scope.topOrigin,recognition:{title:'Primary',url},match:{status:'ok',exact:true,animeId:101},player,players:{},frames:[],frameReports:{},documents:{}};
+  vm.runInContext("stateByTab['7']=seedState",context);const message={type:'player-progress',playerSequence:1,mediaGeneration:1,playerInstanceId:'video-1'};
+  assert.equal(context.captureDreamCastReceipt(message,sender,scope),true);const binding=context.captureLocalWrite(),event=context.captureProgressEvent(context.seedState);assert.equal(context.progressEventCurrent(event,binding),true);
+  assert.equal(context.captureDreamCastReceipt({...message,playerSequence:2},sender,{...scope,documentId:'top-old'}),false);assert.equal(context.progressEventCurrent(event,binding),true);
+  assert.equal(context.captureDreamCastReceipt({...message,playerSequence:99},sender,{...scope,topFrame:false,documentId:'child'}),true);
+  context.seedState.player={...player,documentId:'child',frameId:1};assert.equal(context.progressEventCurrent(context.captureProgressEvent(context.seedState),binding),false);
+  const otherPage={...context.seedState,pageUrl:'https://example.org/watch',sourceOrigin:'https://example.org'};
+  assert.equal(context.dreamCastProgressReceiptCurrent(context.captureProgressEvent(otherPage)),true);
+  context.seedState.player=player;const manual={...context.seedState,player:{...player,episode:3,reason:'manual-history-sync'}};assert.equal(context.progressEventCurrent(context.captureProgressEvent(manual,context.seedState),binding),true);
+  await context.disableTab(7);assert.equal(vm.runInContext("latestDreamCastReceiptByTab.has('7')",context),false);
+});
+
+test('Dream Cast unstarted new episode does not inherit playback or overwrite history', async () => {
+  const {context,storage}=loadServiceWorker({fetchImpl:async()=>({ok:true,status:200,json:async()=>({data:[]})})});
+  const url='https://dreamerscast.com/home/release/621-test',token='1234567890abcdef',now=Date.now();
+  const scope={topFrame:true,documentId:'top',documentToken:token,documentUrl:url,origin:'https://dreamerscast.com',topOrigin:'https://dreamerscast.com'},sender={documentId:'top',frameId:0,tab:{id:7,url}};
+  const previous={episode:1,currentTime:100,duration:1200,playerSequence:1,mediaGeneration:1,playerInstanceId:'video-1',documentId:'top',frameId:0,frameUrl:url,observedAt:now,playbackStarted:true,playing:true,locallyVisible:true};
+  context.seedState={tabId:7,topDocumentId:'top',navigationToken:token,pageUrl:url,pageNavigationAt:now-100,sourceOrigin:scope.topOrigin,recognition:{title:'Primary',url},match:{status:'ok',exact:true,animeId:101,resolvedAt:now,completionMetadataReady:true},player:previous,players:{'top:video-1':previous},frames:[],frameReports:{},documents:{}};
+  vm.runInContext("stateByTab['7']=seedState",context);
+  const next={type:'player-progress',documentUrl:url,documentToken:token,frameUrl:url,playerInstanceId:'video-1',playerSequence:2,mediaGeneration:2,episode:2,episodeAuthoritative:true,currentTime:0,duration:1200,observedAt:now+1000,playbackStarted:false,playing:false,paused:true,watched:false,locallyVisible:true,reason:'episode-change'};
+  assert.equal(context.captureDreamCastReceipt(next,sender,scope),true);context.queueSensorMessage(next,sender,scope);await vm.runInContext("tabQueues['7']",context);
+  assert.equal(context.seedState.player.playbackStarted,false);
+  assert.equal((await storage.local.get('watch-history'))['watch-history']?.records?.['primary::2'],undefined);
+});
+
+test('Dream Cast queued older sample is not published after newer invalidation', async () => {
+  const {context,storage}=loadServiceWorker({fetchImpl:async()=>({ok:true,status:200,json:async()=>({data:[]})})});
+  const url='https://dreamerscast.com/home/release/621-test',token='1234567890abcdef',now=Date.now();
+  const scope={topFrame:true,documentId:'top',documentToken:token,documentUrl:url,origin:'https://dreamerscast.com',topOrigin:'https://dreamerscast.com'},sender={documentId:'top',frameId:0,tab:{id:7,url}};
+  context.seedState={tabId:7,topDocumentId:'top',navigationToken:token,pageUrl:url,pageNavigationAt:now-100,sourceOrigin:scope.topOrigin,recognition:{title:'Primary',url},match:{status:'ok',exact:true,animeId:101,resolvedAt:now,completionMetadataReady:true},players:{},frames:[],frameReports:{},documents:{}};
+  vm.runInContext("stateByTab['7']=seedState",context);let release;context.blockedQueue=new Promise(resolve=>{release=resolve});vm.runInContext("tabQueues['7']=blockedQueue",context);
+  const common={type:'player-progress',frameUrl:url,documentUrl:url,documentToken:token,playerInstanceId:'video-1',mediaGeneration:1,observedAt:now,locallyVisible:true,episodeAuthoritative:true,reason:'episode-change'};
+  const published=[];const original=storage.session.set.bind(storage.session);storage.session.set=async items=>{if(items['tab:7']?.player)published.push(items['tab:7'].player.episode);return original(items)};
+  assert.equal(context.captureDreamCastReceipt({...common,playerSequence:1},sender,scope),true);context.queueSensorMessage({...common,playerSequence:1,episode:1,currentTime:100,duration:1200,watched:false,playing:true,paused:false},sender,scope);
+  assert.equal(context.captureDreamCastReceipt({...common,playerSequence:2},sender,scope),true);context.queueSensorMessage({...common,playerSequence:2,episode:null,currentTime:null,duration:null,watched:false,playing:false,paused:true},sender,scope);
+  release();await vm.runInContext("tabQueues['7']",context);assert.ok(!published.includes(1));assert.equal(context.seedState.players['top:video-1'].episode,null);
+});
+
+test('Dream Cast local clear removes an unpublished receipt', async () => {
+  const {context}=loadServiceWorker({fetchImpl:async()=>({ok:true,status:200,json:async()=>({data:[]})})});
+  const url='https://dreamerscast.com/home/release/621-test',token='1234567890abcdef',scope={topFrame:true,documentId:'top',documentToken:token,documentUrl:url,origin:'https://dreamerscast.com',topOrigin:'https://dreamerscast.com'};
+  context.fixtureScope=scope;context.fixtureUrl=url;vm.runInContext("latestTopDocumentByTab.set('7',{...fixtureScope,url:fixtureUrl})",context);
+  assert.equal(context.captureDreamCastReceipt({type:'player-progress',playerSequence:1,mediaGeneration:1,playerInstanceId:'video-1'},{tab:{id:7,url}},scope),true);
+  assert.equal((await context.handlePopupRequest({type:'popup-delete-local-data'})).status,200);assert.equal(vm.runInContext("latestDreamCastReceiptByTab.has('7')",context),false);
+});
+
+test('Dream Cast watch time cannot cross a skipped media-source transition', async () => {
+  for (const [nextGeneration,expected] of [[1,5],[2,0]]) {
+    const {context,storage}=loadServiceWorker({fetchImpl:async()=>({ok:true,status:200,json:async()=>({data:[]})})});
+    const url='https://dreamerscast.com/home/release/621-test',token='1234567890abcdef',now=Date.now();
+    const scope={topFrame:true,documentId:'top',documentToken:token,documentUrl:url,origin:'https://dreamerscast.com',topOrigin:'https://dreamerscast.com'},sender={documentId:'top',frameId:0,tab:{id:7,url}};
+    const previous={episode:1,currentTime:100,duration:1200,playerSequence:1,mediaGeneration:1,playerInstanceId:'video-1',documentId:'top',frameId:0,frameUrl:url,
+      observedAt:now,playbackStarted:true,playing:true,paused:false,ended:false,seeking:false,watched:false,locallyVisible:true,reason:'timeupdate'};
+    context.seedState={tabId:7,topDocumentId:'top',navigationToken:token,pageUrl:url,pageNavigationAt:now-100,sourceOrigin:scope.topOrigin,
+      recognition:{title:'Primary',url},match:{status:'ok',exact:true,animeId:101,resolvedAt:now,completionMetadataReady:true},player:previous,players:{'top:video-1':previous},frames:[],frameReports:{},documents:{}};
+    vm.runInContext("stateByTab['7']=seedState",context);
+    const next={type:'player-progress',documentUrl:url,documentToken:token,frameUrl:url,playerInstanceId:'video-1',playerSequence:4,mediaGeneration:nextGeneration,
+      episode:1,episodeAuthoritative:true,currentTime:105,duration:1200,observedAt:now+5000,playbackStarted:true,playing:false,paused:true,ended:false,seeking:false,watched:false,locallyVisible:true,reason:'pause'};
+    assert.equal(context.captureDreamCastReceipt(next,sender,scope),true);context.queueSensorMessage(next,sender,scope);await vm.runInContext("tabQueues['7']",context);
+    const history=(await storage.local.get('watch-history'))['watch-history'];assert.equal(history.records['primary::1'].watchedSeconds,expected);
+  }
+});
+
+test('Dream Cast cold worker restores a matching document after rejecting an old one', async () => {
+  const session=makeStorage(),url='https://dreamerscast.com/home/release/621-test',token='1234567890abcdef',now=Date.now();
+  await session.set({'tab:7':{tabId:7,topDocumentId:'top-new',navigationToken:token,pageUrl:url,pageNavigationAt:now-100,sourceOrigin:'https://dreamerscast.com',
+    recognition:{title:'Primary',url},match:{status:'ok',exact:true,animeId:101,resolvedAt:now,completionMetadataReady:true},players:{},frames:[],frameReports:{},documents:{}}});
+  const {context,chrome,storage}=loadServiceWorker({sessionStorage:session,fetchImpl:async()=>({ok:true,status:200,json:async()=>({data:[]})})});
+  const send=async(doc,documentToken)=>{const sender={id:chrome.runtime.id,documentId:doc,frameId:0,url,tab:{id:7,url}};
+    chrome.runtime.onMessage.listener({type:'player-progress',documentUrl:url,documentToken,observedAt:now,frameUrl:url,playerInstanceId:'video-1',playerSequence:1,mediaGeneration:1,
+      episode:1,episodeAuthoritative:true,currentTime:10,duration:1200,playbackStarted:true,watched:false,playing:true,paused:false,locallyVisible:true,reason:'play'},sender,()=>{});
+    await new Promise(resolve=>setImmediate(resolve));await vm.runInContext("tabQueues['7']",context);};
+  await send('top-old','oldtoken123456789');assert.equal((await storage.session.get('tab:7'))['tab:7'].topDocumentId,'top-new');
+  await send('top-new',token);const state=(await storage.session.get('tab:7'))['tab:7'];assert.equal(state.player.episode,1);assert.equal(state.topDocumentId,'top-new');
+});
+
 test('actual legacy progress fails closed without an authenticated adoption snapshot', async () => {
   const posts = [];
   const { context } = loadServiceWorker({ historyFetchImpl: async () => (

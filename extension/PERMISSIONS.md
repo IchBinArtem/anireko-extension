@@ -3,7 +3,7 @@
 ## Required
 
 - `storage` — consent, local watch history, caches, account binding, and session-only tab state.
-- `<all_urls>` — the core feature recognizes anime and HTML5 playback on arbitrary sites and in arbitrary cross-origin player frames. A static detector runs at `document_start` in all frames; no player-provider domain list is used.
+- `<all_urls>` — the core feature recognizes anime and HTML5 playback on arbitrary sites and in arbitrary cross-origin player frames. A static detector runs at `document_start` in all frames. Dream Cast release pages also use a site-specific player observer in the top frame to identify the selected episode.
 
 Incognito use is disabled. The extension does not request `tabs`, `scripting`, browsing history, cookies, webRequest, or debugger access.
 
