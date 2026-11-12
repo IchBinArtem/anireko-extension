@@ -1032,7 +1032,11 @@ test('recognizes anime before playback and confirms player after playback starts
   await popup.waitForTimeout(250);
   expect(popupReloads).toBe(0);
   await expect(popup.locator('#title')).toHaveText('Расхититель гробниц');
-  await expect(popup.locator('#anireko-match')).toHaveText('2024');
+  await expect(popup.locator('.anime-meta #anime-year')).toHaveText('2024');
+  await expect(popup.locator('#anireko-match')).toBeHidden();
+  const yearBox = await popup.locator('#anime-year').boundingBox();
+  const actionBox = await popup.locator('#anime-primary-action').boundingBox();
+  expect(yearBox!.y + yearBox!.height).toBeLessThanOrEqual(actionBox!.y);
   await expect(popup.locator('#anime-primary-action')).toHaveText('Открыть в AniReko →');
   await expect(popup.locator('#anime-primary-action'))
     .toHaveAttribute('href', `${apiBase}/ru/anime/tomb-raider-4242`);

@@ -71,16 +71,21 @@ function popup({ account, projection, syncReply, staleDocument = false, tasteUse
   } };
 }
 
-test('actual popup avoids exact duplicate catalog title but preserves year, manual marker and distinct title', async () => {
-  for (const [options, expected] of [
-    [{}, ''],
-    [{ year: 2024, manual: true }, '2024 · manualMatchMark'],
-    [{ catalogTitle: 'Current anime 2', year: 2024 }, 'catalogPrefix Current anime 2 (2024)'],
-    [{ catalogTitle: 'current anime' }, 'catalogPrefix current anime'],
+test('actual popup puts catalog year in metadata and retains only meaningful catalog copy below action', async () => {
+  for (const [options, expected, year] of [
+    [{}, '', ''],
+    [{ year: 2024, manual: true }, 'manualMatchMark', '2024'],
+    [{ catalogTitle: 'Current anime 2', year: 2024 }, 'catalogPrefix Current anime 2', '2024'],
+    [{ catalogTitle: 'current anime' }, 'catalogPrefix current anime', ''],
+    [{ year: 0 }, '', ''],
+    [{ year: '2024' }, '', ''],
   ]) {
     const ui = popup({ account: authorized(18), projection: history(true), ...options });
     await ui.done; await tick();
     assert.equal(ui.get('anireko-match').textContent, expected);
+    assert.equal(ui.get('anime-year').textContent, year);
+    assert.equal(ui.get('anime-year').hidden, !year);
+    assert.equal(ui.get('anime-year-separator').hidden, !year);
   }
 });
 const authorized = id => ({ ok: true, payload: {

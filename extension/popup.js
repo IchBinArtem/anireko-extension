@@ -491,14 +491,20 @@
   // (KAN-2715) — no user action needed, so no UI for it here.
   set('title', recognition?.title);
   const primaryAction = document.getElementById('anime-primary-action');
+  const catalogYear = match?.status === 'ok' && match.slug && Number.isSafeInteger(match.year) && match.year > 0
+    ? String(match.year) : '';
+  const yearElement = document.getElementById('anime-year');
+  yearElement.textContent = catalogYear;
+  yearElement.hidden = !catalogYear;
+  document.getElementById('anime-year-separator').hidden = !catalogYear;
   if (match?.status === 'ok' && match.slug) {
     primaryAction.href = `${siteBase}/${siteLocale}/anime/${match.slug}-${match.animeId}`;
     primaryAction.hidden = false;
     const sameTitle = typeof match.title === 'string' && typeof recognition.title === 'string'
       && match.title.trim() === recognition.title.trim();
     const catalogNote = sameTitle
-      ? [match.year ? String(match.year) : '', match.manual ? t('manualMatchMark') : ''].filter(Boolean).join(' · ')
-      : `${t('catalogPrefix')} ${match.title}${match.year ? ` (${match.year})` : ''}${match.manual ? ` · ${t('manualMatchMark')}` : ''}`;
+      ? (match.manual ? t('manualMatchMark') : '')
+      : `${t('catalogPrefix')} ${match.title}${match.manual ? ` · ${t('manualMatchMark')}` : ''}`;
     set('anireko-match', catalogNote);
   } else {
     primaryAction.hidden = true;
