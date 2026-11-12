@@ -289,15 +289,28 @@
           note.textContent = t('activityDetailsPartial');
           entries.append(note);
         }
+        const groups = new Map();
         for (const detail of storedDay.details) {
           if (!detail || typeof detail.title !== 'string') continue;
+          const groupKey = Number.isSafeInteger(detail.animeId) && detail.animeId > 0
+            ? `anime:${detail.animeId}` : detail.animeId === null && typeof detail.titleKey === 'string' && detail.titleKey
+              ? `title:${detail.titleKey}` : detail;
+          let group = groups.get(groupKey);
+          if (!group) {
+            const element = document.createElement('div');
+            element.className = 'activity-entry';
+            const title = document.createElement('strong');
+            title.textContent = detail.title;
+            element.append(title);
+            group = { element, title: detail.title };
+            groups.set(groupKey, group);
+            entries.append(element);
+          }
           const row = document.createElement('div');
-          row.className = 'activity-entry';
-          const title = document.createElement('strong');
-          title.textContent = detail.title;
-          row.append(title);
+          row.className = 'activity-observation';
           const metadata = document.createElement('p');
           const parts = [detail.episode == null ? t('activityFull') : t('episodeLabel', String(detail.episode))];
+          if (detail.title !== group.title) parts.unshift(detail.title);
           if (detail.voice) parts.push(detail.voice);
           if (Number.isFinite(detail.watchedSeconds) && detail.watchedSeconds >= 0) parts.push(detail.watchedSeconds === 0
             ? t('activityObservedNoTime') : detail.watchedSeconds < 60
@@ -313,7 +326,7 @@
               : t('activityPositionWithDuration', [position, duration]);
             row.append(positionLine);
           }
-          entries.append(row);
+          group.element.append(row);
         }
       }
       for (const cell of chart.children) cell.setAttribute('aria-pressed', String(cell.activityDate === selectedActivityDate));
