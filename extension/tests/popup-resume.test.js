@@ -239,7 +239,7 @@ test('actual repair renderer requires a human choice in every group and preserve
     repairComplete: true, actions: [{ command: 'reconcile', capabilityId: 'opaque-choice', groups }] };
   const mutations = [];
   const context = vm.createContext({ matchConfirmed: true, syncAccountActive: true, tab: { id: 71 },
-    accountActivityEpoch: 0, localWriteRevision: 'revision',
+    accountActivityEpoch: 0, localWriteRevision: 'revision', playerFound: true,
     watchProjection: null, pauseSessionStateReload: false, renderResume: async () => {},
     watchCard: elements.get('watch-cycle-card'), watchActions: elements.get('watch-actions'),
     watchFeedback: elements.get('watch-feedback'),
@@ -289,7 +289,7 @@ test('failed explicit action remains visible after a fresh nonpending projection
   const projection = { pending: false, snapshot: { history_adopted: true, readiness: 'ready', origins: [],
     foreground: { cycle_id: null } }, actions: [{ command: 'pause', capabilityId: 'stale-capability' }] };
   const context = vm.createContext({ matchConfirmed: true, syncAccountActive: true, tab: { id: 71 },
-    accountActivityEpoch: 0, localWriteRevision: 'revision',
+    accountActivityEpoch: 0, localWriteRevision: 'revision', playerFound: true,
     watchProjection: null, pauseSessionStateReload: false, renderResume: async () => {},
     watchCard: elements.get('watch-cycle-card'), watchActions: elements.get('watch-actions'),
     watchFeedback: elements.get('watch-feedback'), set: (id, value) => { elements.get(id).textContent = value; },
@@ -338,7 +338,7 @@ test('actual cycle renderer retains completion and shows only component tracked 
   snapshot.origins[0].state = snapshot.start_state;
   const projection = { snapshot, actions: [] };
   const context = vm.createContext({ matchConfirmed: true, syncAccountActive: true, tab: { id: 71 },
-    accountActivityEpoch: 0, localWriteRevision: 'revision',
+    accountActivityEpoch: 0, localWriteRevision: 'revision', playerFound: true,
     watchProjection: null, pauseSessionStateReload: false, renderResume: async () => {},
     watchCard: elements.get('watch-cycle-card'), watchActions: elements.get('watch-actions'),
     watchFeedback: elements.get('watch-feedback'),
@@ -440,6 +440,17 @@ test('actual cycle renderer retains completion and shows only component tracked 
   await context.run();
   assert.equal(elements.get('watch-actions').children[0].children.length, 5, 'retry and check remain distinct explicit actions');
   assert.equal(elements.get('watch-actions').children[0].open, true, 'pending disclosure survives foreign-account projection');
+  projection.pending = false;
+  projection.actions = [];
+  snapshot.foreground.cycle_id = null;
+  snapshot.origins = [];
+  snapshot.previously_completed = false;
+  snapshot.totals.completed = 0;
+  await context.run();
+  assert.equal(elements.get('watch-cycle-card').hidden, true, 'idle card with no history/action is not another play-video prompt');
+  projection.pending = true;
+  await context.run();
+  assert.equal(elements.get('watch-cycle-card').hidden, false, 'pending safety warning is never removed as empty space');
 });
 
 test('adopted or unknown account history never substitutes legacy resume into a cycle', async () => {

@@ -739,7 +739,7 @@
   document.getElementById('status').className = `status-chip${player?.watched ? ' ok' : ''}`;
   set('progress', player?.progress == null ? null : `${(player.progress * 100).toFixed(1)}%`);
   const hint = document.getElementById('hint');
-  if (playerReady) hint.hidden = true;
+  if (playerReady || (playerFound && matchConfirmed)) hint.hidden = true;
   else set('hint', matchConfirmed
     ? t('animeFoundPlayVideo')
     : t('catalogMatchNotConfirmed'));
@@ -834,7 +834,7 @@
       } else {
         // A pending save needs one clear warning, not a second prompt to play.
         // Keep actual paused/current/reconciliation state visible below.
-        if (!watchProjection.pending) parts.push(t('watchNoActiveCycle'));
+        if (!watchProjection.pending && !playerFound) parts.push(t('watchNoActiveCycle'));
         const paused = origins.filter((origin) => origin.state?.current?.status === 'paused');
         const seenPaused = new Set();
         for (const origin of paused) {
@@ -981,6 +981,9 @@
           button.addEventListener('click', () => run('popup-watch-command', { capabilityId: action.capabilityId }));
           manualActions.append(button);
         }
+      }
+      if (!completion && parts.length === 0 && !watchFeedback.textContent && watchActions.children.length === 0) {
+        watchCard.hidden = true;
       }
     } catch {
       if (!canPublish()) return;

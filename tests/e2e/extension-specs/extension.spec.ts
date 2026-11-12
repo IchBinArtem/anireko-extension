@@ -1105,6 +1105,22 @@ test('recognizes anime before playback and confirms player after playback starts
   await expect(popup.locator('#anime-check .recognized-only')).toBeVisible();
   await expect(popup.locator('#anime-check-detail')).toHaveText('Расхититель гробниц');
   await expect(popup.locator('#player-check')).not.toHaveClass(/success/);
+  for (const width of [390, 360]) {
+    await popup.setViewportSize({ width, height: 850 });
+    const geometry = await popup.evaluate(() => {
+      const brand = document.querySelector('.brand')!.getBoundingClientRect();
+      const card = document.querySelector('#anime-check')!.getBoundingClientRect();
+      const title = document.querySelector('#title')!.getBoundingClientRect();
+      const status = document.createRange();
+      status.selectNodeContents(document.querySelector('#anime-check-title')!);
+      return { cardTop: card.top, brandInside: brand.top >= card.top && brand.right <= card.right,
+        aboveTitle: brand.bottom <= title.top,
+        overlapsStatus: [...status.getClientRects()].some(rect => rect.left < brand.right && rect.right > brand.left
+          && rect.top < brand.bottom && rect.bottom > brand.top) };
+    });
+    expect(geometry).toEqual({ cardTop: 16, brandInside: true, aboveTitle: true, overlapsStatus: false });
+  }
+  await expect(popup.locator('#hint')).toBeHidden();
   await popup.setViewportSize({ width: 360, height: 850 });
   expect(await popup.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
   const waitingScreenshot = testInfo.outputPath('compact-player-waiting-ru.png');
