@@ -93,6 +93,12 @@ a tab removes only its own stops. A retry lacking the original live document con
 requires a new play for that account/title. This guard is local, never uploaded.
 Original retry/settlement revokes pre-command cycle capabilities; its receipt is
 not publication of current-document state, which requires an explicit fresh read.
+The popup places the explicit settlement check and its late-execution consequence
+in the same disclosure as the original target/action and retry. Opening the popup never
+posts a command or retries automatically. Day detail snapshots remain in local
+watch-history storage only: up to 32 observed identity/episode/voice tuples per day,
+with bounded title/voice, same accepted watched delta and latest observed endpoint.
+Legacy and overflow days remain explicitly incomplete; no URL or day details are sent.
 History caches and asynchronous controller publication are generation-fenced.
 After an accepted mutation and fresh receipt read, every pre-command snapshot is
 retired, including a GET started while the command was reserved.

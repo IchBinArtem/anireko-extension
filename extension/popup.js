@@ -258,6 +258,11 @@
     return `${year}-${month}-${day}`;
   }
 
+  let selectedActivityDate = null;
+  function activityTime(seconds) {
+    const value = Math.floor(seconds);
+    return `${Math.floor(value / 60)}:${String(value % 60).padStart(2, '0')}`;
+  }
   function renderStats(history) {
     const now = new Date();
     const today = history?.days?.[dateKey(now)];
@@ -267,6 +272,52 @@
     document.getElementById('today-episodes').title = t('activityEpisodesDetail');
     const days = AniRekoActivity.calendar(history, now);
     const chart = document.getElementById('week-chart');
+    if (!days.some(day => dateKey(day.date) === selectedActivityDate)) selectedActivityDate = dateKey(now);
+    const showDay = (day, label) => {
+      selectedActivityDate = dateKey(day.date);
+      set('activity-detail', label);
+      const entries = document.getElementById('activity-entries');
+      entries.replaceChildren();
+      const storedDay = history?.days?.[selectedActivityDate];
+      if (!Array.isArray(storedDay?.details)) {
+        const note = document.createElement('p');
+        note.textContent = t('activityDetailsUnavailable');
+        entries.append(note);
+      } else {
+        if (storedDay.detailsPartial) {
+          const note = document.createElement('p');
+          note.textContent = t('activityDetailsPartial');
+          entries.append(note);
+        }
+        for (const detail of storedDay.details) {
+          if (!detail || typeof detail.title !== 'string') continue;
+          const row = document.createElement('div');
+          row.className = 'activity-entry';
+          const title = document.createElement('strong');
+          title.textContent = detail.title;
+          row.append(title);
+          const metadata = document.createElement('p');
+          const parts = [detail.episode == null ? t('activityFull') : t('episodeLabel', String(detail.episode))];
+          if (detail.voice) parts.push(detail.voice);
+          if (Number.isFinite(detail.watchedSeconds) && detail.watchedSeconds >= 0) parts.push(detail.watchedSeconds === 0
+            ? t('activityObservedNoTime') : detail.watchedSeconds < 60
+              ? t('activityWatchedSeconds', String(detail.watchedSeconds))
+              : t('activityWatched', String(Math.floor(detail.watchedSeconds / 60))));
+          metadata.textContent = parts.join(' · ');
+          row.append(metadata);
+          if (Number.isFinite(detail.position) && detail.position >= 0) {
+            const position = activityTime(detail.position);
+            const duration = Number.isFinite(detail.duration) && detail.duration > 0 ? activityTime(detail.duration) : null;
+            const positionLine = document.createElement('p');
+            positionLine.textContent = duration === null ? t('activityLastPosition', position)
+              : t('activityPositionWithDuration', [position, duration]);
+            row.append(positionLine);
+          }
+          entries.append(row);
+        }
+      }
+      for (const cell of chart.children) cell.setAttribute('aria-pressed', String(cell.activityDate === selectedActivityDate));
+    };
     chart.replaceChildren(...days.map((day, index) => {
       const cell = document.createElement('button');
       cell.type = 'button';
@@ -275,8 +326,10 @@
         ? t('activityUnknown') : t('minutesShort', String(Math.floor(day.seconds / 60)))}`;
       cell.title = label;
       cell.setAttribute('aria-label', label);
-      cell.tabIndex = day.today ? 0 : -1;
-      const showDetail = () => set('activity-detail', label);
+      cell.activityDate = dateKey(day.date);
+      cell.setAttribute('aria-pressed', String(cell.activityDate === selectedActivityDate));
+      cell.tabIndex = cell.activityDate === selectedActivityDate ? 0 : -1;
+      const showDetail = () => showDay(day, label);
       cell.addEventListener('focus', () => {
         for (const item of chart.children) item.tabIndex = item === cell ? 0 : -1;
         showDetail();
@@ -290,10 +343,15 @@
           chart.children[target].focus();
         }
       });
-      cell.addEventListener('pointerenter', showDetail);
       cell.addEventListener('click', showDetail);
       return cell;
     }));
+    const selected = days.find(day => dateKey(day.date) === selectedActivityDate);
+    if (selected) {
+      const label = `${selected.date.toLocaleDateString(dateLocale, { day: 'numeric', month: 'short', year: 'numeric' })} · ${selected.seconds === null
+        ? t('activityUnknown') : t('minutesShort', String(Math.floor(selected.seconds / 60)))}`;
+      showDay(selected, label);
+    }
   }
 
   const reportSection = document.getElementById('not-found-report');
@@ -617,7 +675,11 @@
     watchProjection = null;
     await renderResume(false);
     watchCard.hidden = false;
-    const manualWasOpen = Array.from(watchActions.children).some(node => node.tagName === 'DETAILS' && node.open);
+    for (const node of [...Array.from(watchActions.children), ...watchActions.querySelectorAll('details')]) {
+      if (node.tagName === 'DETAILS' && node.watchDisclosure) {
+        watchActions[node.watchDisclosure] = node.open;
+      }
+    }
     watchActions.replaceChildren();
     try {
       const response = await requestBackground('popup-watch-history', { tabId: tab?.id });
@@ -632,11 +694,11 @@
       }
       const origins = [...(snapshot.origins || []), ...(snapshot.selected_origin ? [snapshot.selected_origin] : [])];
       const currentOrigin = origins.find((origin) => origin.state?.current?.cycle_id === snapshot.foreground?.cycle_id);
-      let completion = snapshot.previously_completed ? t('watchPreviouslyCompleted') : t('watchNotCompleted');
+      let completion = snapshot.previously_completed ? t('watchPreviouslyCompleted') : '';
       // Component totals are tracked completions, not an invented lifetime total.
       const count = snapshot.totals?.completed;
       if (Number.isSafeInteger(count) && count > 0) {
-        completion += ` · ${t('watchTrackedCompletions', String(count))}`;
+        completion += `${completion ? ' · ' : ''}${t('watchTrackedCompletions', String(count))}`;
       }
       set('watch-completion', completion);
       const current = currentOrigin?.state?.current;
@@ -659,41 +721,60 @@
         }
       }
       set('watch-current', parts.join(' · '));
+      watchFeedback.textContent = '';
       const run = async (type, input) => {
         for (const button of watchActions.querySelectorAll('button')) button.disabled = true;
         pauseSessionStateReload = true;
         watchFeedback.textContent = t('syncUpdating');
         watchProjection = null;
         await renderResume(false);
+        let failed = false;
         try {
           const result = await requestBackground(type, input);
           if (!result?.ok) throw new Error('command_unresolved');
           watchFeedback.textContent = '';
-        } catch { watchFeedback.textContent = t('watchCommandUnresolved'); }
+        } catch { failed = true; }
         finally {
           await renderWatchCycle();
           await renderResume(false);
+          if (failed && !watchProjection?.pending) {
+            watchFeedback.textContent = [watchFeedback.textContent, t('watchActionFailed')].filter(Boolean).join(' · ');
+          }
           pauseSessionStateReload = false;
         }
-      };
-      const addButton = (label, type, input, explanation = '') => {
-        const button = document.createElement('button');
-        button.type = 'button';
-        button.textContent = label;
-        if (explanation) button.title = explanation;
-        button.addEventListener('click', () => run(type, input));
-        watchActions.append(button);
       };
       if (watchProjection.pending) {
         watchFeedback.textContent = t('watchCommandUnresolved');
         const original = watchProjection.pendingIntent;
-        if (original) {
-          watchFeedback.textContent += ` · ${t('watchOriginalTarget', String(original.animeId))} · ${t(`watchAction_${original.action}`)}`;
-          addButton(t('watchRetryOriginal'), 'popup-watch-retry', { commandId: original.commandId });
-        } else watchFeedback.textContent += ` · ${t('watchPendingOtherAccount')}`;
-        if (watchProjection.settlementCapabilityId) {
-          addButton(t('watchSettleOriginal'), 'popup-watch-settle',
-            { capabilityId: watchProjection.settlementCapabilityId }, t('watchSettlementHint'));
+        if (!original) watchFeedback.textContent += ` · ${t('watchPendingOtherAccount')}`;
+        if (original || watchProjection.settlementCapabilityId) {
+          const details = document.createElement('details');
+          details.watchDisclosure = 'pendingDetailsOpen';
+          details.open = !!watchActions.pendingDetailsOpen;
+          const summary = document.createElement('summary');
+          summary.textContent = t('watchPendingDetails');
+          details.append(summary);
+          if (watchProjection.settlementCapabilityId) {
+            const hint = document.createElement('p');
+            hint.className = 'watch-choice-hint';
+            hint.textContent = t('watchSettlementHint');
+            const check = document.createElement('button');
+            check.type = 'button';
+            check.textContent = t('watchSettleOriginal');
+            const capabilityId = watchProjection.settlementCapabilityId;
+            check.addEventListener('click', () => run('popup-watch-settle', { capabilityId }));
+            details.append(hint); details.append(check);
+          }
+          if (original) {
+            const target = document.createElement('p');
+            target.textContent = `${t('watchOriginalTarget', String(original.animeId))} · ${t(`watchAction_${original.action}`)}`;
+            const retry = document.createElement('button');
+            retry.type = 'button';
+            retry.textContent = t('watchRetryOriginal');
+            retry.addEventListener('click', () => run('popup-watch-retry', { commandId: original.commandId }));
+            details.append(target); details.append(retry);
+          }
+          watchActions.append(details);
         }
       } else {
         if (watchProjection.repairComplete === false) watchFeedback.textContent = t('watchChoicesIncomplete');
@@ -714,10 +795,10 @@
               const fieldset = document.createElement('fieldset');
               fieldset.className = 'watch-choice-group';
               const legend = document.createElement('legend');
-              legend.textContent = group.catalog?.title_ru || group.catalog?.title
-                || group.catalog?.title_en || t('watchOriginalTarget', String(group.effectiveAnimeId));
+            legend.textContent = group.catalog?.title_ru || group.catalog?.title
+                || group.catalog?.title_en || t('watchChoiceGroup', String(index + 1));
               fieldset.append(legend);
-              for (const option of group.options) {
+              for (const [optionIndex, option] of group.options.entries()) {
                 const label = document.createElement('label');
                 const radio = document.createElement('input');
                 radio.type = 'radio';
@@ -726,10 +807,9 @@
                 radio.checked = false;
                 const detail = document.createElement('span');
                 detail.textContent = [t(option.kind === 'rewatching' ? 'watchRewatching' : 'statusWatching'),
+                  t('watchChoiceOption', String(optionIndex + 1)),
                   t('watchTrackedCycle', String(option.ordinal)),
-                  ...(option.episode == null ? [] : [t('episodeLabel', String(option.episode))]),
-                  t('watchOriginalTarget', String(option.animeId)),
-                  t('watchHistoryIdentity', String(option.historyId))].join(' · ');
+                  ...(option.episode == null ? [] : [t('episodeLabel', String(option.episode))])].join(' · ');
                 radio.addEventListener('change', () => {
                   if (!radio.checked) return;
                   selected.set(index, option.cycleId);
@@ -738,6 +818,16 @@
                 label.append(radio);
                 label.append(detail);
                 fieldset.append(label);
+                const identity = document.createElement('details');
+                identity.watchDisclosure = `choice:${option.cycleId}`;
+                identity.open = !!watchActions[identity.watchDisclosure];
+                const identitySummary = document.createElement('summary');
+                identitySummary.textContent = t('watchChoiceDetails', String(optionIndex + 1));
+                const identityText = document.createElement('p');
+                identityText.textContent = [t('watchOriginalTarget', String(option.animeId)),
+                  t('watchHistoryIdentity', String(option.historyId))].join(' · ');
+                identity.append(identitySummary); identity.append(identityText);
+                fieldset.append(identity);
               }
               watchActions.append(fieldset);
             });
@@ -753,7 +843,8 @@
           const suffix = action.ordinal == null ? '' : ` · ${t('watchTrackedCycle', String(action.ordinal))}`;
           if (!manualActions) {
             manualActions = document.createElement('details');
-            manualActions.open = manualWasOpen;
+            manualActions.watchDisclosure = 'manualControlsOpen';
+            manualActions.open = !!watchActions.manualControlsOpen;
             const summary = document.createElement('summary');
             summary.textContent = t('watchManualControls');
             manualActions.append(summary);

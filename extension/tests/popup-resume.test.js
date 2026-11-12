@@ -214,6 +214,32 @@ test('actual repair renderer requires a human choice in every group and preserve
   assert.equal(elements.get('watch-feedback').textContent, 'watchChoicesIncomplete');
 });
 
+test('failed explicit action remains visible after a fresh nonpending projection', async () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'popup.js'), 'utf8').replace(/\r\n/g, '\n');
+  const start = source.indexOf('  async function renderWatchCycle() {');
+  const end = source.indexOf('\n  await renderWatchCycle();\n', start);
+  const element = tag => ({ tagName: String(tag).toUpperCase(), children: [], events: {}, textContent: '',
+    append(child) { this.children.push(child); }, replaceChildren(...children) { this.children = children; },
+    addEventListener(type, callback) { this.events[type] = callback; },
+    querySelectorAll(selector) { return this.children.filter(child => child.tagName === selector.toUpperCase()); } });
+  const elements = new Map(['watch-completion', 'watch-current', 'watch-actions', 'watch-feedback',
+    'watch-cycle-card', 'resume-label', 'resume'].map(id => [id, element('div')]));
+  const projection = { pending: false, snapshot: { history_adopted: true, readiness: 'ready', origins: [],
+    foreground: { cycle_id: null } }, actions: [{ command: 'pause', capabilityId: 'stale-capability' }] };
+  const context = vm.createContext({ matchConfirmed: true, syncAccountActive: true, tab: { id: 71 },
+    watchProjection: null, pauseSessionStateReload: false, renderResume: async () => {},
+    watchCard: elements.get('watch-cycle-card'), watchActions: elements.get('watch-actions'),
+    watchFeedback: elements.get('watch-feedback'), set: (id, value) => { elements.get(id).textContent = value; },
+    t: key => key, requestBackground: async type => type === 'popup-watch-history'
+      ? { ok: true, payload: projection } : { ok: false },
+    document: { createElement: element, getElementById: id => elements.get(id) } });
+  vm.runInContext(`${source.slice(start, end)}\n globalThis.run = renderWatchCycle;`, context);
+  await context.run();
+  const button = elements.get('watch-actions').children[0].children[1];
+  await button.events.click();
+  assert.equal(elements.get('watch-feedback').textContent, 'watchActionFailed');
+});
+
 test('same popup clears previously visible legacy resume after adoption or unknown history', async () => {
   for (const transition of [{ snapshot: { history_adopted: true } }, { snapshot: {} }]) {
     const result = await render({ match: { status: 'ok', animeId: 1 }, records: { 'naruto::3': history(1) },
@@ -310,22 +336,28 @@ test('actual cycle renderer retains completion and shows only component tracked 
   projection.pending = true;
   projection.pendingIntent = { animeId: 303, action: 'start', commandId: 'original-id' };
   await context.run();
-  assert.ok(elements.get('watch-feedback').textContent.includes('watchOriginalTarget:303'));
-  assert.ok(elements.get('watch-feedback').textContent.includes('watchAction_start'));
+  assert.equal(elements.get('watch-feedback').textContent, 'watchCommandUnresolved');
   assert.equal(elements.get('watch-actions').children.length, 1);
+  assert.equal(elements.get('watch-actions').children[0].open, false);
+  assert.ok(elements.get('watch-actions').children[0].children[1].textContent.includes('watchOriginalTarget:303'));
+  elements.get('watch-actions').children[0].open = true;
+  await context.run();
+  assert.equal(elements.get('watch-actions').children[0].open, true, 'pending details retain disclosure state');
   projection.pendingIntent = null;
   await context.run();
   assert.equal(elements.get('watch-actions').children.length, 0, 'foreign account intent offers no retry');
   assert.equal(elements.get('watch-feedback').textContent.includes('303'), false);
   projection.settlementCapabilityId = 'opaque-check';
   await context.run();
-  assert.equal(elements.get('watch-actions').children.length, 1, 'generic check does not disclose a foreign intent');
-  assert.equal(elements.get('watch-actions').children[0].textContent, 'watchSettleOriginal');
-  assert.equal(elements.get('watch-actions').children[0].title, 'watchSettlementHint');
+  assert.equal(elements.get('watch-actions').children.length, 1, 'generic check has one disclosure');
+  assert.equal(elements.get('watch-actions').children[0].children[1].textContent, 'watchSettlementHint');
+  assert.equal(elements.get('watch-actions').children[0].children[2].textContent, 'watchSettleOriginal');
+  assert.equal(elements.get('watch-actions').children[0].children.length, 3, 'foreign intent details remain absent');
   assert.equal(elements.get('watch-feedback').textContent.includes('303'), false);
   projection.pendingIntent = { animeId: 303, action: 'start', commandId: 'original-id' };
   await context.run();
-  assert.equal(elements.get('watch-actions').children.length, 2, 'retry and outcome check are distinct explicit actions');
+  assert.equal(elements.get('watch-actions').children[0].children.length, 5, 'retry and check remain distinct explicit actions');
+  assert.equal(elements.get('watch-actions').children[0].open, true, 'pending disclosure survives foreign-account projection');
 });
 
 test('adopted or unknown account history never substitutes legacy resume into a cycle', async () => {

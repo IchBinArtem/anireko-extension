@@ -257,12 +257,18 @@ for (const status of ['active', 'paused', 'noDate'] as const) {
       await expect(popup.locator('#resume')).toBeVisible();
       await expect(popup.locator('#resume')).toContainText('Серия 1 · 22:51 · Dream Cast');
       if (status === 'noDate') await expect(popup.locator('#resume')).toHaveText('Серия 1 · 22:51 · Dream Cast');
-      else await expect(popup.locator('#resume')).toContainText('Цикл обновлён:');
+      else await expect(popup.locator('#resume')).toContainText('Обновлено:');
+      const resumeBox = await popup.locator('#anime-fields').boundingBox();
+      const statsBox = await popup.locator('#stats-card').boundingBox();
+      expect(resumeBox).not.toBeNull(); expect(statsBox).not.toBeNull();
+      expect(resumeBox!.y).toBeLessThan(statsBox!.y);
       const commands = () => worker.evaluate(async () => (await (await fetch(
         (globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/cycle-history')).json()).posts);
       expect(await commands()).toEqual([], 'read-only resume opening cannot start, adopt or migrate');
       await popup.setViewportSize({ width: 390, height: 850 });
-      await testInfo.attach('current-cycle-resume', { body: await popup.screenshot({ fullPage: true }), contentType: 'image/png' });
+      const resumeScreenshot = testInfo.outputPath('current-cycle-resume.png');
+      await popup.screenshot({ path: resumeScreenshot, fullPage: true });
+      await testInfo.attach('current-cycle-resume', { path: resumeScreenshot, contentType: 'image/png' });
       if (status === 'active') {
         await popup.getByText('Управление вручную', { exact: true }).click();
         await popup.getByRole('button', { name: /^Приостановить просмотр/ }).click();
@@ -529,7 +535,7 @@ test('native movie Complete80 then close/reopen starts one repeat without popup 
   } finally { await popup?.close(); await page.close(); }
 });
 
-test('cycle settlement preserves lost-ACK intent across account transfer and popup reopen', async () => {
+test('cycle settlement preserves lost-ACK intent across account transfer and popup reopen', async ({}, testInfo) => {
   await worker.evaluate(async () => {
     await chrome.storage.local.set({ 'auto-mark': true, 'sync-account': { id: 18, name: 'TestUser' } });
     const base = (globalThis as any).AniRekoRuntimeConfig.apiBase;
@@ -550,19 +556,40 @@ test('cycle settlement preserves lost-ACK intent across account transfer and pop
     popup = await openPopup(tabId);
     await popup.getByText('Управление вручную', { exact: true }).click();
     await popup.getByRole('button', { name: 'Начать новый просмотр', exact: true }).click();
-    await expect(popup.getByRole('button', { name: 'Проверить результат команды', exact: true })).toBeVisible();
     const original = await pending();
     expect(original.version).toBe(1);
     expect(original.acknowledged).toBe(false);
     expect((await receipts()).posts).toHaveLength(1);
+    await expect(popup.locator('#watch-feedback')).toHaveText('Изменение ещё не подтверждено.');
+    const pendingDetails = popup.locator('#watch-actions details');
+    await expect(pendingDetails).not.toHaveAttribute('open', '');
+    await expect(popup.getByRole('button', { name: 'Проверить результат', exact: true })).toBeHidden();
+    await expect(popup.getByRole('button', { name: 'Повторить исходную команду' })).toBeHidden();
+    await expect(pendingDetails.locator('.watch-choice-hint')).toBeHidden();
+    await popup.setViewportSize({ width: 390, height: 850 });
+    const pendingScreenshot = testInfo.outputPath('pending-collapsed-ru.png');
+    await popup.screenshot({ path: pendingScreenshot, fullPage: true });
+    await testInfo.attach('pending-collapsed-ru', { path: pendingScreenshot, contentType: 'image/png' });
+    await pendingDetails.locator('summary').click();
+    await expect(pendingDetails).toHaveAttribute('open', '');
+    await expect(pendingDetails.locator('.watch-choice-hint')).toBeVisible();
+    await expect(pendingDetails.locator('.watch-choice-hint')).toContainText('позднее выполнение будет запрещено');
+    await expect(popup.getByRole('button', { name: 'Проверить результат', exact: true })).toBeVisible();
+    await expect(popup.getByRole('button', { name: 'Повторить исходную команду' })).toBeVisible();
+    const expandedScreenshot = testInfo.outputPath('pending-expanded-ru.png');
+    await popup.screenshot({ path: expandedScreenshot, fullPage: true });
+    await testInfo.attach('pending-expanded-ru', { path: expandedScreenshot, contentType: 'image/png' });
+    expect((await receipts()).posts).toHaveLength(1, 'opening details does not retry');
+    expect((await receipts()).settlementPosts).toEqual([], 'opening details does not settle');
     await popup.close(); popup = null;
     await worker.evaluate(async () => {
       await chrome.storage.local.set({ 'sync-account': { id: 19, name: 'MergedOwner' } });
       await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/session?on=1&user=19');
     });
     popup = await openPopup(tabId);
-    await expect(popup.locator('#watch-feedback')).toContainText('Исходная команда относится к другому аккаунту');
-    const settle = () => popup!.getByRole('button', { name: 'Проверить результат команды', exact: true });
+    await expect(popup.locator('#watch-feedback')).toContainText('Неподтверждённое сохранение связано с другим аккаунтом');
+    const settle = () => popup!.getByRole('button', { name: 'Проверить результат', exact: true });
+    await popup.getByText('Проверка сохранения', { exact: true }).click();
     await expect(settle()).toBeVisible();
     expect(await pending()).toEqual(original);
     expect((await receipts()).settlementPosts).toEqual([]);
@@ -571,6 +598,7 @@ test('cycle settlement preserves lost-ACK intent across account transfer and pop
     await expect.poll(async () => (await receipts()).settlementPosts.length).toBe(1);
     expect(await pending()).toEqual(original);
     await popup.close(); popup = await openPopup(tabId);
+    await popup.getByText('Проверка сохранения', { exact: true }).click();
     await expect(settle()).toBeVisible();
     expect((await receipts()).settlementPosts).toHaveLength(1);
     expect((await receipts()).posts).toHaveLength(1);
@@ -731,7 +759,7 @@ test('cycle repair requires separate explicit choices for complete related group
   } finally { await popup?.close(); await page.close(); }
 });
 
-test('renders browser-local activity as a calm calendar with honest missing days', async () => {
+test('renders browser-local activity as a calm calendar with honest missing days', async ({}, testInfo) => {
   const page = await context.newPage();
   await page.goto(`${siteBase}/anime.html`);
   const tabId = await extensionTabId(`${siteBase}/*`);
@@ -745,8 +773,14 @@ test('renders browser-local activity as a calm calendar with honest missing days
       const date = `${day.getFullYear()}-${String(day.getMonth() + 1).padStart(2, '0')}-${String(day.getDate()).padStart(2, '0')}`;
       return [date, { watchedSeconds: seconds, episodeKeys: [] }];
     }));
-    await (globalThis as any).AniRekoTestHooks.seedLocalHistory({ records: {}, days: {
-      [key]: { watchedSeconds: 3600, episodeKeys: ['example::1'] },
+    await (globalThis as any).AniRekoTestHooks.seedLocalHistory({ records: {
+      'first::1': { title: 'Mutable decoy', voice: 'Wrong voice', position: 9999, lastWatchedAt: Date.now() },
+    }, days: {
+      [key]: { watchedSeconds: 3600, episodeKeys: ['first::1', 'second::2'], detailsPartial: true,
+        details: [
+          { animeId: 101, titleKey: null, title: 'Первое аниме', episode: 1, voice: 'Озвучка А', watchedSeconds: 300, position: 120, duration: 1200, observedAt: Date.now() },
+          { animeId: null, titleKey: 'second', title: 'Второе аниме', episode: 2, voice: 'Озвучка Б', watchedSeconds: 0, position: 20, duration: 900, observedAt: Date.now() },
+        ] },
       ...boundaryDays,
       '2025-01-01': { watchedSeconds: 100000, episodeKeys: [] },
     } });
@@ -771,6 +805,24 @@ test('renders browser-local activity as a calm calendar with honest missing days
   await expect(popup.locator('.activity-cell.today')).toHaveClass(/level-4/);
   await popup.locator('.activity-cell.today').click();
   await expect(popup.locator('#activity-detail')).toContainText('60 мин');
+  await expect(popup.locator('.activity-cell.today')).toHaveAttribute('aria-pressed', 'true');
+  await expect(popup.locator('#activity-entries')).toContainText('Подробности за этот день неполные');
+  await expect(popup.locator('.activity-entry').nth(0).locator('strong')).toHaveText('Первое аниме');
+  await expect(popup.locator('.activity-entry').nth(0).locator('p').first()).toContainText('Серия 1 · Озвучка А');
+  await expect(popup.locator('.activity-entry').nth(1).locator('strong')).toHaveText('Второе аниме');
+  await expect(popup.locator('.activity-entry').nth(1).locator('p').first()).toContainText('Серия 2 · Озвучка Б');
+  await expect(popup.locator('#activity-entries')).toContainText('Зафиксировано без времени просмотра');
+  await expect(popup.locator('#activity-entries')).toContainText('Последняя позиция: 2:00 из 20:00');
+  await expect(popup.locator('#activity-entries')).not.toContainText('Mutable decoy');
+  await expect(popup.locator('#activity-entries')).not.toContainText('Wrong voice');
+  const detailScreenshot = testInfo.outputPath('activity-day-detail-ru.png');
+  await popup.screenshot({ path: detailScreenshot, fullPage: true });
+  await testInfo.attach('activity-day-detail-ru', { path: detailScreenshot, contentType: 'image/png' });
+  await popup.locator('.activity-cell.today').press('ArrowUp');
+  await expect(popup.locator('#activity-entries')).toContainText('Подробности за этот день недоступны');
+  await expect(popup.locator('.activity-cell[tabindex="0"]')).toHaveAttribute('aria-pressed', 'true');
+  await popup.locator('.activity-cell[tabindex="0"]').press('ArrowDown');
+  await expect(popup.locator('#activity-entries')).toContainText('Первое аниме');
   await expect(popup.locator('#today-episodes')).toHaveAttribute('title', /не обязательно досмотренные/);
   await expect(popup.locator('.activity-cell.today')).toHaveCSS('background-color', 'rgb(52, 211, 153)');
   await expect(popup.locator('.activity-cell[tabindex="0"]')).toHaveCount(1);

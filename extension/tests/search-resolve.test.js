@@ -1707,6 +1707,60 @@ test('local history queue captures media and match before its asynchronous turn'
   assert.equal(record.position, 10);
   assert.equal(record.voice, 'Original');
   assert.equal(record.animeId, 101);
+  const detail = Object.values((await storage.local.get('watch-history'))['watch-history'].days)[0].details[0];
+  assert.equal(detail.voice, 'Original', 'captured current voice is retained');
+});
+
+test('day details snapshot actual observations, not mutable resume, and keep legacy and overflow partial', async () => {
+  const { context, storage } = loadServiceWorker({ fetchImpl: async () => { throw Error('unexpected_network'); } });
+  const midnight = new Date(2026, 9, 5, 0, 0, 0).getTime();
+  const state = { recognition: { title: 'Observed Anime' }, match: { status: 'none' } };
+  const send = async (overrides, previous = null) => {
+    state.player = { episode: 1, currentTime: 10, duration: 1200, observedAt: midnight,
+      reason: 'pause', playbackStarted: true, ...overrides };
+    await context.queueHistoryUpdate(state, state.player, previous);
+  };
+  await send({ observedAt: midnight - 5000, voice: 'A' });
+  await send({ currentTime: 15, observedAt: midnight, voice: 'A' },
+    { currentTime: 10, observedAt: midnight - 5000, playbackStarted: true });
+  await send({ currentTime: 2, observedAt: midnight + 1000, reason: 'seeked', voice: 'A' });
+  await send({ currentTime: 40, observedAt: midnight + 2000, voice: 'B' });
+  state.match = { status: 'ok', exact: true, animeId: 101 };
+  await send({ currentTime: 50, observedAt: midnight + 3000, voice: 'A' });
+  const history = (await storage.local.get('watch-history'))['watch-history'];
+  const key = context.localDateKey(midnight);
+  const prior = history.days[context.localDateKey(midnight - 5000)];
+  const day = history.days[key];
+  assert.equal(prior.details[0].watchedSeconds, 0);
+  assert.equal(day.watchedSeconds, 5, 'whole delta goes to observation date');
+  assert.equal(day.details.length, 3, 'voice and confirmed identity are separate');
+  assert.equal(day.details[0].watchedSeconds, 5);
+  assert.equal(day.details[0].position, 2, 'latest rewind, not greatest position');
+  assert.equal(day.details[0].animeId, null);
+  assert.equal(day.details[2].animeId, 101);
+  await send({ currentTime: 999, observedAt: midnight + 500, voice: 'A' });
+  assert.equal(day.details[2].position, 50, 'older observations cannot replace the confirmed endpoint');
+  for (let n = 2; n <= 35; n++) await send({ episode: n, observedAt: midnight + 4000 + n });
+  assert.equal(day.details.length, 32);
+  assert.equal(day.detailsPartial, true);
+  assert.equal(day.episodeKeys.length, 35, 'cap does not change existing totals');
+});
+
+test('existing day without details stays partial even with zero total', async () => {
+  const localStorage = makeStorage();
+  const observedAt = new Date(2026, 9, 5, 12).getTime();
+  const key = '2026-10-05';
+  await localStorage.set({ 'watch-history': { records: { 'legacy::1': { title: 'Legacy', episode: 1,
+    watchedSeconds: 0, voice: 'Old voice', lastWatchedAt: observedAt - 1000 } },
+    days: { [key]: { watchedSeconds: 0, episodeKeys: [] } } } });
+  const { context, storage } = loadServiceWorker({ localStorage, fetchImpl: async () => { throw Error('unexpected_network'); } });
+  const state = { recognition: { title: 'Legacy' }, match: { status: 'none' },
+    player: { episode: 1, currentTime: 0, duration: 1200, observedAt, reason: 'pause' } };
+  await context.queueHistoryUpdate(state, state.player, null);
+  const day = (await storage.local.get('watch-history'))['watch-history'].days[key];
+  assert.equal(day.detailsPartial, true);
+  assert.equal(day.details[0].watchedSeconds, 0);
+  assert.equal(day.details[0].voice, null, 'old record voice is not an observation');
 });
 
 test('local history queue rejects a replacement page or anime before writing', async () => {

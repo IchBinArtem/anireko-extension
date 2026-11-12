@@ -2584,9 +2584,40 @@ function queueHistoryUpdate(state, player, previousPlayer, writeBinding = captur
       lastWatchedAt: player.observedAt,
     };
     const dateKey = localDateKey(player.observedAt);
-    const day = history.days[dateKey] || { watchedSeconds: 0, episodeKeys: [] };
+    const existingDay = history.days[dateKey];
+    const day = existingDay || { watchedSeconds: 0, episodeKeys: [] };
     day.watchedSeconds = Math.round((day.watchedSeconds + watchedDelta) * 10) / 10;
     if (!day.episodeKeys.includes(recordKey)) day.episodeKeys.push(recordKey);
+    // Day snapshots are observations, not references to the mutable resume record.
+    if (!Array.isArray(day.details)) {
+      day.details = [];
+      day.detailsPartial = Boolean(existingDay);
+    }
+    const currentVoice = player.voice || event.topVoice || recognition.voice;
+    const voice = typeof currentVoice === 'string' && currentVoice.trim() ? currentVoice.trim() : null;
+    const episode = player.episode ?? null;
+    if ((matchedAnimeId === null && titleKey.length > 180) || (voice && voice.length > 80)) {
+      day.detailsPartial = true;
+    } else {
+      let detail = day.details.find(item => item && item.animeId === matchedAnimeId
+        && (matchedAnimeId !== null || item.titleKey === titleKey)
+        && item.episode === episode && item.voice === voice);
+      if (!detail && day.details.length < 32) {
+        detail = { animeId: matchedAnimeId, titleKey: matchedAnimeId === null ? titleKey : null,
+          title: String(recognition.title).slice(0, 180), episode, voice, watchedSeconds: 0,
+          observedAt: player.observedAt, position: player.currentTime, duration: player.duration };
+        day.details.push(detail);
+      } else if (!detail) day.detailsPartial = true;
+      if (detail) {
+        detail.watchedSeconds = Math.round(((Number(detail.watchedSeconds) || 0) + watchedDelta) * 10) / 10;
+        if (player.observedAt >= detail.observedAt) {
+          detail.title = String(recognition.title).slice(0, 180);
+          detail.observedAt = player.observedAt;
+          detail.position = player.currentTime;
+          detail.duration = player.duration;
+        }
+      }
+    }
     history.days[dateKey] = day;
 
     await flushHistory(player, watchedTransition, writeBinding);
