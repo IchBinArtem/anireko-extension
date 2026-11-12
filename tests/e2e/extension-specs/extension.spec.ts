@@ -556,7 +556,11 @@ test('cycle settlement preserves lost-ACK intent across account transfer and pop
     popup = await openPopup(tabId);
     await popup.getByText('Управление вручную', { exact: true }).click();
     await popup.getByRole('button', { name: 'Начать новый просмотр', exact: true }).click();
-    await expect(popup.locator('#watch-feedback')).toHaveText('Изменение ещё не подтверждено.');
+    await expect(popup.locator('#watch-feedback')).toHaveText('Сохранение не подтверждено.');
+    await expect(popup.locator('#watch-current')).not.toContainText('Запустите видео');
+    expect(await popup.locator('#watch-feedback').evaluate(node => ({
+      top: getComputedStyle(node).marginTop, bottom: getComputedStyle(node).marginBottom,
+    }))).toEqual({ top: '4px', bottom: '4px' });
     const original = await pending();
     expect(original.version).toBe(1);
     expect(original.acknowledged).toBe(false);
@@ -589,7 +593,7 @@ test('cycle settlement preserves lost-ACK intent across account transfer and pop
     popup = await openPopup(tabId);
     await expect(popup.locator('#watch-feedback')).toContainText('Неподтверждённое сохранение связано с другим аккаунтом');
     const settle = () => popup!.getByRole('button', { name: 'Проверить результат', exact: true });
-    await popup.getByText('Проверка сохранения', { exact: true }).click();
+    await popup.getByText('Подробнее', { exact: true }).click();
     await expect(settle()).toBeVisible();
     expect(await pending()).toEqual(original);
     expect((await receipts()).settlementPosts).toEqual([]);
@@ -598,7 +602,7 @@ test('cycle settlement preserves lost-ACK intent across account transfer and pop
     await expect.poll(async () => (await receipts()).settlementPosts.length).toBe(1);
     expect(await pending()).toEqual(original);
     await popup.close(); popup = await openPopup(tabId);
-    await popup.getByText('Проверка сохранения', { exact: true }).click();
+    await popup.getByText('Подробнее', { exact: true }).click();
     await expect(settle()).toBeVisible();
     expect((await receipts()).settlementPosts).toHaveLength(1);
     expect((await receipts()).posts).toHaveLength(1);

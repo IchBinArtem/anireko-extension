@@ -733,7 +733,9 @@
         if (current.episode != null) parts.push(t('episodeLabel', String(current.episode)));
         if (currentOrigin.anime_id !== snapshot.requested_anime_id) parts.push(t('watchOtherTitle'));
       } else {
-        parts.push(t('watchNoActiveCycle'));
+        // A pending save needs one clear warning, not a second prompt to play.
+        // Keep actual paused/current/reconciliation state visible below.
+        if (!watchProjection.pending) parts.push(t('watchNoActiveCycle'));
         const paused = origins.filter((origin) => origin.state?.current?.status === 'paused');
         const seenPaused = new Set();
         for (const origin of paused) {

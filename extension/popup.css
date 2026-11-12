@@ -301,7 +301,7 @@ h1 { margin: 0; font-size: 17px; line-height: 1.15; letter-spacing: -.02em; }
 #watch-cycle-card { margin-top: 12px; }
 #watch-completion { color: #8bd5b2; }
 #watch-completion:empty, #watch-current:empty, #watch-feedback:empty { display: none; }
-#watch-current, #watch-feedback { font-size: 12px; line-height: 1.45; color: #b8c3d0; }
+#watch-current, #watch-feedback { margin: 4px 0; font-size: 12px; line-height: 1.45; color: #b8c3d0; }
 #watch-actions { display: flex; flex-wrap: wrap; gap: 6px; }
 #watch-actions details { width: 100%; color: #b8c3d0; font-size: 11px; }
 #watch-actions summary { cursor: pointer; padding: 4px 0; }
