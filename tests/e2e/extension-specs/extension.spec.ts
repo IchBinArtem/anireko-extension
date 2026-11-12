@@ -252,6 +252,10 @@ for (const status of ['active', 'paused', 'noDate'] as const) {
         const base = (globalThis as any).AniRekoRuntimeConfig.apiBase;
         await fetch(base + '/__test/cycle-history?resume=' + (mode === 'noDate' ? 'paused&noDate=1' : mode));
       }, status);
+      // Resume is intentionally hidden during active playback. Establish the
+      // sensor's paused state, not only its earlier seek position, before opening.
+      await setSyntheticPlayback(page.frameLocator('#main-player'), '#main-video', { currentTime: 1, paused: true });
+      await expect.poll(async () => (await storedTabState(tabId))?.player?.playing).toBe(false);
       popup = await openPopup(tabId);
       await expect(popup.locator('#resume-label')).toHaveText('Где остановился');
       await expect(popup.locator('#resume')).toBeVisible();
@@ -262,6 +266,22 @@ for (const status of ['active', 'paused', 'noDate'] as const) {
       const statsBox = await popup.locator('#stats-card').boundingBox();
       expect(resumeBox).not.toBeNull(); expect(statsBox).not.toBeNull();
       expect(resumeBox!.y).toBeLessThan(statsBox!.y);
+      for (const width of [360, 390]) {
+        await popup.setViewportSize({ width, height: 850 });
+        const positions = await popup.evaluate(() => {
+          const anime = document.getElementById('anime-check')!.getBoundingClientRect();
+          const resume = document.getElementById('anime-fields')!.getBoundingClientRect();
+          const player = document.getElementById('player-check')!.getBoundingClientRect();
+          const change = document.getElementById('match-change')!;
+          return { order: anime.bottom <= resume.top && resume.bottom <= player.top,
+            changeHeight: change.getBoundingClientRect().height,
+            changeBackground: getComputedStyle(change).backgroundColor };
+        });
+        expect(positions.order).toBe(true);
+        expect(positions.changeHeight).toBeGreaterThanOrEqual(24);
+        expect(positions.changeBackground).toBe('rgba(0, 0, 0, 0)');
+      }
+      await expect(popup.locator('#match-change')).toHaveText('Не то аниме?');
       const commands = () => worker.evaluate(async () => (await (await fetch(
         (globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/cycle-history')).json()).posts);
       expect(await commands()).toEqual([], 'read-only resume opening cannot start, adopt or migrate');

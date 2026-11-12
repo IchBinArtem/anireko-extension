@@ -230,7 +230,7 @@
     "message": "Эта страница связана с «$TITLE$». Можно найти другой тайтл или сбросить привязку.",
     "placeholders": { "title": { "content": "$1" } }
   },
-  "changeAnime": { "message": "Изменить аниме" },
+  "changeAnime": { "message": "Не то аниме?" },
   "changeAnimeTitle": { "message": "Исправить совпадение" },
   "changeAnimeDetail": {
     "message": "Сейчас выбрано «$TITLE$». Найдите и выберите правильный тайтл. Изменение сохранится только в этом браузере.",

@@ -230,7 +230,7 @@
     "message": "This page is linked to “$TITLE$”. You can find another title or reset the binding.",
     "placeholders": { "title": { "content": "$1" } }
   },
-  "changeAnime": { "message": "Change anime" },
+  "changeAnime": { "message": "Wrong anime?" },
   "changeAnimeTitle": { "message": "Correct the match" },
   "changeAnimeDetail": {
     "message": "“$TITLE$” is selected now. Find and choose the correct title. The change is stored only in this browser.",

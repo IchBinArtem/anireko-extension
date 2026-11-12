@@ -4,9 +4,11 @@ const path = require('node:path');
 const vm = require('node:vm');
 const test = require('node:test');
 
-test('resume follows watch controls and precedes activity', () => {
+test('resume follows anime and precedes player, history controls and activity', () => {
   const html = fs.readFileSync(path.join(__dirname, '..', 'popup.html'), 'utf8');
-  assert.ok(html.indexOf('id="watch-cycle-card"') < html.indexOf('id="anime-fields"'));
+  assert.ok(html.indexOf('id="anime-check"') < html.indexOf('id="anime-fields"'));
+  assert.ok(html.indexOf('id="anime-fields"') < html.indexOf('id="player-check"'));
+  assert.ok(html.indexOf('id="anime-fields"') < html.indexOf('id="watch-cycle-card"'));
   assert.ok(html.indexOf('id="anime-fields"') < html.indexOf('id="stats-card"'));
 });
 
