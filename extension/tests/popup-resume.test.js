@@ -288,19 +288,30 @@ test('failed explicit action remains visible after a fresh nonpending projection
     'watch-cycle-card', 'resume-label', 'resume'].map(id => [id, element('div')]));
   const projection = { pending: false, snapshot: { history_adopted: true, readiness: 'ready', origins: [],
     foreground: { cycle_id: null } }, actions: [{ command: 'pause', capabilityId: 'stale-capability' }] };
+  projection.snapshot.foreground.cycle_id = 'first-view';
+  projection.snapshot.origins = [{ anime_id: 101, state: { current: {
+    cycle_id: 'first-view', status: 'active', kind: 'watching', episode: 1,
+  } } }];
+  projection.actions = [{ command: 'cancel', capabilityId: 'cancel-first-view' }];
   const context = vm.createContext({ matchConfirmed: true, syncAccountActive: true, tab: { id: 71 },
     accountActivityEpoch: 0, localWriteRevision: 'revision', playerFound: true,
     watchProjection: null, pauseSessionStateReload: false, renderResume: async () => {},
     watchCard: elements.get('watch-cycle-card'), watchActions: elements.get('watch-actions'),
     watchFeedback: elements.get('watch-feedback'), set: (id, value) => { elements.get(id).textContent = value; },
-    t: key => key, requestBackground: async type => type === 'popup-watch-history'
-      ? { ok: true, payload: projection } : { ok: false },
+    t: key => key, requestBackground: async type => {
+      if (type === 'popup-watch-history') return { ok: true, payload: projection };
+      projection.snapshot.foreground.cycle_id = null;
+      projection.snapshot.origins = [];
+      projection.actions = [{ command: 'start', capabilityId: 'next-automatic-start' }];
+      return { ok: false };
+    },
     document: { createElement: element, getElementById: id => elements.get(id) } });
   vm.runInContext(`${source.slice(start, end)}\n globalThis.run = renderWatchCycle;`, context);
   await context.run();
   const button = elements.get('watch-actions').children[0].children[1];
   await button.events.click();
   assert.equal(elements.get('watch-feedback').textContent, 'watchActionFailed');
+  assert.equal(elements.get('watch-cycle-card').hidden, false, 'failure stays visible when successor has only automatic Start');
 });
 
 test('same popup clears previously visible legacy resume after adoption or unknown history', async () => {
@@ -448,6 +459,18 @@ test('actual cycle renderer retains completion and shows only component tracked 
   snapshot.totals.completed = 0;
   await context.run();
   assert.equal(elements.get('watch-cycle-card').hidden, true, 'idle card with no history/action is not another play-video prompt');
+  context.playerFound = false;
+  for (const command of ['start', 'initialize']) {
+    projection.actions = [{ command, capabilityId: 'automatic-only' }];
+    await context.run();
+    assert.equal(elements.get('watch-cycle-card').hidden, true, `${command} alone is automatic, not a user task`);
+    assert.equal(elements.get('watch-actions').children.length, 0);
+    assert.equal(elements.get('watch-current').textContent, '');
+  }
+  snapshot.previously_completed = true;
+  await context.run();
+  assert.equal(elements.get('watch-cycle-card').hidden, false, 'already-watched information is retained without a start button');
+  assert.equal(elements.get('watch-completion').textContent, 'watchPreviouslyCompleted');
   projection.pending = true;
   await context.run();
   assert.equal(elements.get('watch-cycle-card').hidden, false, 'pending safety warning is never removed as empty space');

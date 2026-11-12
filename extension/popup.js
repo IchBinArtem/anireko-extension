@@ -832,9 +832,6 @@
         if (current.episode != null) parts.push(t('episodeLabel', String(current.episode)));
         if (currentOrigin.anime_id !== snapshot.requested_anime_id) parts.push(t('watchOtherTitle'));
       } else {
-        // A pending save needs one clear warning, not a second prompt to play.
-        // Keep actual paused/current/reconciliation state visible below.
-        if (!watchProjection.pending && !playerFound) parts.push(t('watchNoActiveCycle'));
         const paused = origins.filter((origin) => origin.state?.current?.status === 'paused');
         const seenPaused = new Set();
         for (const origin of paused) {
@@ -862,8 +859,9 @@
         finally {
           await renderWatchCycle();
           await renderResume(false);
-          if (failed && !watchProjection?.pending) {
+          if (failed && canPublish() && !watchProjection?.pending) {
             watchFeedback.textContent = [watchFeedback.textContent, t('watchActionFailed')].filter(Boolean).join(' · ');
+            watchCard.hidden = false;
           }
           pauseSessionStateReload = false;
         }
@@ -905,6 +903,8 @@
         if (watchProjection.repairComplete === false) watchFeedback.textContent = t('watchChoicesIncomplete');
         let manualActions = null;
         for (const action of watchProjection.actions || []) {
+          // Playback owns ordinary initialization/start; do not ask users to do it twice.
+          if (action.command === 'initialize' || action.command === 'start') continue;
           if (action.command === 'reconcile') {
             const selected = new Map();
             const groups = action.groups || [];

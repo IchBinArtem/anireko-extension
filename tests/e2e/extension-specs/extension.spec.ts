@@ -408,6 +408,20 @@ test('popup keeps local UI on failed session and rejects old taste after an acco
   }
 });
 
+// Test setup only: the user-facing Start control is intentionally absent.
+// Exercise the existing immutable capability transport to create recovery fixtures.
+async function startCycleFixture(popup: Page, tabId: number) {
+  await popup.evaluate(async (tabId) => {
+    const runtime = await chrome.runtime.sendMessage({ type: 'popup-runtime-info' });
+    const expectedRevision = runtime.payload.localWriteRevision;
+    const history = await chrome.runtime.sendMessage({ type: 'popup-watch-history', tabId, expectedRevision });
+    const start = history.payload?.actions?.find((action: any) => action.command === 'start');
+    if (!start) throw new Error('synthetic_start_capability_missing');
+    await chrome.runtime.sendMessage({ type: 'popup-watch-command', capabilityId: start.capabilityId, expectedRevision });
+  }, tabId);
+  await popup.reload();
+}
+
 test('paused playback preserves previous completion and exposes optional manual controls', async ({}, testInfo) => {
   await worker.evaluate(async () => {
     await chrome.storage.local.set({ 'auto-mark': true, 'sync-account': { id: 18, name: 'TestUser' } });
@@ -425,15 +439,17 @@ test('paused playback preserves previous completion and exposes optional manual 
     await popup.setViewportSize({ width: 390, height: 600 });
     await expect(popup.locator('#watch-cycle-card')).toBeVisible();
     await expect(popup.locator('#watch-completion')).toHaveText('Уже просмотрено · Завершено с начала учёта: 1');
-    await expect(popup.locator('#watch-current')).toContainText('просмотр учтётся автоматически');
+    await expect(popup.locator('#watch-current')).toBeEmpty();
+    await expect(popup.getByRole('button', { name: 'Начать новый просмотр', exact: true })).toHaveCount(0);
+    await expect(popup.getByRole('button', { name: 'Подключить историю просмотров', exact: true })).toHaveCount(0);
     const commands = () => worker.evaluate(async () => {
       const response = await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/cycle-history');
       return (await response.json()).posts;
     });
     expect(await commands()).toEqual([]);
-    await popup.getByText('Управление вручную', { exact: true }).click();
-    await popup.getByRole('button', { name: 'Начать новый просмотр', exact: true }).click();
+    await startCycleFixture(popup, tabId);
     await expect(popup.locator('#watch-current')).toContainText('Пересматриваю');
+    await popup.getByText('Управление вручную', { exact: true }).click();
     await expect(popup.locator('#watch-actions details')).toHaveAttribute('open', '');
     const completionBox = await popup.locator('#watch-completion').boundingBox();
     const activityBox = await popup.locator('#stats-card').boundingBox();
@@ -554,8 +570,7 @@ test('cycle settlement preserves lost-ACK intent across account transfer and pop
     const tabId = await extensionTabId(`${siteBase}/*`);
     await expect.poll(async () => (await storedTabState(tabId))?.match?.status).toBe('ok');
     popup = await openPopup(tabId);
-    await popup.getByText('Управление вручную', { exact: true }).click();
-    await popup.getByRole('button', { name: 'Начать новый просмотр', exact: true }).click();
+    await startCycleFixture(popup, tabId);
     await expect(popup.locator('#watch-feedback')).toHaveText('Сохранение не подтверждено.');
     await expect(popup.locator('#watch-current')).not.toContainText('Запустите видео');
     expect(await popup.locator('#watch-feedback').evaluate(node => ({
@@ -641,8 +656,7 @@ test('Cancel survives actual MV3 worker stop while the same video keeps playing'
     const tabId = await extensionTabId(`${siteBase}/*`);
     await expect.poll(async () => (await storedTabState(tabId))?.match?.status).toBe('ok');
     popup = await openPopup(tabId);
-    await popup.getByText('Управление вручную', { exact: true }).click();
-    await popup.getByRole('button', { name: 'Начать новый просмотр', exact: true }).click();
+    await startCycleFixture(popup, tabId);
     await expect(popup.locator('#watch-current')).toContainText('Пересматриваю');
     await popup.close(); popup = null;
     await setSyntheticPlayback(page.frameLocator('#main-player'), '#main-video', { currentTime: 0, paused: false });
