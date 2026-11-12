@@ -481,7 +481,12 @@
   if (match?.status === 'ok' && match.slug) {
     primaryAction.href = `${siteBase}/${siteLocale}/anime/${match.slug}-${match.animeId}`;
     primaryAction.hidden = false;
-    set('anireko-match', `${t('catalogPrefix')} ${match.title}${match.year ? ` (${match.year})` : ''}${match.manual ? ` · ${t('manualMatchMark')}` : ''}`);
+    const sameTitle = typeof match.title === 'string' && typeof recognition.title === 'string'
+      && match.title.trim() === recognition.title.trim();
+    const catalogNote = sameTitle
+      ? [match.year ? String(match.year) : '', match.manual ? t('manualMatchMark') : ''].filter(Boolean).join(' · ')
+      : `${t('catalogPrefix')} ${match.title}${match.year ? ` (${match.year})` : ''}${match.manual ? ` · ${t('manualMatchMark')}` : ''}`;
+    set('anireko-match', catalogNote);
   } else {
     primaryAction.hidden = true;
     set('anireko-match', match?.status === 'ambiguous'

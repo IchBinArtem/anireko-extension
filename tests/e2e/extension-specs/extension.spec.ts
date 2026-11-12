@@ -556,11 +556,11 @@ test('cycle settlement preserves lost-ACK intent across account transfer and pop
     popup = await openPopup(tabId);
     await popup.getByText('Управление вручную', { exact: true }).click();
     await popup.getByRole('button', { name: 'Начать новый просмотр', exact: true }).click();
+    await expect(popup.locator('#watch-feedback')).toHaveText('Изменение ещё не подтверждено.');
     const original = await pending();
     expect(original.version).toBe(1);
     expect(original.acknowledged).toBe(false);
     expect((await receipts()).posts).toHaveLength(1);
-    await expect(popup.locator('#watch-feedback')).toHaveText('Изменение ещё не подтверждено.');
     const pendingDetails = popup.locator('#watch-actions details');
     await expect(pendingDetails).not.toHaveAttribute('open', '');
     await expect(popup.getByRole('button', { name: 'Проверить результат', exact: true })).toBeHidden();
@@ -835,7 +835,7 @@ test('renders browser-local activity as a calm calendar with honest missing days
   await page.close();
 });
 
-test('renders the English manifest and popup for an English Chrome UI', async () => {
+test('renders the English manifest and popup for an English Chrome UI', async ({}, testInfo) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'anireko-extension-en-'));
   const englishExtensionPath = path.join(root, 'extension');
   const englishProfilePath = path.join(root, 'profile');
@@ -859,7 +859,7 @@ test('renders the English manifest and popup for an English Chrome UI', async ()
     await englishPopup.goto(`chrome-extension://${englishExtensionId}/popup.html`);
 
     await expect(englishPopup.locator('html')).toHaveAttribute('lang', 'en');
-    await expect(englishPopup.locator('.brand span')).toHaveText('Anime watch tracker');
+    await expect(englishPopup.locator('.brand h1')).toHaveText('AniReko');
     await expect(englishPopup.locator('#privacy-accept')).toHaveText('Got it, enable AniReko');
     await expect(englishPopup.locator('#anime-check-title')).toHaveText('Enable AniReko');
     await expect(englishPopup.locator('#page-recovery')).toBeHidden();
@@ -868,13 +868,107 @@ test('renders the English manifest and popup for an English Chrome UI', async ()
     );
     await expect.poll(() => englishWorker.evaluate(() => chrome.runtime.getManifest().name))
       .toBe('AniReko — Anime Tracker');
+    // Presentation-only fixture: the real popup renderer and English i18n with
+    // deterministic local state; no matcher or live service claim is made.
+    const preview = await englishContext.newPage();
+    await preview.addInitScript(() => {
+      const title = 'A very long anime title which should remain fully readable and leave enough room for the primary action';
+      const pageUrl = 'https://layout.example.test/watch';
+      const state = { navigationToken: 'fixture-token', pageUrl, recognition: { title, episode: 1 },
+        match: { status: 'ok', exact: true, animeId: 1, slug: 'fixture', title, year: 2024 },
+        player: { player: 'HTML5', playing: false, playbackStarted: true, episode: 1,
+          currentTime: 20, duration: 1200, progress: 20 / 1200 } };
+      chrome.tabs.get = async () => ({ id: 1, url: pageUrl } as chrome.tabs.Tab);
+      chrome.tabs.sendMessage = async () => ({ ok: true, documentUrl: pageUrl, documentToken: 'fixture-token' });
+      chrome.storage.local.get = async () => ({ 'privacy-consent': { version: 1, acceptedAt: 1 }, 'watch-history': { records: {}, days: {} } });
+      chrome.storage.session.get = async () => ({ 'tab:1': state });
+      chrome.runtime.sendMessage = async (message: any) => message.type === 'popup-runtime-info'
+        ? { ok: true, payload: { siteBase: 'https://anireko.com', localWriteRevision: 'fixture' } }
+        : { ok: false };
+    });
+    await preview.goto(`chrome-extension://${englishExtensionId}/popup.html?tabId=1`);
+    await expect(preview.locator('#title')).toContainText('A very long anime title');
+    const englishGeometry = [];
+    for (const width of [360, 390]) {
+      await preview.setViewportSize({ width, height: 850 });
+      const geometry = await preview.evaluate(() => {
+        const box = (selector: string) => {
+          const rect = document.querySelector(selector)!.getBoundingClientRect();
+          return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+        };
+        return { header: box('.brand'), anime: box('#anime-check'), title: box('#title'),
+          player: box('#player-check'), button: box('#anime-primary-action'),
+          viewport: document.documentElement.clientWidth, scroll: document.documentElement.scrollWidth };
+      });
+      await testInfo.attach(`compact-geometry-en-${width}`, { body: JSON.stringify(geometry), contentType: 'application/json' });
+      const screenshot = testInfo.outputPath(`compact-long-title-en-${width}.png`);
+      await preview.screenshot({ path: screenshot, fullPage: true });
+      await testInfo.attach(`compact-long-title-en-${width}`, { path: screenshot, contentType: 'image/png' });
+      englishGeometry.push(geometry);
+    }
+    await expect(englishPopup.locator('.brand span')).toHaveCount(0);
+    for (const geometry of englishGeometry) {
+      expect(geometry.header.height).toBeLessThanOrEqual(32);
+      expect(geometry.button.height).toBeGreaterThanOrEqual(38);
+      expect(geometry.title.x - geometry.anime.x).toBeLessThan(16);
+      expect(geometry.player.height).toBeLessThanOrEqual(81);
+      expect(geometry.scroll).toBeLessThanOrEqual(geometry.viewport);
+    }
+    await preview.locator('#anime-primary-action').focus();
+    await expect(preview.locator('#anime-primary-action')).toBeFocused();
   } finally {
     await englishContext?.close();
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
 
-test('recognizes anime before playback and confirms player after playback starts', async () => {
+test('compact popup keeps a long recognized title and action usable at 360 and 390', async ({}, testInfo) => {
+  const { page, tabId } = await localPopupPage();
+  let popup: Page | null = null;
+  const longTitle = 'Очень длинное название аниме, которое должно полностью помещаться без обрезки и освобождать место для основной кнопки';
+  try {
+    await worker.evaluate(async ({ key, title }) => {
+      const stored = await chrome.storage.session.get(key);
+      const state = structuredClone(stored[key]);
+      state.recognition.title = title;
+      state.match.title = title;
+      await chrome.storage.session.set({ [key]: state });
+    }, { key: `tab:${tabId}`, title: longTitle });
+    popup = await openPopup(tabId);
+    await expect(popup.locator('#title')).toHaveText(longTitle);
+    const geometries = [];
+    for (const width of [360, 390]) {
+      await popup.setViewportSize({ width, height: 850 });
+      const geometry = await popup.evaluate(() => {
+        const rect = (selector: string) => {
+          const bounds = document.querySelector(selector)!.getBoundingClientRect();
+          return { x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height };
+        };
+        return { header: rect('.brand'), anime: rect('#anime-check'), title: rect('#title'),
+          player: rect('#player-check'), button: rect('#anime-primary-action'),
+          viewport: document.documentElement.clientWidth, scroll: document.documentElement.scrollWidth };
+      });
+      await testInfo.attach(`compact-geometry-${width}`, { body: JSON.stringify(geometry), contentType: 'application/json' });
+      const screenshot = testInfo.outputPath(`compact-long-title-ru-${width}.png`);
+      await popup.screenshot({ path: screenshot, fullPage: true });
+      await testInfo.attach(`compact-long-title-ru-${width}`, { path: screenshot, contentType: 'image/png' });
+      geometries.push(geometry);
+    }
+    for (const geometry of geometries) {
+      expect(geometry.header.height).toBeLessThanOrEqual(32);
+      expect(geometry.button.height).toBeGreaterThanOrEqual(38);
+      expect(geometry.title.x - geometry.anime.x).toBeLessThan(16);
+      expect(geometry.button.width).toBeGreaterThan(geometry.anime.width - 30);
+      expect(geometry.player.height).toBeLessThanOrEqual(81);
+      expect(geometry.scroll).toBeLessThanOrEqual(geometry.viewport);
+    }
+    await popup.locator('#anime-primary-action').focus();
+    await expect(popup.locator('#anime-primary-action')).toBeFocused();
+    await expect(popup.locator('#match-change')).toBeVisible();
+  } finally { await popup?.close(); await page.close(); }
+});
+
+test('recognizes anime before playback and confirms player after playback starts', async ({}, testInfo) => {
   const page = await context.newPage();
   await page.goto(`${siteBase}/anime.html`);
   const tabId = await extensionTabId(`${siteBase}/*`);
@@ -889,6 +983,11 @@ test('recognizes anime before playback and confirms player after playback starts
   await expect(popup.locator('#anime-check .recognized-only')).toBeVisible();
   await expect(popup.locator('#anime-check-detail')).toHaveText('Расхититель гробниц');
   await expect(popup.locator('#player-check')).not.toHaveClass(/success/);
+  await popup.setViewportSize({ width: 360, height: 850 });
+  expect(await popup.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+  const waitingScreenshot = testInfo.outputPath('compact-player-waiting-ru.png');
+  await popup.screenshot({ path: waitingScreenshot, fullPage: true });
+  await testInfo.attach('compact-player-waiting-ru', { path: waitingScreenshot, contentType: 'image/png' });
 
   await setSyntheticPlayback(page.frameLocator('#main-player'), '#main-video', {
     currentTime: 60,
@@ -926,7 +1025,7 @@ test('recognizes anime before playback and confirms player after playback starts
   await popup.waitForTimeout(250);
   expect(popupReloads).toBe(0);
   await expect(popup.locator('#title')).toHaveText('Расхититель гробниц');
-  await expect(popup.locator('#anireko-match')).toHaveText('В каталоге: Расхититель гробниц (2024)');
+  await expect(popup.locator('#anireko-match')).toHaveText('2024');
   await expect(popup.locator('#anime-primary-action')).toHaveText('Открыть в AniReko →');
   await expect(popup.locator('#anime-primary-action'))
     .toHaveAttribute('href', `${apiBase}/ru/anime/tomb-raider-4242`);
@@ -1150,7 +1249,7 @@ test('shows only an anime-not-found state and manually reports a recognition mis
   await page.close();
 });
 
-test('detects a disconnected old document despite saved recognition and recovers only after confirmation', async () => {
+test('detects a disconnected old document despite saved recognition and recovers only after confirmation', async ({}, testInfo) => {
   const page = await context.newPage();
   await page.goto(`${siteBase}/anime.html`);
   const tabId = await extensionTabId(`${siteBase}/anime.html`);
@@ -1166,6 +1265,11 @@ test('detects a disconnected old document despite saved recognition and recovers
   page.on('framenavigated', (frame) => { if (frame === page.mainFrame()) navigations += 1; });
   const popup = await openPopup(tabId);
   await expect(popup.locator('#anime-check-title')).toHaveText('Нет подключения к странице');
+  await popup.setViewportSize({ width: 360, height: 850 });
+  expect(await popup.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+  const disconnectedScreenshot = testInfo.outputPath('compact-disconnected-ru.png');
+  await popup.screenshot({ path: disconnectedScreenshot, fullPage: true });
+  await testInfo.attach('compact-disconnected-ru', { path: disconnectedScreenshot, contentType: 'image/png' });
   await expect(popup.locator('#not-found-report')).toBeHidden();
   await expect(popup.locator('#report-anime-miss')).toBeDisabled();
   await expect(popup.locator('#automark')).toBeHidden();
@@ -1281,7 +1385,7 @@ test('does not mistake a restricted browser page for an anime recognition miss',
   await page.close();
 });
 
-test('requires a choice for duplicate exact matches, stores it locally, and syncs immediately', async () => {
+test('requires a choice for duplicate exact matches, stores it locally, and syncs immediately', async ({}, testInfo) => {
   await worker.evaluate(async () => {
     await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/session?on=1&user=18');
     await chrome.storage.local.set({
@@ -1306,6 +1410,11 @@ test('requires a choice for duplicate exact matches, stores it locally, and sync
   await expect(popup.locator('#anime-check-title')).toHaveText('Нужно подтвердить аниме');
   await expect(popup.locator('#anireko-match')).toHaveText('Совпадение в каталоге ещё не подтверждено');
   await expect(popup.locator('.match-candidate')).toHaveCount(2);
+  await popup.setViewportSize({ width: 360, height: 850 });
+  expect(await popup.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+  const ambiguousScreenshot = testInfo.outputPath('compact-ambiguous-ru.png');
+  await popup.screenshot({ path: ambiguousScreenshot, fullPage: true });
+  await testInfo.attach('compact-ambiguous-ru', { path: ambiguousScreenshot, contentType: 'image/png' });
   const chosenCandidate = popup.locator('.match-candidate').filter({ hasText: '2022 · ONA' });
   await expect(chosenCandidate).toHaveCount(1);
   await expect.poll(() => worker.evaluate(

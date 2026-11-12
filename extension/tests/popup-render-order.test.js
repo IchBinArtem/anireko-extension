@@ -12,7 +12,8 @@ function deferred() {
   const promise = new Promise(done => { resolve = done; });
   return { promise, resolve };
 }
-function popup({ account, projection, syncReply, staleDocument = false, tasteUser = 18, tasteAnime = 1, cooldownAt = 0 } = {}) {
+function popup({ account, projection, syncReply, staleDocument = false, tasteUser = 18, tasteAnime = 1, cooldownAt = 0,
+  recognitionTitle = 'Current anime', catalogTitle = 'Current anime', year = null, manual = false } = {}) {
   const elements = new Map();
   function element(id) {
     const node = { textContent: '', hidden: ['resume', 'resume-label', 'watch-cycle-card'].includes(id),
@@ -29,8 +30,8 @@ function popup({ account, projection, syncReply, staleDocument = false, tasteUse
     return elements.get(id);
   };
   const state = { navigationToken: staleDocument ? 'old' : 'current', pageUrl: 'https://example.test/anime',
-    recognition: { title: 'Current anime', episode: 3 },
-    match: { status: 'ok', exact: true, animeId: 1, title: 'Current anime' },
+    recognition: { title: recognitionTitle, episode: 3 },
+    match: { status: 'ok', exact: true, manual, animeId: 1, title: catalogTitle, year, slug: 'current-anime' },
     taste: { status: 'ok', userKey: 'user:' + tasteUser, animeId: tasteAnime, percent: 87, labelKey: 'likely' },
     player: { player: 'html5', playbackStarted: true, playing: false, currentTime: 100,
       duration: 1000, episode: 3, progress: .1 } };
@@ -69,6 +70,19 @@ function popup({ account, projection, syncReply, staleDocument = false, tasteUse
     sessionListener({ 'tab:1': { newValue: { ...state, player: { ...state.player, progress } } } }, 'session');
   } };
 }
+
+test('actual popup avoids exact duplicate catalog title but preserves year, manual marker and distinct title', async () => {
+  for (const [options, expected] of [
+    [{}, ''],
+    [{ year: 2024, manual: true }, '2024 · manualMatchMark'],
+    [{ catalogTitle: 'Current anime 2', year: 2024 }, 'catalogPrefix Current anime 2 (2024)'],
+    [{ catalogTitle: 'current anime' }, 'catalogPrefix current anime'],
+  ]) {
+    const ui = popup({ account: authorized(18), projection: history(true), ...options });
+    await ui.done; await tick();
+    assert.equal(ui.get('anireko-match').textContent, expected);
+  }
+});
 const authorized = id => ({ ok: true, payload: {
   success: true, user: { id, name: 'TestUser' }, localWriteRevision: 'fresh' } });
 const history = adopted => ({ ok: true, payload: {
