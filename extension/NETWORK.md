@@ -99,6 +99,18 @@ posts a command or retries automatically. Day detail snapshots remain in local
 watch-history storage only: up to 32 observed identity/episode/voice tuples per day,
 with bounded title/voice, same accepted watched delta and latest observed endpoint.
 Legacy and overflow days remain explicitly incomplete; no URL or day details are sent.
+After general consent, the optional player-diagnostics flag can also be changed
+directly below account synchronization. It defaults OFF and does not require an
+account. The existing guarded local-control writer changes only diagnostics in
+the existing consent object, retaining acceptedAt/version and sync/history data;
+it refuses missing/declined/unsupported general consent. It never silently accepts
+general consent. A successful edit reloads the popup only, not the media page, and
+does not itself submit or replay a report. Deferred sends recheck the live consent
+and write binding immediately before network admission; disabled/stale callbacks
+do not reschedule. A request already dispatched before withdrawal may finish.
+RPC errors read authoritative local state without a write retry or invented OFF
+state; unknown reads are disabled/indeterminate. No new endpoint/data type/permission.
+
 The calendar reuses the existing progress-all download and account-bound resume-bulk
 cache. At most500 latest mutable bookmarks are accepted, with a2MiB streamed JSON
 limit and bounded optional catalog titles. Neutral account markers mean only that

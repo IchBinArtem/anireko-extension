@@ -1693,6 +1693,123 @@ test('old popup preference capability cannot restore consent after clear', async
   assert.equal((await storage.local.get('privacy-consent'))['privacy-consent'].diagnostics, false);
 });
 
+test('later diagnostics choice preserves general consent, sync preference and history without network', async () => {
+  const { context, storage } = loadServiceWorker({ fetchImpl: async () => { throw Error('unexpected_network'); } });
+  await storage.local.set({ 'privacy-consent': { version: 1, acceptedAt: 123, diagnostics: false },
+    'auto-mark': false, 'sync-account': { id: 18 }, 'watch-history': { records: { keep: 1 } } });
+  for (const diagnostics of [true, false]) {
+    const runtime = await context.handlePopupRequest({ type: 'popup-runtime-info' });
+    const result = await context.handlePopupRequest({ type: 'popup-update-preferences', operation: 'set-diagnostics',
+      diagnostics, expectedRevision: runtime.payload.localWriteRevision });
+    assert.equal(result.status, 200);
+    const data = await storage.local.get(null);
+    assert.equal(data['privacy-consent'].diagnostics, diagnostics);
+    assert.equal(data['privacy-consent'].acceptedAt, 123);
+    assert.equal(data['auto-mark'], false);
+    assert.equal(data['sync-account'].id, 18);
+    assert.equal(data['watch-history'].records.keep, 1);
+  }
+});
+
+test('later diagnostics choice cannot grant missing, declined, old or malformed consent', async () => {
+  for (const consent of [null, { version: 1, declinedAt: 1, diagnostics: true },
+    { version: 0, acceptedAt: 1 }, { version: 1, acceptedAt: 1, declinedAt: 2 }]) {
+    const { context, storage } = loadServiceWorker({ fetchImpl: async () => { throw Error('unexpected_network'); } });
+    await storage.local.set({ 'privacy-consent': consent });
+    const before = JSON.stringify(await storage.local.get(null));
+    const runtime = await context.handlePopupRequest({ type: 'popup-runtime-info' });
+    const result = await context.handlePopupRequest({ type: 'popup-update-preferences', operation: 'set-diagnostics',
+      diagnostics: true, expectedRevision: runtime.payload.localWriteRevision });
+    assert.equal(result.status, 409);
+    assert.equal(JSON.stringify(await storage.local.get(null)), before);
+  }
+  const { context, storage } = loadServiceWorker({ fetchImpl: async () => { throw Error('unexpected_network'); } });
+  const runtime = await context.handlePopupRequest({ type: 'popup-runtime-info' });
+  const bad = await context.handlePopupRequest({ type: 'popup-update-preferences', operation: 'set-diagnostics',
+    diagnostics: 'true', expectedRevision: runtime.payload.localWriteRevision });
+  assert.equal(bad.status, 400);
+  assert.equal((await storage.local.get('privacy-consent'))['privacy-consent'].diagnostics, undefined);
+});
+
+test('clear during later diagnostics read cannot resurrect the old accepted choice', async () => {
+  const { context, storage } = loadServiceWorker({ fetchImpl: async () => { throw Error('unexpected_network'); } });
+  const runtime = await context.handlePopupRequest({ type: 'popup-runtime-info' });
+  const original = storage.local.get;
+  let enter, release;
+  const entered = new Promise(done => { enter = done; });
+  const held = new Promise(done => { release = done; });
+  storage.local.get = async keys => {
+    const snapshot = await original(keys);
+    if (keys === 'privacy-consent') { enter(); await held; }
+    return snapshot;
+  };
+  const pending = context.handlePopupRequest({ type: 'popup-update-preferences', operation: 'set-diagnostics',
+    diagnostics: true, expectedRevision: runtime.payload.localWriteRevision });
+  await entered;
+  await context.handlePopupRequest({ type: 'popup-delete-local-data' });
+  release();
+  await assert.rejects(pending, /write_binding_changed/);
+  assert.deepEqual(await original(null), {});
+});
+
+test('diagnostic dispatch awaiting storage is fenced by a later opt-out', async () => {
+  const calls = [];
+  const { context, storage } = loadServiceWorker({ fetchImpl: async url => {
+    calls.push(url); return { ok: true, status: 200, json: async () => ({}) };
+  } });
+  await storage.local.set({ 'privacy-consent': { version: 1, acceptedAt: 1, diagnostics: true } });
+  const now = Date.now();
+  const current = { recognition: { title: 'Synthetic', observedAt: now - 60_000 },
+    match: { status: 'ok', exact: true, animeId: 1 }, players: {}, pageUrl: 'https://media.example.test/watch',
+    pageNavigationAt: 1, playerInteractionNavigationAt: 1, playerInteractionAt: now - 60_000,
+    playerInteractionPageUrl: 'https://media.example.test/watch', probe: { videos: 0, iframes: [{ src: 'https://player.example.test/' }] } };
+  const original = storage.local.get;
+  let enter, release;
+  const entered = new Promise(done => { enter = done; });
+  const held = new Promise(done => { release = done; });
+  storage.local.get = async keys => {
+    const snapshot = await original(keys);
+    if (Array.isArray(keys) && keys.includes('diag-sent')) { enter(); await held; }
+    return snapshot;
+  };
+  const binding = context.captureLocalWrite();
+  const pending = context.maybeSendDiagnostic(current, binding);
+  await entered;
+  const runtime = await context.handlePopupRequest({ type: 'popup-runtime-info' });
+  await context.handlePopupRequest({ type: 'popup-update-preferences', operation: 'set-diagnostics',
+    diagnostics: false, expectedRevision: runtime.payload.localWriteRevision });
+  release();
+  await assert.rejects(pending, /write_binding_changed/);
+  assert.equal(calls.length, 0);
+  assert.equal((await original('privacy-consent'))['privacy-consent'].diagnostics, false);
+});
+
+test('diagnostic dispatch requires the saved opt-in and keeps the existing anonymous payload boundary', async () => {
+  for (const diagnostics of [false, true]) {
+    const calls = [];
+    const { context, storage } = loadServiceWorker({ fetchImpl: async (url, init) => {
+      calls.push({ url, init }); return { ok: true, status: 200, json: async () => ({}) };
+    } });
+    await storage.local.set({ 'privacy-consent': { version: 1, acceptedAt: 1, diagnostics } });
+    const current = { recognition: { title: 'Do not upload this title', observedAt: Date.now() - 60_000 },
+      match: { status: 'ok', exact: true, animeId: 1 }, players: {}, pageUrl: 'https://media.example.test/private/path?q=private',
+      pageNavigationAt: 1, playerInteractionNavigationAt: 1, playerInteractionAt: Date.now() - 60_000,
+      playerInteractionPageUrl: 'https://media.example.test/private/path?q=private',
+      probe: { videos: 0, iframes: [{ src: 'https://player.example.test/embed/secret' }] } };
+    await context.maybeSendDiagnostic(current);
+    assert.equal(calls.length, diagnostics ? 1 : 0);
+    if (diagnostics) {
+      assert.equal(calls[0].init.credentials, 'omit');
+      const payload = JSON.parse(calls[0].init.body);
+      assert.deepEqual(Object.keys(payload).sort(), ['ext_version', 'host', 'probe', 'report_kind']);
+      assert.equal(payload.host, 'media.example.test');
+      assert.equal(calls[0].init.body.includes('private'), false);
+      assert.equal(calls[0].init.body.includes('Do not upload'), false);
+      assert.equal(calls[0].init.body.includes('/embed/secret'), false);
+    }
+  }
+});
+
 test('local history queue captures media and match before its asynchronous turn', async () => {
   const { context, storage } = loadServiceWorker({ fetchImpl: async () => { throw Error('unexpected_network'); } });
   const state = { recognition: { title: 'Captured Anime', voice: 'Original' },

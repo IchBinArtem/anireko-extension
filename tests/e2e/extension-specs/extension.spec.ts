@@ -998,6 +998,63 @@ test('account calendar reuses one bounded bulk read and hides records after opt-
   } finally { await popup?.close(); await page.close(); }
 });
 
+for (const signedIn of [false, true]) {
+test(`diagnostics choice stays available below sync after onboarding (${signedIn ? 'account' : 'guest'})`, async ({}, testInfo) => {
+  const originalConsent = await worker.evaluate(async () => (await chrome.storage.local.get('privacy-consent'))['privacy-consent']);
+  await worker.evaluate(async (signedIn) => {
+    if (signedIn) await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/session?on=1&user=18');
+    await chrome.storage.local.set({ 'auto-mark': signedIn, 'sync-account': { id: 18, name: 'Synthetic' },
+      'preference-sentinel': { keep: true } });
+  }, signedIn);
+  const page = await context.newPage();
+  let popup: Page | null = null;
+  try {
+    await page.goto(`${siteBase}/anime.html`);
+    const tabId = await extensionTabId(`${siteBase}/*`);
+    await waitForDetectorReady(tabId);
+    const documentTimeOrigin = await page.evaluate(() => performance.timeOrigin);
+    popup = await openPopup(tabId);
+    await expect(popup.locator('#privacy-disclosure')).toBeHidden();
+    await expect(popup.locator('#diagnostics-option')).toBeVisible();
+    await expect(popup.locator('#diagnostics-setting')).not.toBeChecked();
+    await expect(popup.locator('#diagnostics-setting')).toBeEnabled();
+    if (signedIn) await expect(popup.locator('#auto-mark')).toBeChecked();
+    else await expect(popup.locator('#auto-mark')).toBeDisabled();
+    const boxes = await popup.evaluate(() => ({
+      sync: document.getElementById('automark')!.getBoundingClientRect().bottom,
+      diagnostics: document.getElementById('diagnostics-option')!.getBoundingClientRect().top,
+    }));
+    expect(boxes.sync).toBeLessThanOrEqual(boxes.diagnostics);
+    await Promise.all([popup.waitForEvent('domcontentloaded'), popup.locator('#diagnostics-setting').check()]);
+    await expect(popup.locator('#diagnostics-setting')).toBeChecked();
+    await expect.poll(async () => (await worker.evaluate(async () =>
+      (await chrome.storage.local.get('privacy-consent'))['privacy-consent'])).diagnostics).toBe(true);
+    await popup.close(); popup = await openPopup(tabId);
+    await expect(popup.locator('#diagnostics-setting')).toBeChecked();
+    await popup.setViewportSize({ width: 390, height: 900 });
+    await popup.screenshot({ path: testInfo.outputPath('persistent-diagnostics-ru.png'), fullPage: true });
+    await Promise.all([popup.waitForEvent('domcontentloaded'), popup.locator('#diagnostics-setting').uncheck()]);
+    await expect.poll(async () => (await worker.evaluate(async () =>
+      (await chrome.storage.local.get('privacy-consent'))['privacy-consent'])).diagnostics).toBe(false);
+    await popup.close(); popup = await openPopup(tabId);
+    await expect(popup.locator('#diagnostics-setting')).not.toBeChecked();
+    const saved = await worker.evaluate(async () => chrome.storage.local.get([
+      'privacy-consent', 'auto-mark', 'sync-account', 'preference-sentinel',
+    ]));
+    expect(saved['privacy-consent'].acceptedAt).toBe(originalConsent.acceptedAt);
+    expect(saved['auto-mark']).toBe(signedIn);
+    expect(saved['sync-account'].id).toBe(18);
+    expect(saved['preference-sentinel']).toEqual({ keep: true });
+    expect(await page.evaluate(() => performance.timeOrigin)).toBe(documentTimeOrigin);
+    expect(await worker.evaluate(async () => (await (await fetch(
+      (globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/diagnostics')).json()))).toEqual([]);
+  } finally {
+    await popup?.close(); await page.close();
+    await worker.evaluate(async (consent) => { await chrome.storage.local.set({ 'privacy-consent': consent }); }, originalConsent);
+  }
+});
+}
+
 test('renders the English manifest and popup for an English Chrome UI', async ({}, testInfo) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'anireko-extension-en-'));
   const englishExtensionPath = path.join(root, 'extension');

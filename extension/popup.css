@@ -306,6 +306,7 @@ main:has(#privacy-disclosure[hidden]) #anime-check-title { padding-right: 100px;
 }
 .automark input { margin: 1px 0 0; accent-color: #ff4757; }
 .automark:has(input:disabled) { opacity: .55; cursor: default; }
+.preference-error { margin: 5px 0; color: #fbbf24; font-size: 11px; line-height: 1.4; }
 .privacy-controls {
   display: flex; justify-content: space-between; align-items: center; gap: 8px;
   margin-top: 10px; color: #9ca3af; font-size: 11px;

@@ -975,6 +975,7 @@ function scheduleDiagTimer(tabId, delay, attempt, retryMs, writeBinding = captur
     const latest = stateByTab[tabId];
     if (!latest || latest.diagSentAt || latest.diagDone) return;
     await maybeSendDiagnostic(latest, writeBinding).catch(() => {});
+    if (!localWriteCurrent(writeBinding)) return;
     // Проба могла дозреть позже грейса (медленный SPA) — ограниченные
     // ретраи вместо пересоздания таймера на каждом сообщении.
     if (!latest.diagSentAt && !latest.diagDone && attempt < 3) {
@@ -1028,7 +1029,11 @@ async function maybeSendDiagnostic(current, writeBinding = captureLocalWrite()) 
     || (probe.customTags?.length || 0) > 0
     || (probe.videos || 0) > 0;
   if (!playerSignal) return;
-  const stored = await chrome.storage.local.get(['diag-grace-ms', 'diag-sent']);
+  const stored = await chrome.storage.local.get(['diag-grace-ms', 'diag-sent', PRIVACY_CONSENT_KEY]);
+  requireLocalWrite(writeBinding);
+  const privacy = stored[PRIVACY_CONSENT_KEY];
+  if (privacy?.version !== PRIVACY_CONSENT_VERSION || !Number.isFinite(privacy.acceptedAt)
+    || Object.hasOwn(privacy, 'declinedAt') || privacy.diagnostics !== true) return;
   const graceMs = Number.isFinite(stored['diag-grace-ms']) ? stored['diag-grace-ms'] : 15000;
   const signalAt = Math.max(recognition.observedAt, current.playerInteractionAt);
   if (Date.now() - signalAt < graceMs) return;
@@ -3389,6 +3394,18 @@ async function handlePopupRequest(message, writeBinding = captureLocalWrite()) {
         case 'decline-consent':
           items = { [PRIVACY_CONSENT_KEY]: { version: PRIVACY_CONSENT_VERSION, declinedAt: Date.now() } };
           break;
+        case 'set-diagnostics': {
+          if (typeof message.diagnostics !== 'boolean') return { ok: false, status: 400, payload: null };
+          const stored = await chrome.storage.local.get(PRIVACY_CONSENT_KEY);
+          requireLocalWrite(writeBinding);
+          const consent = stored[PRIVACY_CONSENT_KEY];
+          if (consent?.version !== PRIVACY_CONSENT_VERSION || !Number.isFinite(consent.acceptedAt)
+            || Object.hasOwn(consent, 'declinedAt')) {
+            return { ok: false, status: 409, payload: { error: 'privacy_consent_required' } };
+          }
+          items = { [PRIVACY_CONSENT_KEY]: { ...consent, diagnostics: message.diagnostics } };
+          break;
+        }
         case 'disable-sync':
           items = { 'auto-mark': false };
           break;

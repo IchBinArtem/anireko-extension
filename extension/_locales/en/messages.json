@@ -1,4 +1,5 @@
 {
+  "diagnosticsSaveFailed": {"message":"Could not confirm saving. Reopen the extension."},
   "activityHeadingAccount": {"message":"Activity · 12 weeks · browser + account"},
   "activityAccountLegend": {"message":"Blue: account save, watched minutes unknown."},
   "activityAccountSaved": {"message":"account record"},

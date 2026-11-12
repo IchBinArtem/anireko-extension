@@ -15,7 +15,8 @@ function deferred() {
 function popup({ account, projection, syncReply, staleDocument = false, tasteUser = 18, tasteAnime = 1, cooldownAt = 0,
   recognitionTitle = 'Current anime', catalogTitle = 'Current anime', year = null, manual = false,
   cachedBulk = null, bulkReply = { ok: true, payload: { progress_all: {} } },
-  consentState = { version: 1, acceptedAt: 1 }, detectorReply = null } = {}) {
+  consentState = { version: 1, acceptedAt: 1 }, detectorReply = null,
+  preferenceReply = null, privacyRead = null } = {}) {
   const elements = new Map();
   function element(id) {
     const node = { textContent: '', hidden: ['resume', 'resume-label', 'watch-cycle-card'].includes(id),
@@ -38,21 +39,26 @@ function popup({ account, projection, syncReply, staleDocument = false, tasteUse
     player: { player: 'html5', playbackStarted: true, playing: false, currentTime: 100,
       duration: 1000, episode: 3, progress: .1 } };
   const calls = [];
+  let popupReloads = 0;
+  let videoReloads = 0;
   const sessionListeners = [];
   const stored = { 'privacy-consent': consentState, 'auto-mark': true,
     'sync-account': { id: 18 }, 'resume-bulk': cachedBulk, 'resume-sync-at': cooldownAt, 'watch-history': { records: {
       'current anime::3': { animeId: 1, episode: 3, position: 60, lastWatchedAt: 1 },
     }, days: {} } };
   const context = vm.createContext({
-    URLSearchParams, navigator: { language: 'en' }, location: { search: '?tabId=1', reload() {} },
+    URLSearchParams, navigator: { language: 'en' }, location: { search: '?tabId=1', reload() { popupReloads++; } },
     window: { close() {} }, confirm: () => false, setTimeout: () => {},
     AniRekoActivity: { calendar: () => [], accountDays: () => ({}) },
     document: { documentElement: {}, querySelectorAll: () => [], getElementById: get, createElement: element },
     chrome: {
       i18n: { getMessage: (key, value) => key + (value === undefined ? '' : ':' + value), getUILanguage: () => 'en' },
-      tabs: { get: async () => ({ id: 1, url: state.pageUrl }),
+      tabs: { get: async () => ({ id: 1, url: state.pageUrl }), reload: async () => { videoReloads++; },
         sendMessage: async () => detectorReply ? detectorReply() : ({ ok: true, documentUrl: state.pageUrl, documentToken: 'current' }) },
-      storage: { local: { get: async () => structuredClone(stored) },
+      storage: { local: { get: async keys => {
+        const snapshot = structuredClone(stored);
+        return keys === 'privacy-consent' && privacyRead ? privacyRead(snapshot) : snapshot;
+      } },
         session: { get: async () => ({ 'tab:1': state }) },
         onChanged: { addListener(listener) { sessionListeners.push(listener); } } },
       runtime: { sendMessage: async message => {
@@ -63,12 +69,13 @@ function popup({ account, projection, syncReply, staleDocument = false, tasteUse
         if (message.type === 'popup-watch-history') return typeof projection === 'function' ? projection() : projection;
         if (message.type === 'popup-sync-current') return typeof syncReply === 'function' ? syncReply() : syncReply;
         if (message.type === 'popup-progress-all') return typeof bulkReply === 'function' ? bulkReply() : bulkReply;
+        if (message.type === 'popup-update-preferences' && preferenceReply) return preferenceReply(message);
         throw new Error('unexpected request ' + message.type);
       } },
     },
   });
   const done = vm.runInContext(source, context);
-  return { get, calls, done, publishLocal(changes) {
+  return { get, calls, done, popupReloads: () => popupReloads, videoReloads: () => videoReloads, publishLocal(changes) {
     for (const [key, change] of Object.entries(changes)) {
       if (change.newValue === undefined) delete stored[key]; else stored[key] = structuredClone(change.newValue);
     }
@@ -100,6 +107,66 @@ const authorized = id => ({ ok: true, payload: {
 const history = adopted => ({ ok: true, payload: {
   snapshot: { history_adopted: adopted, requested_anime_id: 1, readiness: 'ready',
     origins: [], foreground: { cycle_id: null } }, actions: [] } });
+
+test('diagnostics remains optional and available after onboarding even for a guest', async () => {
+  const html = fs.readFileSync(path.join(__dirname, '../popup.html'), 'utf8');
+  assert.ok(html.indexOf('id="automark"') < html.indexOf('id="diagnostics-option"'));
+  assert.ok(html.indexOf('id="diagnostics-option"') < html.indexOf('class="privacy-controls"'));
+  const ui = popup({ account: { ok: false, status: 401 }, preferenceReply: async () => ({ ok: true,
+    payload: { localWriteRevision: 'after-setting' } }) });
+  await ui.done; await tick();
+  assert.equal(ui.get('privacy-disclosure').hidden, true);
+  assert.equal(ui.get('diagnostics-option').hidden, false);
+  assert.equal(ui.get('diagnostics-setting').checked, false);
+  assert.equal(ui.get('diagnostics-setting').disabled, false);
+  assert.equal(ui.get('auto-mark').disabled, true);
+  ui.get('diagnostics-setting').checked = true;
+  await ui.get('diagnostics-setting').events.change();
+  const requests = ui.calls.filter(call => call.type === 'popup-update-preferences');
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].operation, 'set-diagnostics');
+  assert.equal(requests[0].diagnostics, true);
+  assert.equal(ui.popupReloads(), 1);
+  assert.equal(ui.videoReloads(), 0, 'changing diagnostics must not interrupt the watched page');
+});
+
+test('diagnostics RPC failure shows actual saved choice without automatic retry or false OFF', async () => {
+  for (const committed of [false, true]) {
+    let ui;
+    ui = popup({ account: { ok: false, status: 401 }, preferenceReply: async () => {
+      if (committed) ui.publishLocal({ 'privacy-consent': { newValue: { version: 1, acceptedAt: 1, diagnostics: true } } });
+      throw new Error('port_closed');
+    } });
+    await ui.done; await tick();
+    ui.get('diagnostics-setting').checked = true;
+    await ui.get('diagnostics-setting').events.change();
+    assert.equal(ui.get('diagnostics-setting').checked, committed);
+    assert.equal(ui.get('diagnostics-setting-error').hidden, false);
+    assert.equal(ui.popupReloads(), 0);
+    assert.equal(ui.calls.filter(call => call.type === 'popup-update-preferences').length, 1);
+  }
+});
+
+test('late initial diagnostics read cannot overwrite a newer preference event', async () => {
+  const held = deferred();
+  let snapshot;
+  const ui = popup({ account: { ok: false, status: 401 }, privacyRead: value => { snapshot = value; return held.promise; } });
+  await ui.done; await tick();
+  ui.publishLocal({ 'privacy-consent': { newValue: { version: 1, acceptedAt: 1, diagnostics: true } } });
+  held.resolve(snapshot);
+  await tick();
+  assert.equal(ui.get('diagnostics-setting').checked, true);
+  assert.equal(ui.get('diagnostics-option').hidden, false);
+});
+
+test('diagnostics cannot become preselected or available under declined/unsupported consent', async () => {
+  for (const consent of [{ version: 1, declinedAt: 1, diagnostics: true }, { version: 0, acceptedAt: 1, diagnostics: true }]) {
+    const ui = popup({ consentState: consent });
+    await ui.done; await tick();
+    assert.equal(ui.get('diagnostics-option').hidden, true);
+    assert.equal(ui.get('diagnostics-consent').checked, false);
+  }
+});
 
 test('pending account read cannot reactivate cached account data after preference revocation', async () => {
   for (const change of [

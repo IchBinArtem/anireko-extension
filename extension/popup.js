@@ -126,7 +126,63 @@
   document.getElementById('privacy-link').href = privacyHref;
   const disclosure = document.getElementById('privacy-disclosure');
   disclosure.hidden = consentAccepted;
-  document.getElementById('diagnostics-consent').checked = consent?.diagnostics === true;
+  document.getElementById('diagnostics-consent').checked = consentAccepted && consent?.diagnostics === true;
+  const diagnosticsOption = document.getElementById('diagnostics-option');
+  const diagnosticsSetting = document.getElementById('diagnostics-setting');
+  const diagnosticsError = document.getElementById('diagnostics-setting-error');
+  let diagnosticsSaving = false;
+  let diagnosticsViewEpoch = 0;
+  let diagnosticsSnapshot = null;
+  const validDiagnosticsConsent = value => value?.version === PRIVACY_CONSENT_VERSION
+    && Number.isFinite(value.acceptedAt) && !Object.hasOwn(value, 'declinedAt');
+  const renderDiagnosticsSetting = value => {
+    diagnosticsSnapshot = value;
+    const accepted = validDiagnosticsConsent(value);
+    diagnosticsOption.hidden = !accepted;
+    diagnosticsSetting.checked = accepted && value.diagnostics === true;
+    diagnosticsSetting.indeterminate = false;
+    diagnosticsSetting.disabled = diagnosticsSaving || !accepted;
+  };
+  async function readDiagnosticsSetting() {
+    const epoch = diagnosticsViewEpoch;
+    try {
+      const fresh = await chrome.storage.local.get(PRIVACY_CONSENT_KEY);
+      if (epoch === diagnosticsViewEpoch) renderDiagnosticsSetting(fresh[PRIVACY_CONSENT_KEY]);
+    } catch {
+      if (epoch !== diagnosticsViewEpoch) return;
+      diagnosticsSnapshot = null;
+      diagnosticsOption.hidden = !consentAccepted;
+      diagnosticsSetting.indeterminate = true;
+      diagnosticsSetting.disabled = true;
+      diagnosticsError.textContent = t('diagnosticsSaveFailed');
+      diagnosticsError.hidden = false;
+    }
+  }
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area !== 'local' || !Object.hasOwn(changes, PRIVACY_CONSENT_KEY)) return;
+    diagnosticsViewEpoch++;
+    renderDiagnosticsSetting(changes[PRIVACY_CONSENT_KEY].newValue);
+  });
+  diagnosticsSetting.addEventListener('change', async () => {
+    const diagnostics = diagnosticsSetting.checked;
+    diagnosticsSaving = true;
+    diagnosticsSetting.disabled = true;
+    diagnosticsError.hidden = true;
+    try {
+      await updatePreferences('set-diagnostics', { diagnostics });
+      location.reload();
+    } catch {
+      // The local write may have committed before a port failure. Never invent
+      // an OFF state or retry the consent write; show authoritative storage.
+      await readDiagnosticsSetting();
+      diagnosticsError.textContent = t('diagnosticsSaveFailed');
+      diagnosticsError.hidden = false;
+    } finally {
+      diagnosticsSaving = false;
+      diagnosticsSetting.disabled = !validDiagnosticsConsent(diagnosticsSnapshot);
+    }
+  });
+  void readDiagnosticsSetting();
   document.getElementById('privacy-accept').addEventListener('click', async () => {
     try {
       await updatePreferences('accept-consent', { diagnostics: document.getElementById('diagnostics-consent').checked });

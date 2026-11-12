@@ -1,4 +1,5 @@
 {
+  "diagnosticsSaveFailed": {"message":"Не удалось подтвердить сохранение. Откройте расширение заново."},
   "activityHeadingAccount": {"message":"Активность · 12 недель · браузер + аккаунт"},
   "activityAccountLegend": {"message":"Синий: сохранение в аккаунте, минуты неизвестны."},
   "activityAccountSaved": {"message":"запись аккаунта"},
