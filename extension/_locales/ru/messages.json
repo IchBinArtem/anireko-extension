@@ -1,4 +1,12 @@
 {
+  "activityHeadingAccount": {"message":"Активность · 12 недель · браузер + аккаунт"},
+  "activityAccountLegend": {"message":"Синий: сохранение в аккаунте, минуты неизвестны."},
+  "activityAccountSaved": {"message":"запись аккаунта"},
+  "activityAccountNote": {"message":"Последние сохранения аккаунта, не полная история просмотров."},
+  "activityAccountAnime": {"message":"Аниме #$ID$","placeholders":{"id":{"content":"$1"}}},
+  "activityAccountSaveTime": {"message":"Сохранено в $TIME$","placeholders":{"time":{"content":"$1"}}},
+  "activityAccountPosition": {"message":"Сохранённая позиция: $POSITION$","placeholders":{"position":{"content":"$1"}}},
+  "activityAccountPositionDuration": {"message":"Сохранённая позиция: $POSITION$ из $DURATION$","placeholders":{"position":{"content":"$1"},"duration":{"content":"$2"}}},
   "watchChoicesHint": {"message":"Выберите один текущий просмотр в каждой группе. Остальные будут поставлены на паузу, не удалены; прежние завершения сохранятся."},
   "watchChoicesIncomplete": {"message":"Полный список вариантов не загрузился. Частичный выбор не будет применён."},
   "watchHistoryIdentity": {"message":"История $ID$","placeholders":{"id":{"content":"$1"}}},

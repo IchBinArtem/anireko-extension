@@ -98,6 +98,43 @@
     return url.origin;
   }
 
+  const BULK_RESPONSE_BYTES = 2 * 1024 * 1024;
+  async function readBulkJson(response) {
+    const declared = response.headers?.get?.('Content-Length');
+    if (declared && /^\d+$/.test(declared) && Number(declared) > BULK_RESPONSE_BYTES) {
+      await response.body?.cancel?.();
+      throw new Error('bulk_response_too_large');
+    }
+    // Real extension fetch responses expose a stream: cap decoded bytes before JSON allocation.
+    if (!response.body?.getReader) throw new Error('bulk_response_unreadable');
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder('utf-8', { fatal: true });
+    const parts = [];
+    let size = 0;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        size += value.byteLength;
+        if (size > BULK_RESPONSE_BYTES) throw new Error('bulk_response_too_large');
+        parts.push(decoder.decode(value, { stream: true }));
+      }
+      parts.push(decoder.decode());
+      return JSON.parse(parts.join(''));
+    } catch (error) {
+      await reader.cancel().catch(() => {});
+      throw error;
+    } finally { reader.releaseLock(); }
+  }
+
+  function responseRetryAfter(response) {
+    const value = response.headers?.get?.('Retry-After');
+    if (typeof value !== 'string' || value.length > 128) return undefined;
+    const trimmed = value.trim();
+    const delay = /^\d+$/.test(trimmed) ? Number(trimmed) * 1000 : Date.parse(trimmed) - Date.now();
+    return Number.isFinite(delay) && delay >= 0 ? Math.min(delay, 7 * 24 * 60 * 60_000) : undefined;
+  }
+
   function create(options) {
     const base = safeBase(options?.baseUrl);
     const fetchImpl = options?.fetchImpl || global.fetch.bind(global);
@@ -247,8 +284,12 @@
         ...init,
         signal: AbortSignal.timeout(action === 'session-info' ? 5000 : 10000),
       });
-      const payload = response.status === 204 ? null : await response.json().catch(() => null);
-      return { ok: response.ok, status: response.status, payload };
+      const payload = response.status === 204 ? null : action === 'progress-all'
+        ? await readBulkJson(response).catch(() => null)
+        : await response.json().catch(() => null);
+      const retryAfterMs = action === 'progress-all' ? responseRetryAfter(response) : undefined;
+      return { ok: response.ok, status: response.status, payload,
+        ...(retryAfterMs === undefined ? {} : { retryAfterMs }) };
     }
 
     return Object.freeze({ base, request });

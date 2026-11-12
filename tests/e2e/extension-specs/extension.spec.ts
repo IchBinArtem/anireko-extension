@@ -846,6 +846,117 @@ test('renders browser-local activity as a calm calendar with honest missing days
   await page.close();
 });
 
+for (const kind of ['session', 'history'] as const) {
+  test(`account UI rejects held ${kind} after preference revocation`, async () => {
+    const originalConsent = await worker.evaluate(async () => (await chrome.storage.local.get('privacy-consent'))['privacy-consent']);
+    const { page, tabId } = await localPopupPage();
+    let popup: Page | null = null;
+    try {
+      await worker.evaluate(async () => {
+        await chrome.storage.local.set({ 'resume-bulk': { userId: 18, fetchedAt: Date.now(), byAnime: {
+          4343: { title: 'Remote-only record', episode: 7, position_sec: 1260, duration_sec: 1440,
+            voice: 'Remote-only voice', watched_at: new Date().toISOString() },
+        } } });
+      });
+      await popupReadGate(kind, '&hold=1');
+      popup = await context.newPage();
+      await popup.addInitScript(() => {
+        const runtime = (chrome as any).runtime;
+        const send = runtime.sendMessage.bind(runtime);
+        (window as any).__settledAccountReads = {};
+        chrome.storage.onChanged.addListener((changes, area) => {
+          if (area === 'local' && (changes['auto-mark'] || changes['privacy-consent'])) (window as any).__preferenceSeen = true;
+        });
+        runtime.sendMessage = (...args: any[]) => {
+          const pending = send(...args);
+          const type = args[0]?.type;
+          if (!['popup-session-info', 'popup-watch-history'].includes(type)) return pending;
+          return pending.then((response: any) => {
+            (window as any).__settledAccountReads[type] = true;
+            return response;
+          });
+        };
+      });
+      await popup.goto(`chrome-extension://${extensionId}/popup.html?tabId=${tabId}`);
+      await expect.poll(async () => (await popupReadGate(kind)).pending).toBeGreaterThan(0);
+      await worker.evaluate(async (kind) => {
+        await chrome.storage.local.set(kind === 'session'
+          ? { 'privacy-consent': { version: 1, declinedAt: Date.now() } }
+          : { 'auto-mark': false });
+      }, kind);
+      await popup.waitForFunction(() => (window as any).__preferenceSeen === true);
+      await popupReadGate(kind, '&hold=0');
+      await popup.waitForFunction((kind) => (window as any).__settledAccountReads[
+        kind === 'session' ? 'popup-session-info' : 'popup-watch-history'] === true, kind);
+      await expect(popup.locator('#watch-cycle-card')).toBeHidden();
+      await expect(popup.locator('#resume-sync')).toBeDisabled();
+      await expect(popup.locator('.activity-account-entry')).toHaveCount(0);
+      await expect(popup.locator('#resume')).not.toContainText('Remote-only voice');
+      await expect(popup.locator('#today-time')).toHaveText('10 мин');
+    } finally {
+      await popupReadGate(kind, '&hold=0&status=200');
+      await popup?.close(); await page.close();
+      await worker.evaluate(async (consent) => {
+        if (consent === undefined) await chrome.storage.local.remove('privacy-consent');
+        else await chrome.storage.local.set({ 'privacy-consent': consent });
+      }, originalConsent);
+    }
+  });
+}
+
+test('account calendar reuses one bounded bulk read and hides records after opt-out', async ({}, testInfo) => {
+  await worker.evaluate(async () => {
+    const base = (globalThis as any).AniRekoRuntimeConfig.apiBase;
+    await fetch(base + '/__test/session?on=1&user=18');
+    const seed = await fetch(base + '/api/extension/progress.php', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({
+        expected_user_id: 18, anime_id: 4343, episode: 7, position_sec: 1260, duration_sec: 1440, voice: 'Account Voice',
+      }) });
+    if (!seed.ok) throw new Error('synthetic_progress_seed_failed');
+  });
+  const page = await context.newPage();
+  let popup: Page | null = null;
+  try {
+    await page.goto(`${siteBase}/anime.html`);
+    const tabId = await extensionTabId(`${siteBase}/*`);
+    await waitForDetectorReady(tabId);
+    popup = await openPopup(tabId);
+    const localTime = await popup.locator('#today-time').innerText();
+    await expect(popup.locator('.activity-account-entry')).toHaveCount(0);
+    await popup.close(); popup = null;
+    await worker.evaluate(async () => {
+      await chrome.storage.local.set({ 'auto-mark': true, 'sync-account': { id: 18, name: 'TestUser' } });
+    });
+    const reads = () => worker.evaluate(async () => {
+      const response = await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/progress-read-count');
+      return (await response.json()).reads;
+    });
+    popup = await openPopup(tabId);
+    await expect(popup.locator('#activity-heading')).toContainText('браузер + аккаунт');
+    await expect(popup.locator('#week-chart .has-account-records')).toHaveCount(1);
+    await expect(popup.locator('.activity-account-entry')).toHaveCount(1);
+    await expect(popup.locator('.activity-account-entry')).toContainText('Аниме из аккаунта');
+    await expect(popup.locator('.activity-account-entry')).toContainText('Серия 7');
+    await expect(popup.locator('.activity-account-entry')).toContainText('Account Voice');
+    await expect(popup.locator('.activity-account-entry')).toContainText('Сохранённая позиция: 21:00 из 24:00');
+    await expect(popup.locator('#resume')).toBeHidden();
+    await expect(popup.locator('#today-time')).toHaveText(localTime);
+    expect(await reads()).toBe(1);
+    await popup.close(); popup = await openPopup(tabId);
+    await expect(popup.locator('.activity-account-entry')).toHaveCount(1);
+    expect(await reads()).toBe(1, 'reopening reuses the same account snapshot, not another GET');
+    const stored = await worker.evaluate(async () => (await chrome.storage.local.get('resume-bulk'))['resume-bulk']);
+    expect(stored.userId).toBe(18);
+    expect(Object.keys(stored.byAnime)).toEqual(['4343']);
+    await popup.setViewportSize({ width: 390, height: 850 });
+    await popup.screenshot({ path: testInfo.outputPath('account-calendar-ru.png'), fullPage: true });
+    await worker.evaluate(async () => { await chrome.storage.local.set({ 'auto-mark': false }); });
+    await expect(popup.locator('.activity-account-entry')).toHaveCount(0);
+    await expect(popup.locator('#week-chart .has-account-records')).toHaveCount(0);
+    expect(await reads()).toBe(1);
+  } finally { await popup?.close(); await page.close(); }
+});
+
 test('renders the English manifest and popup for an English Chrome UI', async ({}, testInfo) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'anireko-extension-en-'));
   const englishExtensionPath = path.join(root, 'extension');

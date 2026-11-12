@@ -99,6 +99,23 @@ posts a command or retries automatically. Day detail snapshots remain in local
 watch-history storage only: up to 32 observed identity/episode/voice tuples per day,
 with bounded title/voice, same accepted watched delta and latest observed endpoint.
 Legacy and overflow days remain explicitly incomplete; no URL or day details are sent.
+The calendar reuses the existing progress-all download and account-bound resume-bulk
+cache. At most500 latest mutable bookmarks are accepted, with a2MiB streamed JSON
+limit and bounded optional catalog titles. Neutral account markers mean only that
+progress was saved at the returned timestamp, not that the user watched on that day.
+They never add local watched seconds/episode totals or overwrite local day snapshots;
+successive snapshots replace markers rather than accumulating invented history.
+Calendar demand freshness is24h, ordinary resume remains30min, and all manual/automatic
+bulk readers share a60s dispatch floor, single-flight and persisted pre-network
+admission. Failed/malformed responses wait at least15min; longer bounded Retry-After
+is honored. No background timer/alarm, receipt scan, per-title download or new upload
+is introduced. Own accepted writes update this same cache and fence late bulk reads.
+401/409 never publish cached account records. Opt-out/account/consent/clear changes
+hide remote data; explicit delete-all removes the cache and its attempt metadata.
+Client cooldown is not server abuse protection: the local backend candidate enforces
+the existing progress GET class and fail-closes limiter errors independently of global
+off/shadow modes, before DB work. Source tests are not an installed/live enforcement claim.
+
 History caches and asynchronous controller publication are generation-fenced.
 After an accepted mutation and fresh receipt read, every pre-command snapshot is
 retired, including a GET started while the command was reserved.

@@ -66,3 +66,54 @@ test('production activity renderer selects days and preserves selection on refre
   assert.ok(get('activity-entries').children[1].children[1].children[0].textContent.includes('Voice A'));
   assert.equal(JSON.stringify(history), original, 'rendering does not write or mutate history');
 });
+
+test('account bookmarks add neutral saved-progress details without creating local minutes', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'popup.js'), 'utf8');
+  const start = source.indexOf('  function dateKey(date) {');
+  const end = source.indexOf('  const reportSection', start);
+  const elements = new Map();
+  function element() {
+    return { children: [], attrs: {}, events: {}, textContent: '',
+      append(child) { this.children.push(child); }, replaceChildren(...children) { this.children = children; },
+      setAttribute(key, value) { this.attrs[key] = value; }, addEventListener(key, value) { this.events[key] = value; } };
+  }
+  const get = id => { if (!elements.has(id)) elements.set(id, element()); return elements.get(id); };
+  const fixedTime = new Date(2026, 10, 12, 12).getTime();
+  class Clock extends Date {
+    constructor(...args) { super(...(args.length ? args : [fixedTime])); }
+    static now() { return fixedTime; }
+  }
+  const context = vm.createContext({ Date: Clock, document: { getElementById: get, createElement: element },
+    dateLocale: 'en-US', set: (id, value) => { get(id).textContent = value; }, countLabel: () => '',
+    t: (id, value) => value === undefined ? id : `${id}:${value}` });
+  vm.runInContext(fs.readFileSync(path.join(__dirname, '../lib/activity.js'), 'utf8'), context);
+  vm.runInContext(`${source.slice(start, end)}\nglobalThis.render = renderStats;`, context);
+  const now = new Clock();
+  const savedAt = new Date(now.getTime() - 1000).toISOString();
+  const cache = { userId: 18, byAnime: {
+    42: { title: '<unsafe>', episode: 3, voice: 'Voice', position_sec: 1260, duration_sec: 1440, watched_at: savedAt },
+    43: { episode: 4, voice: '', position_sec: 0, duration_sec: null, watched_at: savedAt },
+  } };
+  const local = { days: {} };
+  const original = JSON.stringify(local);
+  context.render(local, cache, 18);
+  const cell = get('week-chart').children.at(-1);
+  assert.ok(cell.className.includes('level-unknown'));
+  assert.ok(cell.className.includes('account-only'));
+  assert.equal(get('today-time').textContent, 'activityUnknown');
+  assert.ok(get('activity-legend').textContent.includes('activityAccountLegend'));
+  const entries = get('activity-entries').children;
+  assert.equal(entries[0].textContent, 'activityAccountNote');
+  assert.equal(entries[1].children[0].textContent, '<unsafe>');
+  assert.ok(entries[1].children[1].textContent.includes('Voice'));
+  assert.equal(entries[1].children[2].textContent, 'activityAccountPositionDuration:21:00,24:00');
+  assert.equal(entries[2].children[0].textContent, 'activityAccountAnime:43');
+  assert.equal(entries[2].children[2].textContent, 'activityAccountPosition:0:00');
+  assert.equal(JSON.stringify(local), original);
+  context.render(local, { ...cache, authRejectedUserId: 18, authRejectedStatus: 409 }, 18);
+  assert.equal(get('week-chart').children.some(cell => cell.className.includes('has-account-records')), false,
+    'server rejection metadata must also hide the popup initial-cache path');
+  context.render(local, cache, 19);
+  assert.equal(get('week-chart').children.some(cell => cell.className.includes('has-account-records')), false);
+  assert.equal(get('activity-entries').children[0].textContent, 'activityDetailsUnavailable');
+});

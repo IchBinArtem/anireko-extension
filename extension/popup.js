@@ -168,13 +168,24 @@
   let currentUserId = null;
 
   async function renderAccount() {
+    const requestedEpoch = accountActivityEpoch;
     const label = document.getElementById('account-label');
     const login = document.getElementById('account-login');
     const warning = document.getElementById('account-warning');
     const syncButton = document.getElementById('resume-sync');
     login.href = siteBase;
     try {
+      // Startup detector awaits precede our preference listener. Reconcile the
+      // small permission snapshot before account I/O; later changes use epoch.
+      const preferences = await chrome.storage.local.get([PRIVACY_CONSENT_KEY, 'auto-mark', SYNC_ACCOUNT_KEY]);
+      if (accountActivityEpoch !== requestedEpoch) return;
+      const permission = preferences[PRIVACY_CONSENT_KEY];
+      if (permission?.version !== PRIVACY_CONSENT_VERSION || !Number.isFinite(permission.acceptedAt)) {
+        renderPageUnavailable('consentRequiredTitle', 'syncOffUntilConsent');
+        return;
+      }
       const response = await requestBackground('popup-session-info');
+      if (accountActivityEpoch !== requestedEpoch) return;
       const payload = response?.payload;
       // This background-owned capability also covers local controls for guests;
       // a 401 account response must not strand clear behind the old account epoch.
@@ -183,10 +194,10 @@
       }
       if (response?.ok && payload?.success && payload.user) {
         currentUserId = Number(payload.user.id);
-        const bound = stored[SYNC_ACCOUNT_KEY];
+        const bound = preferences[SYNC_ACCOUNT_KEY];
         const boundUserId = Number(bound?.id);
         const sameAccount = Number.isInteger(boundUserId) && boundUserId === currentUserId;
-        syncAccountActive = sameAccount && stored['auto-mark'] === true;
+        syncAccountActive = sameAccount && preferences['auto-mark'] === true;
         const profile = document.createElement('a');
         profile.className = 'profile-link';
         profile.href = `${siteBase}/${siteLocale}/profile`;
@@ -259,18 +270,27 @@
   }
 
   let selectedActivityDate = null;
+  let accountActivityCache = null;
+  let accountActivityEpoch = 0;
+  let statsInitialized = false;
   function activityTime(seconds) {
     const value = Math.floor(seconds);
     return `${Math.floor(value / 60)}:${String(value % 60).padStart(2, '0')}`;
   }
-  function renderStats(history) {
+  function renderStats(history, accountCache = null, accountUserId = null) {
     const now = new Date();
     const today = history?.days?.[dateKey(now)];
     set('today-time', typeof today?.watchedSeconds === 'number' && Number.isFinite(today.watchedSeconds) && today.watchedSeconds >= 0
       ? t('minutesShort', String(Math.floor(today.watchedSeconds / 60))) : t('activityUnknown'));
     set('today-episodes', countLabel('episodeCount', Array.isArray(today?.episodeKeys) ? today.episodeKeys.length : 0));
     document.getElementById('today-episodes').title = t('activityEpisodesDetail');
-    const days = AniRekoActivity.calendar(history, now);
+    const accountDays = accountCache ? AniRekoActivity.accountDays(accountCache, accountUserId, now) : {};
+    const days = AniRekoActivity.calendar(history, now, 12, accountDays);
+    const hasAccountRecords = days.some(day => day.accountCount > 0);
+    set('activity-heading', t(hasAccountRecords ? 'activityHeadingAccount' : 'activityHeading'));
+    set('activity-legend', t('activityLegend') + (hasAccountRecords ? ` ${t('activityAccountLegend')}` : ''));
+    const dayLabel = day => `${day.date.toLocaleDateString(dateLocale, { day: 'numeric', month: 'short', year: 'numeric' })} · ${day.seconds === null
+      ? t('activityUnknown') : t('minutesShort', String(Math.floor(day.seconds / 60)))}${day.accountCount > 0 ? ` · ${t('activityAccountSaved')}` : ''}`;
     const chart = document.getElementById('week-chart');
     if (!days.some(day => dateKey(day.date) === selectedActivityDate)) selectedActivityDate = dateKey(now);
     const showDay = (day, label) => {
@@ -279,11 +299,11 @@
       const entries = document.getElementById('activity-entries');
       entries.replaceChildren();
       const storedDay = history?.days?.[selectedActivityDate];
-      if (!Array.isArray(storedDay?.details)) {
+      if (!Array.isArray(storedDay?.details) && !day.accountRecords?.length) {
         const note = document.createElement('p');
         note.textContent = t('activityDetailsUnavailable');
         entries.append(note);
-      } else {
+      } else if (Array.isArray(storedDay?.details)) {
         if (storedDay.detailsPartial) {
           const note = document.createElement('p');
           note.textContent = t('activityDetailsPartial');
@@ -329,14 +349,44 @@
           group.element.append(row);
         }
       }
+      if (day.accountRecords?.length) {
+        const note = document.createElement('p');
+        note.className = 'activity-account-note';
+        note.textContent = t('activityAccountNote');
+        entries.append(note);
+        for (const record of day.accountRecords) {
+          const entry = document.createElement('div');
+          entry.className = 'activity-entry activity-account-entry';
+          const title = document.createElement('strong');
+          title.textContent = (/^ru/iu.test(dateLocale) ? record.title_ru || record.title : record.title || record.title_ru)
+            || t('activityAccountAnime', String(record.animeId));
+          const metadata = document.createElement('p');
+          const parts = [t('activityAccountSaveTime', new Date(record.savedAt).toLocaleTimeString(dateLocale,
+            { hour: '2-digit', minute: '2-digit' }))];
+          if (record.episode != null) parts.push(t('episodeLabel', String(record.episode)));
+          if (record.voice) parts.push(record.voice);
+          metadata.textContent = parts.join(' · ');
+          const position = document.createElement('p');
+          const endpoint = activityTime(record.position);
+          position.textContent = record.duration == null ? t('activityAccountPosition', endpoint)
+            : t('activityAccountPositionDuration', [endpoint, activityTime(record.duration)]);
+          entry.append(title); entry.append(metadata); entry.append(position);
+          entries.append(entry);
+        }
+        if (day.accountPartial) {
+          const note = document.createElement('p');
+          note.textContent = t('activityDetailsPartial');
+          entries.append(note);
+        }
+      }
       for (const cell of chart.children) cell.setAttribute('aria-pressed', String(cell.activityDate === selectedActivityDate));
     };
     chart.replaceChildren(...days.map((day, index) => {
       const cell = document.createElement('button');
       cell.type = 'button';
-      cell.className = `activity-cell level-${day.level ?? 'unknown'}${day.today ? ' today' : ''}`;
-      const label = `${day.date.toLocaleDateString(dateLocale, { day: 'numeric', month: 'short', year: 'numeric' })} · ${day.seconds === null
-        ? t('activityUnknown') : t('minutesShort', String(Math.floor(day.seconds / 60)))}`;
+      cell.className = `activity-cell level-${day.level ?? 'unknown'}${day.today ? ' today' : ''}${day.accountCount > 0
+        ? ` has-account-records${day.seconds === null ? ' account-only' : ''}` : ''}`;
+      const label = dayLabel(day);
       cell.title = label;
       cell.setAttribute('aria-label', label);
       cell.activityDate = dateKey(day.date);
@@ -361,13 +411,56 @@
     }));
     const selected = days.find(day => dateKey(day.date) === selectedActivityDate);
     if (selected) {
-      const label = `${selected.date.toLocaleDateString(dateLocale, { day: 'numeric', month: 'short', year: 'numeric' })} · ${selected.seconds === null
-        ? t('activityUnknown') : t('minutesShort', String(Math.floor(selected.seconds / 60)))}`;
-      showDay(selected, label);
+      showDay(selected, dayLabel(selected));
     }
+    statsInitialized = true;
   }
 
   const reportSection = document.getElementById('not-found-report');
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area !== 'local' || ![SYNC_ACCOUNT_KEY, PRIVACY_CONSENT_KEY, 'auto-mark'].some(key => Object.hasOwn(changes, key))) return;
+    accountActivityEpoch++;
+    accountActivityCache = null;
+    syncAccountActive = false;
+    document.getElementById('resume').hidden = true;
+    document.getElementById('resume').textContent = '';
+    document.getElementById('resume-label').hidden = true;
+    document.getElementById('watch-cycle-card').hidden = true;
+    set('watch-completion', '');
+    set('watch-current', '');
+    set('watch-feedback', '');
+    document.getElementById('watch-actions').replaceChildren();
+    document.getElementById('resume-sync').disabled = true;
+    document.getElementById('resume-sync').dataset.accountAllowed = '0';
+    autoMarkToggle.checked = false;
+    autoMarkToggle.disabled = true;
+    if (statsInitialized) renderStats(stored['watch-history']);
+  });
+
+  async function refreshAccountActivity() {
+    if (!syncAccountActive || !Number.isSafeInteger(currentUserId)) return;
+    const userId = currentUserId;
+    const revision = localWriteRevision;
+    const epoch = accountActivityEpoch;
+    const current = () => syncAccountActive && currentUserId === userId
+      && localWriteRevision === revision && accountActivityEpoch === epoch;
+    try {
+      const response = await requestBackground('popup-progress-all', { expectedUserId: userId, purpose: 'activity' });
+      if (!current()) return;
+      if (response?.ok) {
+        accountActivityCache = { userId, byAnime: response.payload?.progress_all,
+          fetchedAt: response.payload?.fetchedAt || 0 };
+        renderStats(stored['watch-history'], accountActivityCache, userId);
+      } else {
+        accountActivityCache = null;
+        renderStats(stored['watch-history']);
+      }
+    } catch {
+      if (!current()) return;
+      accountActivityCache = null;
+      renderStats(stored['watch-history']);
+    }
+  }
   const reportButton = document.getElementById('report-anime-miss');
   const reportDetail = document.getElementById('report-anime-miss-detail');
   const animeDetailIds = [
@@ -652,6 +745,7 @@
     : t('catalogMatchNotConfirmed'));
 
   await renderAccount();
+  void refreshAccountActivity();
   const taste = state.taste;
   const tasteAccountCurrent = Number.isInteger(currentUserId) && currentUserId > 0
     && taste?.userKey === `user:${currentUserId}`
@@ -687,7 +781,6 @@
   // Пока видео активно играет — строка не нужна (инфа живёт в «Прогресс») и
   // сеть не дёргаем вовсе. Кнопка «Синхронизировать» форсит bulk-GET с
   // кулдауном 60с (кейс: только что смотрел с другого устройства).
-  const RESUME_BULK_TTL_MS = 30 * 60 * 1000;
   const SYNC_COOLDOWN_MS = 60 * 1000;
   // Unknown/adopted history must never borrow a previous cycle's legacy resume.
   let watchProjection = null;
@@ -696,8 +789,13 @@
   const watchActions = document.getElementById('watch-actions');
   async function renderWatchCycle() {
     if (!matchConfirmed || !syncAccountActive) return;
+    const renderEpoch = accountActivityEpoch;
+    const renderRevision = localWriteRevision;
+    const canPublish = () => syncAccountActive && accountActivityEpoch === renderEpoch
+      && localWriteRevision === renderRevision;
     watchProjection = null;
     await renderResume(false);
+    if (!canPublish()) return;
     watchCard.hidden = false;
     for (const node of [...Array.from(watchActions.children), ...watchActions.querySelectorAll('details')]) {
       if (node.tagName === 'DETAILS' && node.watchDisclosure) {
@@ -707,6 +805,7 @@
     watchActions.replaceChildren();
     try {
       const response = await requestBackground('popup-watch-history', { tabId: tab?.id });
+      if (!canPublish()) return;
       if (!response?.ok || !response.payload?.snapshot) throw new Error('history_unavailable');
       watchProjection = response.payload;
       const snapshot = watchProjection.snapshot;
@@ -884,6 +983,7 @@
         }
       }
     } catch {
+      if (!canPublish()) return;
       watchProjection = null;
       document.getElementById('resume-label').hidden = true;
       document.getElementById('resume').hidden = true;
@@ -895,30 +995,38 @@
   await renderWatchCycle();
 
   async function loadResumeBulk(force) {
+    const empty = () => ({ userId: null, byAnime: {}, fetchedAt: 0 });
     if (!syncAccountActive || !Number.isInteger(currentUserId)) {
-      return { userId: null, byAnime: {}, fetchedAt: 0 };
+      return empty();
     }
-    const cacheStored = await chrome.storage.local.get('resume-bulk');
-    const cached = cacheStored['resume-bulk'];
-    const bulk = cached?.userId === currentUserId
-      ? cached
-      : { userId: currentUserId, byAnime: {}, fetchedAt: 0 };
-    if (!force && Date.now() - (bulk.fetchedAt || 0) < RESUME_BULK_TTL_MS) return bulk;
+    const requestedUserId = currentUserId;
+    const requestedRevision = localWriteRevision;
+    const requestedEpoch = accountActivityEpoch;
+    const stillCurrent = () => syncAccountActive && currentUserId === requestedUserId
+      && localWriteRevision === requestedRevision && accountActivityEpoch === requestedEpoch;
     try {
+      // The worker owns cache admission and validated offline fallback too.
       const response = await requestBackground('popup-progress-all', {
-        expectedUserId: currentUserId,
+        expectedUserId: requestedUserId,
+        force: force === true,
       });
+      if (!stillCurrent()) return empty();
       if (response?.ok) {
         const payload = response.payload;
-        bulk.byAnime = payload?.progress_all || {};
-        bulk.fetchedAt = Date.now();
-      } else if (response?.status === 401 || response?.status === 409) {
-        // Гость: помечаем «спрошено», чтобы не долбить 401 на каждый попап.
-        bulk.fetchedAt = Date.now();
+        const bulk = { userId: requestedUserId, byAnime: payload?.progress_all || {},
+          fetchedAt: Number.isFinite(payload?.fetchedAt) ? payload.fetchedAt : Date.now() };
+        if (syncAccountActive && bulk.userId === currentUserId) {
+          accountActivityCache = bulk;
+          renderStats(stored['watch-history'], bulk, currentUserId);
+        }
+        return bulk;
       }
-      // The SW owns cache persistence and fences late network callbacks.
-    } catch { /* offline — живём на локальной истории */ }
-    return bulk;
+    } catch { /* A closed worker port is not validated permission to use its old cache. */ }
+    if (stillCurrent()) {
+      accountActivityCache = null;
+      renderStats(stored['watch-history']);
+    }
+    return empty();
   }
 
   async function renderResume(force) {

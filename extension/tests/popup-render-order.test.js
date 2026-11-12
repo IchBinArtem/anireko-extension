@@ -13,7 +13,9 @@ function deferred() {
   return { promise, resolve };
 }
 function popup({ account, projection, syncReply, staleDocument = false, tasteUser = 18, tasteAnime = 1, cooldownAt = 0,
-  recognitionTitle = 'Current anime', catalogTitle = 'Current anime', year = null, manual = false } = {}) {
+  recognitionTitle = 'Current anime', catalogTitle = 'Current anime', year = null, manual = false,
+  cachedBulk = null, bulkReply = { ok: true, payload: { progress_all: {} } },
+  consentState = { version: 1, acceptedAt: 1 }, detectorReply = null } = {}) {
   const elements = new Map();
   function element(id) {
     const node = { textContent: '', hidden: ['resume', 'resume-label', 'watch-cycle-card'].includes(id),
@@ -36,23 +38,23 @@ function popup({ account, projection, syncReply, staleDocument = false, tasteUse
     player: { player: 'html5', playbackStarted: true, playing: false, currentTime: 100,
       duration: 1000, episode: 3, progress: .1 } };
   const calls = [];
-  let sessionListener;
-  const stored = { 'privacy-consent': { version: 1, acceptedAt: 1 }, 'auto-mark': true,
-    'sync-account': { id: 18 }, 'resume-sync-at': cooldownAt, 'watch-history': { records: {
+  const sessionListeners = [];
+  const stored = { 'privacy-consent': consentState, 'auto-mark': true,
+    'sync-account': { id: 18 }, 'resume-bulk': cachedBulk, 'resume-sync-at': cooldownAt, 'watch-history': { records: {
       'current anime::3': { animeId: 1, episode: 3, position: 60, lastWatchedAt: 1 },
     }, days: {} } };
   const context = vm.createContext({
     URLSearchParams, navigator: { language: 'en' }, location: { search: '?tabId=1', reload() {} },
     window: { close() {} }, confirm: () => false, setTimeout: () => {},
-    AniRekoActivity: { calendar: () => [] },
+    AniRekoActivity: { calendar: () => [], accountDays: () => ({}) },
     document: { documentElement: {}, querySelectorAll: () => [], getElementById: get, createElement: element },
     chrome: {
       i18n: { getMessage: (key, value) => key + (value === undefined ? '' : ':' + value), getUILanguage: () => 'en' },
       tabs: { get: async () => ({ id: 1, url: state.pageUrl }),
-        sendMessage: async () => ({ ok: true, documentUrl: state.pageUrl, documentToken: 'current' }) },
-      storage: { local: { get: async () => stored },
+        sendMessage: async () => detectorReply ? detectorReply() : ({ ok: true, documentUrl: state.pageUrl, documentToken: 'current' }) },
+      storage: { local: { get: async () => structuredClone(stored) },
         session: { get: async () => ({ 'tab:1': state }) },
-        onChanged: { addListener(listener) { sessionListener = listener; } } },
+        onChanged: { addListener(listener) { sessionListeners.push(listener); } } },
       runtime: { sendMessage: async message => {
         calls.push(message);
         if (message.type === 'popup-runtime-info') return { ok: true,
@@ -60,14 +62,19 @@ function popup({ account, projection, syncReply, staleDocument = false, tasteUse
         if (message.type === 'popup-session-info') return typeof account === 'function' ? account() : account;
         if (message.type === 'popup-watch-history') return typeof projection === 'function' ? projection() : projection;
         if (message.type === 'popup-sync-current') return typeof syncReply === 'function' ? syncReply() : syncReply;
-        if (message.type === 'popup-progress-all') return { ok: true, payload: { progress_all: {} } };
+        if (message.type === 'popup-progress-all') return typeof bulkReply === 'function' ? bulkReply() : bulkReply;
         throw new Error('unexpected request ' + message.type);
       } },
     },
   });
   const done = vm.runInContext(source, context);
-  return { get, calls, done, publishProgress(progress) {
-    sessionListener({ 'tab:1': { newValue: { ...state, player: { ...state.player, progress } } } }, 'session');
+  return { get, calls, done, publishLocal(changes) {
+    for (const [key, change] of Object.entries(changes)) {
+      if (change.newValue === undefined) delete stored[key]; else stored[key] = structuredClone(change.newValue);
+    }
+    for (const listener of sessionListeners) listener(changes, 'local');
+  }, publishProgress(progress) {
+    for (const listener of sessionListeners) listener({ 'tab:1': { newValue: { ...state, player: { ...state.player, progress } } } }, 'session');
   } };
 }
 
@@ -93,6 +100,80 @@ const authorized = id => ({ ok: true, payload: {
 const history = adopted => ({ ok: true, payload: {
   snapshot: { history_adopted: adopted, requested_anime_id: 1, readiness: 'ready',
     origins: [], foreground: { cycle_id: null } }, actions: [] } });
+
+test('pending account read cannot reactivate cached account data after preference revocation', async () => {
+  for (const change of [
+    { 'auto-mark': { newValue: false } },
+    { 'privacy-consent': { newValue: { version: 1, declinedAt: 1 } } },
+    { 'sync-account': { newValue: { id: 99 } } },
+  ]) {
+    const gate = deferred();
+    const ui = popup({ account: gate.promise, projection: history(false),
+      cachedBulk: { userId: 18, byAnime: { 1: { position_sec: 700 } }, fetchedAt: Date.now() },
+      bulkReply: { ok: false, status: 503 } });
+    await tick();
+    ui.publishLocal(change);
+    gate.resolve(authorized(18));
+    await ui.done; await tick();
+    assert.equal(ui.get('watch-cycle-card').hidden, true);
+    assert.equal(ui.get('resume').textContent.includes('11:40'), false, 'rejected remote endpoint stays hidden; local fallback is allowed');
+    assert.ok(!ui.calls.some(call => call.type === 'popup-progress-all'), 'no newly authorized bulk read after opt-out');
+  }
+});
+
+test('preference revocation hides rendered account cards and fences held cycle response', async () => {
+  const gate = deferred();
+  const ui = popup({ account: authorized(18), projection: gate.promise });
+  await tick();
+  ui.publishLocal({ 'auto-mark': { newValue: false } });
+  gate.resolve(currentCycleHistory());
+  await ui.done; await tick();
+  assert.equal(ui.get('watch-cycle-card').hidden, true);
+  assert.equal(ui.get('resume').textContent.includes('22:51'), false, 'late cycle endpoint is not rendered as local fallback');
+  assert.equal(ui.get('resume-sync').disabled, true);
+  assert.equal(ui.get('watch-current').textContent, '', 'late account response is not published');
+});
+
+test('preference change clears an already displayed account cycle and endpoint', async () => {
+  const ui = popup({ account: authorized(18), projection: currentCycleHistory() });
+  await ui.done; await tick();
+  assert.equal(ui.get('resume').hidden, false);
+  assert.ok(ui.get('resume').textContent.includes('22:51'));
+  ui.publishLocal({ 'sync-account': { newValue: { id: 99 } } });
+  assert.equal(ui.get('watch-cycle-card').hidden, true);
+  assert.equal(ui.get('resume').hidden, true);
+  assert.equal(ui.get('resume').textContent, '');
+  assert.equal(ui.get('resume-sync').disabled, true);
+});
+
+test('declined consent at popup startup dominates every cached account reader', async () => {
+  const ui = popup({ consentState: { version: 1, declinedAt: 1 }, account: authorized(18),
+    projection: history(false), cachedBulk: { userId: 18, fetchedAt: Date.now(), byAnime: { 1: { position_sec: 700 } } } });
+  await ui.done; await tick();
+  assert.ok(!ui.calls.some(call => ['popup-session-info', 'popup-progress-all', 'popup-watch-history'].includes(call.type)));
+  assert.equal(ui.get('resume').hidden, true);
+  assert.equal(ui.get('watch-cycle-card').hidden, true);
+});
+
+test('preference revocation during detector startup is reconciled before cached account publication', async () => {
+  for (const change of [
+    { 'auto-mark': { newValue: false } },
+    { 'privacy-consent': { newValue: { version: 1, declinedAt: 1 } } },
+    { 'sync-account': { newValue: { id: 99 } } },
+  ]) {
+    const gate = deferred();
+    const ui = popup({ detectorReply: () => gate.promise, account: authorized(18), projection: history(false),
+      cachedBulk: { userId: 18, fetchedAt: Date.now(), byAnime: { 1: { episode: 7, position_sec: 700, voice: 'Remote-only' } } },
+      bulkReply: { ok: false, status: 503 } });
+    await tick();
+    ui.publishLocal(change);
+    gate.resolve({ ok: true, documentUrl: 'https://example.test/anime', documentToken: 'current' });
+    await ui.done; await tick();
+    assert.ok(!ui.calls.some(call => call.type === 'popup-progress-all'));
+    assert.equal(ui.get('resume').textContent.includes('Remote-only'), false);
+    assert.equal(ui.get('watch-cycle-card').hidden, true);
+  }
+});
 function localVisible(ui) {
   assert.equal(ui.get('anime-check-detail').textContent, 'Current anime');
   assert.equal(ui.get('progress').textContent, '10.0%');
@@ -126,7 +207,8 @@ test('actual popup renders progress before pending adopted-history response and 
     assert.ok(ui.calls.some(call => call.type === 'popup-watch-history'));
     localVisible(ui);
     assert.equal(ui.get('resume').hidden, true);
-    assert.ok(!ui.calls.some(call => call.type === 'popup-progress-all'));
+    assert.ok(ui.calls.filter(call => call.type === 'popup-progress-all').every(call => call.purpose === 'activity'),
+      'calendar reads must not become a legacy resume fallback');
   } finally { gate.resolve(history(true)); await ui.done; await tick(); }
   assert.equal(ui.get('resume').hidden, true);
   assert.equal(ui.get('resume').textContent, '');
@@ -183,7 +265,8 @@ test('unknown or malformed adopted history keeps legacy resume hidden on opening
     await ui.done; await tick();
     assert.equal(ui.get('resume').hidden, true);
     assert.equal(ui.get('resume').textContent, '');
-    assert.ok(!ui.calls.some(call => call.type === 'popup-progress-all'));
+    assert.ok(ui.calls.filter(call => call.type === 'popup-progress-all').every(call => call.purpose === 'activity'),
+      'unknown cycle history still cannot request legacy resume');
   }
 });
 

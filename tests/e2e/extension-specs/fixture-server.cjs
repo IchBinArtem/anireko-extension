@@ -15,6 +15,8 @@ const searchQueries = [];
 const statusPosts = [];
 const diagnosticPosts = [];
 const progressPosts = [];
+const progressSavedAt = new WeakMap();
+let progressReadCount = 0;
 let progressPostsInFlight = 0;
 let maxProgressPostsInFlight = 0;
 let resetGeneration = 0;
@@ -755,6 +757,7 @@ const server = http.createServer((request, response) => {
   }
   if (request.url.startsWith('/api/extension/progress.php')) {
     if (request.method === 'GET') {
+      progressReadCount++;
       const query = new URL(request.url, 'http://localhost').searchParams;
       if (!sessionUser || Number(query.get('expected_user_id')) !== sessionUser.id) {
         response.writeHead(409, { 'content-type': 'application/json' });
@@ -766,7 +769,8 @@ const server = http.createServer((request, response) => {
         position_sec: p.position_sec,
         duration_sec: p.duration_sec ?? null,
         voice: p.voice || '',
-        watched_at: new Date().toISOString(),
+        watched_at: progressSavedAt.get(p),
+        ...(p.anime_id === 4343 ? { title: 'Account-only anime', title_ru: 'Аниме из аккаунта' } : {}),
       });
       response.writeHead(200, { 'content-type': 'application/json' });
       if (query.get('all')) {
@@ -801,12 +805,18 @@ const server = http.createServer((request, response) => {
       setTimeout(() => {
         if (generation === resetGeneration) {
           progressPosts.push(payload);
+          progressSavedAt.set(payload, new Date().toISOString());
           progressPostsInFlight -= 1;
         }
         response.writeHead(204);
         response.end();
       }, 250);
     });
+    return;
+  }
+  if (request.url.startsWith('/__test/progress-read-count')) {
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ reads: progressReadCount }));
     return;
   }
   if (request.url.startsWith('/__test/progress')) {
@@ -869,6 +879,7 @@ const server = http.createServer((request, response) => {
     statusPosts.length = 0;
     diagnosticPosts.length = 0;
     progressPosts.length = 0;
+    progressReadCount = 0;
     resetGeneration += 1;
     progressPostsInFlight = 0;
     maxProgressPostsInFlight = 0;

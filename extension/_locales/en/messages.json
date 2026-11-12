@@ -1,4 +1,12 @@
 {
+  "activityHeadingAccount": {"message":"Activity · 12 weeks · browser + account"},
+  "activityAccountLegend": {"message":"Blue: account save, watched minutes unknown."},
+  "activityAccountSaved": {"message":"account record"},
+  "activityAccountNote": {"message":"Latest account saves, not a complete viewing history."},
+  "activityAccountAnime": {"message":"Anime #$ID$","placeholders":{"id":{"content":"$1"}}},
+  "activityAccountSaveTime": {"message":"Saved at $TIME$","placeholders":{"time":{"content":"$1"}}},
+  "activityAccountPosition": {"message":"Saved position: $POSITION$","placeholders":{"position":{"content":"$1"}}},
+  "activityAccountPositionDuration": {"message":"Saved position: $POSITION$ of $DURATION$","placeholders":{"position":{"content":"$1"},"duration":{"content":"$2"}}},
   "watchChoicesHint": {"message":"Choose one current watch in each group. Other watches will be paused, not deleted; earlier completions are preserved."},
   "watchChoicesIncomplete": {"message":"The complete choice list could not be loaded. No partial choice will be applied."},
   "watchHistoryIdentity": {"message":"History $ID$","placeholders":{"id":{"content":"$1"}}},

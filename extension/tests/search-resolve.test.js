@@ -1994,7 +1994,9 @@ test('guest session refresh keeps local clear available in the actual popup acco
     document: { getElementById(id) { if (!elements.has(id)) elements.set(id, {}); return elements.get(id); } },
     siteBase: 'https://anireko.com', siteLocale: 'ru', stored: {}, SYNC_ACCOUNT_KEY: 'sync-account',
     autoMarkToggle: {}, syncAccountActive: false, currentUserId: null, t: (key) => key,
-    localWriteRevision: runtime.payload.localWriteRevision,
+    localWriteRevision: runtime.payload.localWriteRevision, accountActivityEpoch: 0,
+    PRIVACY_CONSENT_KEY: 'privacy-consent', PRIVACY_CONSENT_VERSION: 1,
+    chrome: { storage: { local: { get: async () => ({ 'privacy-consent': { version: 1, acceptedAt: 1 } }) } } },
     requestBackground: (type) => context.handlePopupRequest({ type, expectedRevision: popup.localWriteRevision }),
   });
   const source = fs.readFileSync(path.join(extensionDir, 'popup.js'), 'utf8');

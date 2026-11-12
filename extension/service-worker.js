@@ -4,6 +4,7 @@ importScripts(
   'lib/trust.js',
   'lib/recognition.js',
   'lib/auto-mark.js',
+  'lib/activity.js',
   'lib/watch-write-barrier.js',
   'lib/watch-request-hash.js',
   'lib/watch-command-journal.js'
@@ -1999,16 +2000,167 @@ const PROGRESS_MIN_INTERVAL_MS = 300_000;
 // (а) bulk-GET `?all=1` из попапа (1 запрос / 30 мин на юзера, все аниме сразу)
 // и (б) нашими же POST-ами — после них серверный GET не нужен вовсе.
 const RESUME_BULK_KEY = 'resume-bulk';
+const BULK_FLOOR_MS = 60_000;
+const BULK_FAILURE_BACKOFF_MS = 15 * 60_000;
+const BULK_MAX_RETRY_MS = 7 * 24 * 3600_000;
+let bulkFlight = null;
+let bulkCacheQueue = Promise.resolve();
+let bulkOwnWriteGeneration = 0;
+
+function withBulkCache(operation) {
+  const pending = bulkCacheQueue.catch(() => {}).then(operation);
+  bulkCacheQueue = pending.catch(() => {});
+  return pending;
+}
+
+async function bulkAccountCurrent(userId, binding, validateSession = false) {
+  requireLocalWrite(binding);
+  const stored = await chrome.storage.local.get([PRIVACY_CONSENT_KEY, 'auto-mark', SYNC_ACCOUNT_KEY]);
+  requireLocalWrite(binding);
+  const consent = stored[PRIVACY_CONSENT_KEY];
+  if (consent?.version !== PRIVACY_CONSENT_VERSION || !Number.isFinite(consent.acceptedAt)
+    || stored['auto-mark'] !== true || Number(stored[SYNC_ACCOUNT_KEY]?.id) !== userId) return false;
+  if (validateSession) await currentSessionInfo(false, binding);
+  requireLocalWrite(binding);
+  return sessionIdentityKey(sessionInfoCache) === `user:${userId}`;
+}
+
+function bulkReply(map, fetchedAt, cached) {
+  return { ok: true, status: 200, payload: { progress_all: map, fetchedAt, cached } };
+}
+
+function requestBulkProgress(message, binding) {
+  const userId = Number(message.expectedUserId);
+  if (!Number.isSafeInteger(userId) || userId < 1) {
+    return Promise.resolve({ ok: false, status: 409, payload: { error: 'sync_account_mismatch' } });
+  }
+  if (bulkFlight && bulkFlight.userId === userId && bulkFlight.binding.revision === binding.revision) {
+    if (message.purpose !== 'activity') bulkFlight.forceResume = true;
+    if (message.force === true) bulkFlight.force = true;
+    return bulkFlight.promise;
+  }
+  // Reserve synchronously, before the first storage or network await.
+  const flight = { userId, binding, forceResume: message.purpose !== 'activity', force: message.force === true };
+  bulkFlight = flight;
+  const pending = Promise.resolve().then(() => runBulkProgress(flight)).finally(() => {
+    if (bulkFlight === flight) bulkFlight = null;
+  });
+  flight.promise = pending;
+  return pending;
+}
+
+async function runBulkProgress(flight) {
+  const { userId, binding } = flight;
+  const mismatch = { ok: false, status: 409, payload: { error: 'sync_account_mismatch' } };
+  if (!await bulkAccountCurrent(userId, binding, true)) return mismatch;
+  const admission = await withBulkCache(async () => {
+    requireLocalWrite(binding);
+    const stored = await chrome.storage.local.get(RESUME_BULK_KEY);
+    requireLocalWrite(binding);
+    const old = stored[RESUME_BULK_KEY];
+    const now = Date.now();
+    const authRejected = old?.authRejectedUserId === userId
+      && (old?.authRejectedStatus === 401 || old?.authRejectedStatus === 409);
+    const map = !authRejected && old?.userId === userId ? AniRekoActivity.normalizeProgressMap(old.byAnime, now) : null;
+    const fetchedAt = Number.isFinite(old?.fetchedAt) ? old.fetchedAt : 0;
+    const age = now - fetchedAt;
+    const ttl = flight.forceResume ? 30 * 60_000 : 24 * 3600_000;
+    if (!flight.force && map && fetchedAt > 0 && age >= 0 && age < ttl) return { map, fetchedAt };
+    const attemptedAt = Number.isFinite(old?.attemptedAt) ? old.attemptedAt : 0;
+    const retryAt = Number.isFinite(old?.retryAt) ? old.retryAt : 0;
+    // A clock rollback never makes a past attempt look eligible.
+    if ((attemptedAt > 0 && (now < attemptedAt || now - attemptedAt < BULK_FLOOR_MS)) || now < retryAt) {
+      return { map, fetchedAt, cooldown: true, authStatus: authRejected ? old.authRejectedStatus : null };
+    }
+    if (!await bulkAccountCurrent(userId, binding)) return { mismatch: true };
+    const next = old && typeof old === 'object' ? { ...old } : {};
+    next.attemptedAt = now;
+    next.retryAt = now + BULK_FLOOR_MS;
+    await setLocal(binding, { [RESUME_BULK_KEY]: next });
+    requireLocalWrite(binding);
+    return { dispatch: true, generation: bulkOwnWriteGeneration };
+  });
+  if (admission.mismatch || !await bulkAccountCurrent(userId, binding)) return mismatch;
+  if (!admission.dispatch) {
+    if (admission.map) return bulkReply(admission.map, admission.fetchedAt, true);
+    if (admission.authStatus) return { ok: false, status: admission.authStatus, payload: { error: 'sync_account_mismatch' } };
+    return { ok: false, status: 429, payload: { error: 'bulk_cooldown' } };
+  }
+  let response;
+  try { response = await apiClient.request('progress-all', { expectedUserId: userId }); }
+  catch { response = { ok: false, status: 503, payload: null }; }
+  if (!await bulkAccountCurrent(userId, binding)) return mismatch;
+  const result = await withBulkCache(async () => {
+    requireLocalWrite(binding);
+    const stored = await chrome.storage.local.get(RESUME_BULK_KEY);
+    requireLocalWrite(binding);
+    const old = stored[RESUME_BULK_KEY] || {};
+    const now = Date.now();
+    const previous = old.userId === userId ? AniRekoActivity.normalizeProgressMap(old.byAnime, now) : null;
+    const authorizationFailure = response.status === 401 || response.status === 409;
+    const incoming = response.ok && !authorizationFailure
+      ? AniRekoActivity.normalizeProgressMap(response.payload?.progress_all, now) : null;
+    const next = { ...old };
+    if (incoming && flight.binding.revision === binding.revision && admission.generation === bulkOwnWriteGeneration) {
+      next.userId = userId;
+      next.byAnime = incoming;
+      next.fetchedAt = now;
+    } else if (!incoming) {
+      const retry = Number.isFinite(response.retryAfterMs)
+        ? Math.max(BULK_FAILURE_BACKOFF_MS, Math.min(BULK_MAX_RETRY_MS, response.retryAfterMs))
+        : BULK_FAILURE_BACKOFF_MS;
+      next.retryAt = Math.max(Number(next.retryAt) || 0, now + retry);
+    }
+    if (authorizationFailure) {
+      next.authRejectedUserId = userId;
+      next.authRejectedStatus = response.status;
+    } else if (incoming) {
+      delete next.authRejectedUserId;
+      delete next.authRejectedStatus;
+    }
+    if (!await bulkAccountCurrent(userId, binding)) return { mismatch: true };
+    await setLocal(binding, { [RESUME_BULK_KEY]: next });
+    requireLocalWrite(binding);
+    if (authorizationFailure) return { authorizationFailure: true };
+    if (incoming && admission.generation === bulkOwnWriteGeneration) return { map: incoming, fetchedAt: now, cached: false };
+    if (previous && (incoming || old.authRejectedUserId !== userId)) return { map: previous, fetchedAt: old.fetchedAt || 0, cached: true };
+    return { failure: true };
+  });
+  if (result.mismatch || !await bulkAccountCurrent(userId, binding)) return mismatch;
+  if (result.authorizationFailure) return { ok: false, status: response.status, payload: { error: 'sync_account_mismatch' } };
+  if (result.map) return bulkReply(result.map, result.fetchedAt, result.cached);
+  return { ok: false, status: response.status === 429 ? 429 : 503, payload: { error: 'bulk_unavailable' } };
+}
 
 async function updateResumeCache(userId, animeId, progress, writeBinding = captureLocalWrite()) {
+  bulkOwnWriteGeneration += 1;
   try {
+    await withBulkCache(async () => {
     const stored = await chrome.storage.local.get(RESUME_BULK_KEY);
     const cached = stored[RESUME_BULK_KEY];
+    requireLocalWrite(writeBinding);
     const bulk = cached?.userId === userId
-      ? cached
-      : { userId, byAnime: {}, fetchedAt: 0 };
-    bulk.byAnime[animeId] = progress;
+      ? { ...cached, byAnime: { ...cached.byAnime } }
+      : { ...cached, userId, byAnime: {}, fetchedAt: 0 };
+    const oldRow = bulk.byAnime[animeId];
+    const display = {};
+    for (const field of ['title', 'title_ru']) {
+      const value = oldRow?.[field];
+      if (typeof value === 'string' && value.length <= 600 && Array.from(value).length <= 300) display[field] = value;
+    }
+    bulk.byAnime[animeId] = { ...display, ...progress };
+    const keys = Object.keys(bulk.byAnime);
+    if (keys.length > 500) {
+      keys.filter(key => key !== String(animeId)).sort((left, right) => {
+        const leftTime = Date.parse(bulk.byAnime[left]?.watched_at);
+        const rightTime = Date.parse(bulk.byAnime[right]?.watched_at);
+        const a = Number.isFinite(leftTime) ? leftTime : -Infinity;
+        const b = Number.isFinite(rightTime) ? rightTime : -Infinity;
+        return a - b || left.localeCompare(right);
+      }).slice(0, keys.length - 500).forEach(key => { delete bulk.byAnime[key]; });
+    }
     await setLocal(writeBinding, { [RESUME_BULK_KEY]: bulk });
+    });
   } catch { /* кэш — best effort */ }
 }
 
@@ -3220,19 +3372,7 @@ async function handlePopupRequest(message, writeBinding = captureLocalWrite()) {
       }
       return settleWatchCommand(writeBinding, message.capabilityId);
     case 'popup-progress-all': {
-      const expectedUserId = Number(message.expectedUserId);
-      const syncAccount = await activeSyncAccount(writeBinding);
-      if (!syncAccount || syncAccount.userId !== expectedUserId) {
-        return { ok: false, status: 409, payload: { error: 'sync_account_mismatch' } };
-      }
-      requireLocalWrite(writeBinding);
-      const response = await apiClient.request('progress-all', { expectedUserId });
-      requireLocalWrite(writeBinding);
-      if (response.ok) {
-        const bulk = { userId: expectedUserId, byAnime: response.payload?.progress_all || {}, fetchedAt: Date.now() };
-        await setLocal(writeBinding, { [RESUME_BULK_KEY]: bulk });
-      }
-      return response;
+      return requestBulkProgress(message, writeBinding);
     }
     case 'popup-update-preferences': {
       if (message.expectedRevision !== localWriteRevision) {
@@ -3276,7 +3416,7 @@ async function handlePopupRequest(message, writeBinding = captureLocalWrite()) {
       requireLocalWrite(writeBinding);
       await exclusiveLocalControl(async () => {
         await chrome.storage.local.set(items);
-        if (clearResume) await chrome.storage.local.remove([RESUME_BULK_KEY, 'resume-sync-at']);
+        if (clearResume) await chrome.storage.local.remove('resume-sync-at');
         sessionInfoCache = null;
         sessionInfoExpiresAt = 0;
         sessionInfoInFlight = null;

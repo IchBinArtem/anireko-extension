@@ -217,6 +217,11 @@ h1 { margin: 0; font-size: 17px; line-height: 1.15; letter-spacing: -.02em; }
 .activity-cell.level-2 { background: #23785b; }
 .activity-cell.level-3 { background: #2ea97b; }
 .activity-cell.level-4 { background: var(--success); }
+.activity-cell.has-account-records { position: relative; }
+.activity-cell.has-account-records::after { content: ''; position: absolute; right: 1px; top: 1px; width: 4px; height: 4px; border-radius: 50%; background: #9bd5ff; }
+.activity-cell.account-only { background: #274863; }
+.activity-account-entry { border-left: 2px solid #7db9e6; padding-left: 7px; }
+.activity-entries .activity-account-note { color: #9bd5ff; }
 .activity-cell.today { border-color: #f8fafc; }
 .activity-cell:focus-visible { outline: 2px solid #f8fafc; outline-offset: 2px; }
 .activity-detail, .activity-legend { margin: 7px 0 0; color: var(--muted); font-size: 9px; line-height: 1.5; }

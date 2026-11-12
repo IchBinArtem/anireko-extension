@@ -42,6 +42,67 @@ async function render({ match, records, playing = false, bulk = {}, syncAccountA
 
 const history = (animeId, position = 600) => ({ animeId, position, episode: 3, lastWatchedAt: 1 });
 
+test('popup rejected bulk cache cannot return through offline fallback and authorized recovery is clean', async () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'popup.js'), 'utf8');
+  const start = source.indexOf('  async function loadResumeBulk(force) {');
+  const end = source.indexOf('\n  async function renderResume(force) {', start);
+  for (const status of [401, 409]) for (const outcome of ['503', 'throw', 'success']) {
+    const cache = { userId: 18, byAnime: { 1: { episode: 3, position_sec: 600 } }, fetchedAt: 1,
+      authRejectedUserId: 18, authRejectedStatus: status };
+    const context = vm.createContext({ syncAccountActive: true, currentUserId: 18,
+      localWriteRevision: 'revision', accountActivityEpoch: 0, accountActivityCache: null,
+      RESUME_BULK_TTL_MS: 30 * 60_000, stored: { 'watch-history': {} }, renderStats() {},
+      chrome: { storage: { local: { get: async () => ({ 'resume-bulk': structuredClone(cache) }) } } },
+      requestBackground: async () => {
+        if (outcome === 'throw') throw new Error('offline');
+        return outcome === 'success' ? { ok: true, payload: { progress_all: { 1: { position_sec: 900 } }, fetchedAt: 100 } }
+          : { ok: false, status: 503 };
+      } });
+    vm.runInContext(`${source.slice(start, end)}\nglobalThis.run = loadResumeBulk;`, context);
+    const result = await context.run(false);
+    assert.equal(Object.keys(result.byAnime).length, outcome === 'success' ? 1 : 0, `${status}/${outcome}`);
+    assert.equal(result.authRejectedUserId, undefined, 'returned data is an accepted snapshot or an empty fallback');
+  }
+});
+
+test('a bulk port rejection after revocation cannot return a previously accepted account snapshot', async () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'popup.js'), 'utf8');
+  const start = source.indexOf('  async function loadResumeBulk(force) {');
+  const end = source.indexOf('\n  async function renderResume(force) {', start);
+  let reject;
+  const held = new Promise((_, fail) => { reject = fail; });
+  const context = vm.createContext({ syncAccountActive: true, currentUserId: 18,
+    localWriteRevision: 'revision', accountActivityEpoch: 0, accountActivityCache: null,
+    RESUME_BULK_TTL_MS: 30 * 60_000, stored: { 'watch-history': {} }, renderStats() {},
+    chrome: { storage: { local: { get: async () => ({ 'resume-bulk': {
+      userId: 18, fetchedAt: 1, byAnime: { 1: { episode: 7, position_sec: 700, voice: 'Remote-only' } },
+    } }) } } }, requestBackground: () => held });
+  vm.runInContext(`${source.slice(start, end)}\nglobalThis.run = loadResumeBulk;`, context);
+  const pending = context.run(false);
+  await new Promise(done => setImmediate(done));
+  context.syncAccountActive = false;
+  context.accountActivityEpoch++;
+  reject(new Error('port_closed'));
+  const result = await pending;
+  assert.equal(Object.keys(result.byAnime).length, 0);
+});
+
+test('popup never bypasses worker authorization even when persisted bulk cache is fresh', async () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'popup.js'), 'utf8');
+  const start = source.indexOf('  async function loadResumeBulk(force) {');
+  const end = source.indexOf('\n  async function renderResume(force) {', start);
+  let calls = 0;
+  const context = vm.createContext({ syncAccountActive: true, currentUserId: 18,
+    localWriteRevision: 'revision', accountActivityEpoch: 0, accountActivityCache: null,
+    stored: { 'watch-history': {} }, renderStats() {},
+    chrome: { storage: { local: { get: () => { throw new Error('popup_must_not_authorize_cached_account_rows'); } } } },
+    requestBackground: async () => { calls++; return { ok: false, status: 503 }; } });
+  vm.runInContext(`${source.slice(start, end)}\nglobalThis.run = loadResumeBulk;`, context);
+  const result = await context.run(false);
+  assert.equal(calls, 1);
+  assert.equal(Object.keys(result.byAnime).length, 0);
+});
+
 function cycleResumeProjection(status = 'paused') {
   const current = { cycle_id: '33333333-3333-4333-8333-333333333333', status,
     kind: 'rewatching', tracked_start_ordinal: 2, episode: 1, position_sec: 1371,
@@ -178,6 +239,7 @@ test('actual repair renderer requires a human choice in every group and preserve
     repairComplete: true, actions: [{ command: 'reconcile', capabilityId: 'opaque-choice', groups }] };
   const mutations = [];
   const context = vm.createContext({ matchConfirmed: true, syncAccountActive: true, tab: { id: 71 },
+    accountActivityEpoch: 0, localWriteRevision: 'revision',
     watchProjection: null, pauseSessionStateReload: false, renderResume: async () => {},
     watchCard: elements.get('watch-cycle-card'), watchActions: elements.get('watch-actions'),
     watchFeedback: elements.get('watch-feedback'),
@@ -227,6 +289,7 @@ test('failed explicit action remains visible after a fresh nonpending projection
   const projection = { pending: false, snapshot: { history_adopted: true, readiness: 'ready', origins: [],
     foreground: { cycle_id: null } }, actions: [{ command: 'pause', capabilityId: 'stale-capability' }] };
   const context = vm.createContext({ matchConfirmed: true, syncAccountActive: true, tab: { id: 71 },
+    accountActivityEpoch: 0, localWriteRevision: 'revision',
     watchProjection: null, pauseSessionStateReload: false, renderResume: async () => {},
     watchCard: elements.get('watch-cycle-card'), watchActions: elements.get('watch-actions'),
     watchFeedback: elements.get('watch-feedback'), set: (id, value) => { elements.get(id).textContent = value; },
@@ -275,6 +338,7 @@ test('actual cycle renderer retains completion and shows only component tracked 
   snapshot.origins[0].state = snapshot.start_state;
   const projection = { snapshot, actions: [] };
   const context = vm.createContext({ matchConfirmed: true, syncAccountActive: true, tab: { id: 71 },
+    accountActivityEpoch: 0, localWriteRevision: 'revision',
     watchProjection: null, pauseSessionStateReload: false, renderResume: async () => {},
     watchCard: elements.get('watch-cycle-card'), watchActions: elements.get('watch-actions'),
     watchFeedback: elements.get('watch-feedback'),
