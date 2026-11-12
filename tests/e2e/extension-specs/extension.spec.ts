@@ -411,14 +411,20 @@ test('popup keeps local UI on failed session and rejects old taste after an acco
 // Test setup only: the user-facing Start control is intentionally absent.
 // Exercise the existing immutable capability transport to create recovery fixtures.
 async function startCycleFixture(popup: Page, tabId: number) {
-  await popup.evaluate(async (tabId) => {
+  // The removed button used to provide this readiness wait implicitly.
+  await expect(popup.locator('#watch-completion')).toContainText('Уже просмотрено');
+  const outcome = await popup.evaluate(async (tabId) => {
     const runtime = await chrome.runtime.sendMessage({ type: 'popup-runtime-info' });
     const expectedRevision = runtime.payload.localWriteRevision;
     const history = await chrome.runtime.sendMessage({ type: 'popup-watch-history', tabId, expectedRevision });
     const start = history.payload?.actions?.find((action: any) => action.command === 'start');
     if (!start) throw new Error('synthetic_start_capability_missing');
-    await chrome.runtime.sendMessage({ type: 'popup-watch-command', capabilityId: start.capabilityId, expectedRevision });
+    const reply = await chrome.runtime.sendMessage({ type: 'popup-watch-command', capabilityId: start.capabilityId, expectedRevision });
+    const pending = await chrome.storage.local.get('watch-command-pending-v1');
+    return { ok: reply?.ok === true, status: reply?.status, error: reply?.payload?.error || reply?.error,
+      pending: Object.hasOwn(pending, 'watch-command-pending-v1') };
   }, tabId);
+  if (!outcome.ok && !outcome.pending) throw new Error('synthetic_start_not_admitted: ' + JSON.stringify(outcome));
   await popup.reload();
 }
 
@@ -664,7 +670,8 @@ test('Cancel survives actual MV3 worker stop while the same video keeps playing'
     popup = await openPopup(tabId);
     await popup.getByText('Управление вручную', { exact: true }).click();
     await popup.getByRole('button', { name: /Отменить этот просмотр/ }).click();
-    await expect(popup.locator('#watch-current')).toContainText('просмотр учтётся автоматически');
+    await expect(popup.locator('#watch-current')).toBeEmpty();
+    await expect(popup.getByRole('button', { name: 'Начать новый просмотр', exact: true })).toHaveCount(0);
     await expect(popup.locator('#watch-completion')).toContainText('Уже просмотрено');
     expect((await commands()).filter((request: any) => request.command === 'cancel')).toHaveLength(1);
     await expect.poll(() => worker.evaluate(async () =>
