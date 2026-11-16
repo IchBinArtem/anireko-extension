@@ -2365,7 +2365,32 @@ function maybeSyncProgress(state, urgent, writeBinding = captureLocalWrite(), li
 
 function activePlayer(state) {
   const now = Date.now();
-  const players = Object.values(state.players || {});
+  let players = Object.values(state.players || {});
+  if (isDreamCastReleaseUrl(state.pageUrl)) {
+    const receipt = latestDreamCastReceiptByTab.get(String(state.tabId));
+    // A cold worker may show the previously selected player, but never infer
+    // a different selection from stale scores. Writes still require a receipt.
+    if (!receipt) {
+      const saved = state.player;
+      if (!saved || typeof state.navigationToken !== 'string' || !state.navigationToken
+        || typeof state.topDocumentId !== 'string' || !state.topDocumentId
+        || saved.documentId !== state.topDocumentId || saved.frameId !== 0 || saved.frameUrl !== state.pageUrl
+        || typeof saved.playerInstanceId !== 'string' || !saved.playerInstanceId
+        || !Number.isSafeInteger(saved.playerSequence) || saved.playerSequence < 1
+        || !Number.isSafeInteger(saved.mediaGeneration) || saved.mediaGeneration < 1
+        || !(saved.episode === null || (Number.isInteger(saved.episode) && saved.episode > 0 && saved.episode <= 5000))) return null;
+      const matching = players.filter(player => player.documentId === saved.documentId && player.frameId === saved.frameId
+        && player.frameUrl === saved.frameUrl && player.playerInstanceId === saved.playerInstanceId
+        && player.playerSequence === saved.playerSequence && player.mediaGeneration === saved.mediaGeneration
+        && player.episode === saved.episode);
+      return matching.length === 1 ? matching[0] : null;
+    }
+    if (receipt.documentId !== state.topDocumentId
+      || receipt.token !== state.navigationToken || receipt.url !== state.pageUrl) return null;
+    players = players.filter(player => player.documentId === receipt.documentId && player.frameId === 0
+      && player.frameUrl === receipt.url && player.playerInstanceId === receipt.playerId
+      && player.playerSequence === receipt.sequence && player.mediaGeneration === receipt.mediaGeneration);
+  }
   return players.sort((left, right) => {
     const score = (player) => {
       const ageSeconds = Math.max(0, (now - player.observedAt) / 1000);
@@ -3043,10 +3068,9 @@ async function updateTabState(message, sender, messageContext, writeBinding = ca
   }
   if (!stateMatchesLatestReceipt(tabId, current)) return;
   const detectedPlayer = activePlayer(current);
-  current.player = detectedPlayer
-    && AniRekoTrust.playerVisibilityConfirmed(detectedPlayer)
+  current.player = detectedPlayer && AniRekoTrust.playerVisibilityConfirmed(detectedPlayer)
     ? detectedPlayer
-    : activePlayerHint(current);
+    : isDreamCastReleaseUrl(current.pageUrl) ? null : activePlayerHint(current);
   current.voice = current.player?.voice
     || current.topVoice
     || current.recognition?.voice

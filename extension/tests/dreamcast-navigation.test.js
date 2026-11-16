@@ -110,3 +110,63 @@ test('without Navigation API the original full-URL guard and detector reset rema
   isolated.setLabel('Серия 2'); isolated.episode(2);
   assert.equal(main.last(),2); assert.equal(isolated.last().episode,2);
 });
+
+function receiptFixture() {
+  const listeners=new Map(), sent=[]; let selected='Серия 1', playerVideos=[];
+  function video(src, inside) {
+    const handlers=new Map();
+    return {tagName:'VIDEO',isConnected:true,src,currentSrc:src,readyState:4,currentTime:100,duration:1000,
+      paused:false,ended:false,seeking:false,muted:false,volume:1,playbackRate:1,hidden:false,inside,
+      closest(selector) {return selector==='#player' && this.isConnected && this.inside ? {} : null;},
+      getBoundingClientRect() {return {width:800,height:450};},
+      addEventListener(type,fn) {handlers.set(type,fn);}, emit(type) {assert.ok(handlers.has(type));handlers.get(type)();}};
+  }
+  const old=video('blob:old',true), next=video('blob:new',false), other=video('blob:other',false); playerVideos=[old];
+  const document={documentElement:{},title:'',readyState:'complete',
+    addEventListener(type,fn) {const list=listeners.get(type)||[];list.push(fn);listeners.set(type,list);},
+    querySelectorAll(selector) {if(selector==='#player video') return playerVideos;
+      if(selector==='video') return [old,next,other];
+      if(selector==='#player .pjs-player-active-pl') return [{textContent:selected}];return [];},
+    querySelector(selector) {return selector==='#player video' ? playerVideos[0] || null : selector==='video' ? old : null;}};
+  const window={addEventListener(){},navigation:{addEventListener(){}}};window.top=window;
+  const context=vm.createContext({document,window,location:new URL(base),
+    chrome:{runtime:{id:'extension',onMessage:{addListener(){}},sendMessage(m){sent.push(m);return Promise.resolve();}}},
+    getComputedStyle:()=>({display:'block',visibility:'visible',opacity:'1'}),
+    MutationObserver:class {observe(){} disconnect(){}},Element:class{},Node:{ELEMENT_NODE:1},
+    setTimeout(){},setInterval(){return 1;},clearInterval(){},queueMicrotask(){},URL});
+  for(const file of ['lib/recognition.js','lib/progress.js','content/media-detector.js'])
+    vm.runInContext(fs.readFileSync(path.join(root,file),'utf8'),context,{filename:file});
+  const source=fs.readFileSync(path.join(root,'service-worker.js'),'utf8');
+  const start=source.indexOf('function captureDreamCastReceipt('), end=source.indexOf('chrome.runtime.onMessage.addListener(',start);
+  assert.ok(start>=0 && end>start);
+  const worker=vm.createContext({URL});
+  vm.runInContext("const latestDreamCastReceiptByTab=new Map(),latestTopDocumentByTab=new Map(),stateByTab={}; function isDreamCastReleaseUrl(v){try {const u=new URL(v);return u.hostname==='dreamerscast.com' && /^\\/home\\/release\\/\\d+-[^/]+\\/?$/u.test(u.pathname);}catch{return false;}}\n"+source.slice(start,end),worker);
+  const sender={tab:{id:7}}, scope={topFrame:true,documentId:'top',documentToken:null,documentUrl:base};
+  let consumed=0;
+  return {old,next,other,sent,
+    player(videos, label) {playerVideos=videos;selected=label;},
+    proof(episode) {for(const fn of listeners.get('anireko-dreamcast-prototype')||[])fn({detail:JSON.stringify({episode})});},
+    messages() {return sent.filter(m=>m.type==='player-progress');},
+    accept() {const messages=this.messages();for(;consumed<messages.length;consumed++) {const m=messages[consumed];scope.documentToken=m.documentToken;assert.equal(worker.captureDreamCastReceipt(m,sender,scope),true);}return messages.at(-1);},
+    current(message) {return worker.dreamCastMessageReceiptCurrent(message,sender,scope);}};
+}
+
+test('detached and unrelated video events cannot supersede a valid current receipt', () => {
+  const f=receiptFixture();f.proof(1);f.accept();f.old.isConnected=false;f.next.inside=true;
+  f.player([f.next],'Серия 2');f.proof(2);const valid=f.accept();assert.equal(valid.episode,2);
+  const count=f.messages().length;f.old.emit('pause');f.other.emit('pause');f.accept();
+  assert.equal(f.messages().length,count);assert.equal(f.current(valid),true);
+  f.next.paused=true;f.next.emit('pause');const paused=f.accept();
+  assert.equal(paused.episode,2);assert.equal(paused.paused,true);assert.equal(f.current(valid),false);assert.equal(f.current(paused),true);
+});
+
+for(const mode of ['missing','ambiguous','replacement']) {
+  test(`lost proof invalidates the previous worker receipt once: ${mode}`, () => {
+    const f=receiptFixture();f.proof(1);const valid=f.accept();assert.equal(valid.episode,1);
+    if(mode==='missing') {f.old.isConnected=false;f.player([],'Серия 1');}
+    if(mode==='ambiguous') {f.next.inside=true;f.player([f.old,f.next],'Серия 1');}
+    if(mode==='replacement') {f.old.isConnected=false;f.next.inside=true;f.player([f.next],'Серия 2');}
+    f.proof(null);const invalid=f.accept();assert.equal(invalid.episode,null);assert.equal(f.current(valid),false);assert.equal(f.current(invalid),true);
+    const count=f.messages().length;f.old.emit('pause');f.accept();assert.equal(f.messages().length,count);
+  });
+}

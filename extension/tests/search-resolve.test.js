@@ -7,6 +7,146 @@ const test = require('node:test');
 const extensionDir = path.join(__dirname, '..');
 const serviceWorkerPath = process.env.ANIREKO_SW_UNDER_TEST || path.join(extensionDir, 'service-worker.js');
 
+function dreamCastSensorFixture() {
+  const listeners=new Map(), sent=[];let selected='Серия 1', playerVideos=[];
+  function video(src,inside) {const handlers=new Map();return {tagName:'VIDEO',isConnected:true,src,currentSrc:src,
+    readyState:4,currentTime:100,duration:1000,paused:false,ended:false,seeking:false,muted:false,volume:1,
+    playbackRate:1,hidden:false,inside,closest(selector){return selector==='#player'&&this.isConnected&&this.inside?{}:null;},
+    getBoundingClientRect(){return {width:800,height:450};},addEventListener(type,fn){handlers.set(type,fn);},
+    emit(type){assert.ok(handlers.has(type));handlers.get(type)();}};}
+  const old=video('blob:old',true),next=video('blob:new',false);playerVideos=[old];
+  const document={documentElement:{},title:'',readyState:'complete',
+    addEventListener(type,fn){const list=listeners.get(type)||[];list.push(fn);listeners.set(type,list);},
+    querySelectorAll(selector){if(selector==='#player video')return playerVideos;if(selector==='video')return [old,next];
+      if(selector==='#player .pjs-player-active-pl')return [{textContent:selected}];return [];},
+    querySelector(selector){return selector==='#player video'?playerVideos[0]||null:selector==='video'?old:null;}};
+  const window={addEventListener(){},navigation:{addEventListener(){}}};window.top=window;
+  const url='https://dreamerscast.com/home/release/621-test';
+  const context=vm.createContext({document,window,location:new URL(url),
+    chrome:{runtime:{id:'test-extension-id',onMessage:{addListener(){}},sendMessage(m){sent.push(m);return Promise.resolve();}}},
+    getComputedStyle:()=>({display:'block',visibility:'visible',opacity:'1'}),MutationObserver:class{observe(){} disconnect(){}},
+    Element:class{},Node:{ELEMENT_NODE:1},setTimeout(){},setInterval(){return 1;},clearInterval(){},queueMicrotask(){},URL});
+  for(const file of ['lib/recognition.js','lib/progress.js','content/media-detector.js'])
+    vm.runInContext(fs.readFileSync(path.join(extensionDir,file),'utf8'),context,{filename:file});
+  return {old,next,url,sent,proof(n){for(const fn of listeners.get('anireko-dreamcast-prototype')||[])fn({detail:JSON.stringify({episode:n})});},
+    replace(){old.isConnected=false;next.inside=true;next.paused=true;playerVideos=[next];selected='Серия 2';},
+    progress(){return sent.filter(m=>m.type==='player-progress');}};
+}
+
+function clonedSessionStorage() {
+  const storage=makeStorage();
+  return {...storage, get:async keys=>structuredClone(await storage.get(keys)),
+    set:async items=>storage.set(structuredClone(items))};
+}
+
+for (const batch of [false,true]) {
+  test(`Dream Cast worker queue selects the latest paused replacement after ${batch?'null batch':'direct handoff'}`, async () => {
+    const sensor=dreamCastSensorFixture();sensor.proof(1);const first=sensor.progress().at(-1);
+    const session=clonedSessionStorage();
+    const {context,chrome}=loadServiceWorker({sessionStorage:session,fetchImpl:async()=>({ok:true,status:200,json:async()=>({data:[]})})});
+    const sender={id:chrome.runtime.id,documentId:'top',frameId:0,url:sensor.url,tab:{id:7,url:sensor.url}};
+    context.seedState={tabId:7,topDocumentId:'top',navigationToken:first.documentToken,pageUrl:sensor.url,
+      pageNavigationAt:Date.now()-100,sourceOrigin:'https://dreamerscast.com',players:{},frames:[],frameReports:{},documents:{}};
+    vm.runInContext("stateByTab['7']=seedState",context);
+    const send=m=>chrome.runtime.onMessage.listener(m,sender,()=>{});
+    const drain=async()=>{await new Promise(resolve=>setImmediate(resolve));await vm.runInContext("tabQueues['7']",context);};
+    send(first);await drain();assert.equal(context.seedState.player.episode,1);assert.equal(context.seedState.player.playing,true);
+    sensor.replace();let before=sensor.progress().length;
+    if(batch)sensor.proof(null);sensor.proof(2);
+    if(batch) assert.ok(sensor.progress().length-before>=2, 'null and replacement arrive before the queue drains');
+    for(const message of sensor.progress().slice(before))send(message);
+    await drain();assert.equal(context.seedState.player.episode,2);assert.equal(context.seedState.player.paused,true);
+    before=sensor.progress().length;sensor.old.emit('pause');assert.equal(sensor.progress().length,before);
+    sensor.next.emit('pause');send(sensor.progress().at(-1));await drain();
+    assert.equal(context.seedState.player.episode,2);assert.equal(context.seedState.player.reason,'pause');
+    assert.equal(Object.keys(context.seedState.players).length,2);
+    const restarted=loadServiceWorker({sessionStorage:session,fetchImpl:async()=>({ok:true,status:200,json:async()=>({data:[]})})});
+    restarted.chrome.runtime.onMessage.listener({type:'frame-visibility',pageUrl:sensor.url,documentUrl:sensor.url,
+      documentToken:first.documentToken,frames:[],observedAt:Date.now()},sender,()=>{});
+    await new Promise(resolve=>setImmediate(resolve));await vm.runInContext("tabQueues['7']",restarted.context);
+    const restored=(await session.get('tab:7'))['tab:7'];
+    assert.equal(restored.player?.episode,2);assert.equal(restored.player.paused,true);
+    const live=vm.runInContext("stateByTab['7']",restarted.context);
+    assert.equal(restarted.context.progressEventCurrent(restarted.context.captureProgressEvent(live),restarted.context.captureLocalWrite()),false);
+  });
+}
+
+test('ordinary multi-frame worker queue still prefers playing media', async () => {
+  const {context}=loadServiceWorker({fetchImpl:async()=>({ok:true,status:200,json:async()=>({data:[]})})});
+  const now=Date.now(),url='https://example.com/watch',childUrl='https://player.example/embed';
+  context.seedState={tabId:7,topDocumentId:'top',navigationToken:'top-token',pageUrl:url,sourceOrigin:'https://example.com',
+    players:{},frames:[],frameReports:{},documents:{}};
+  vm.runInContext("stateByTab['7']=seedState",context);
+  const top={topFrame:true,documentId:'top',documentToken:'top-token',documentUrl:url,origin:'https://example.com',topOrigin:'https://example.com'};
+  const child={topFrame:false,documentId:'child',documentToken:'child-token',documentUrl:childUrl,origin:'https://player.example',topOrigin:'https://example.com',frameId:1};
+  const common={type:'player-progress',currentTime:20,duration:1000,locallyVisible:true,observedAt:now,reason:'pause'};
+  context.queueSensorMessage({...common,frameUrl:url,playerInstanceId:'top-video',episode:2,playing:false,paused:true},
+    {tab:{id:7,url},frameId:0,documentId:'top'},top);
+  context.queueSensorMessage({...common,frameUrl:childUrl,playerInstanceId:'child-video',episode:1,playing:true,paused:false},
+    {tab:{id:7,url},frameId:1,documentId:'child'},child);
+  await vm.runInContext("tabQueues['7']",context);
+  assert.equal(context.activePlayer(context.seedState).documentId,'child');
+});
+
+test('Dream Cast stored display yields to a mismatched current receipt', () => {
+  const {context}=loadServiceWorker({fetchImpl:async()=>({ok:true,status:200,json:async()=>({data:[]})})});
+  const url='https://dreamerscast.com/home/release/621-test', token='1234567890abcdef';
+  const player={documentId:'top',frameId:0,frameUrl:url,playerInstanceId:'video-1',playerSequence:1,mediaGeneration:1,episode:1};
+  const state={tabId:7,topDocumentId:'top',navigationToken:token,pageUrl:url,player,players:{one:player}};
+  assert.equal(context.activePlayer(state),player);
+  const scope={topFrame:true,documentId:'top',documentToken:token,documentUrl:url};
+  assert.equal(context.captureDreamCastReceipt({type:'player-progress',playerInstanceId:'video-2',playerSequence:2,mediaGeneration:2}, {tab:{id:7}},scope),true);
+  assert.equal(context.activePlayer(state),null);
+});
+
+test('cold Dream Cast selection rejects missing, malformed, stale and ambiguous saved identity', () => {
+  const {context}=loadServiceWorker({fetchImpl:async()=>({ok:true,status:200,json:async()=>({data:[]})})});
+  const url='https://dreamerscast.com/home/release/621-test';
+  const valid={documentId:'top',frameId:0,frameUrl:url,playerInstanceId:'video-1',playerSequence:1,mediaGeneration:1,episode:1};
+  const state={tabId:7,topDocumentId:'top',navigationToken:'1234567890abcdef',pageUrl:url,player:valid,players:{one:{...valid}}};
+  assert.equal(context.activePlayer(state),state.players.one);
+  for(const bad of [null, {...valid,playerSequence:undefined}, {...valid,mediaGeneration:0},
+    {...valid,documentId:'old'}, {...valid,frameUrl:`${url}#old`}, {...valid,episode:2}]) {
+    assert.equal(context.activePlayer({...state,player:bad}),null);
+  }
+  assert.equal(context.activePlayer({...state,players:{one:{...valid},duplicate:{...valid}}}),null);
+});
+
+test('cold worker retains paused Dream Cast display without authorizing old progress', async () => {
+  const session=clonedSessionStorage(),url='https://dreamerscast.com/home/release/621-test';
+  const sensor=dreamCastSensorFixture();sensor.old.paused=true;sensor.proof(1);const sample=sensor.progress().at(-1);
+  const first=loadServiceWorker({sessionStorage:session,fetchImpl:async()=>({ok:true,status:200,json:async()=>({data:[]})})});
+  const sender={id:first.chrome.runtime.id,documentId:'top',frameId:0,url,tab:{id:7,url}};
+  first.context.seedState={tabId:7,topDocumentId:'top',navigationToken:sample.documentToken,pageUrl:url,
+    pageNavigationAt:Date.now()-100,sourceOrigin:'https://dreamerscast.com',players:{},frames:[],frameReports:{},documents:{}};
+  vm.runInContext("stateByTab['7']=seedState",first.context);
+  first.chrome.runtime.onMessage.listener(sample,sender,()=>{});
+  await new Promise(resolve=>setImmediate(resolve));await vm.runInContext("tabQueues['7']",first.context);
+  assert.equal((await session.get('tab:7'))['tab:7'].player.episode,1);
+  const requests=[];
+  const second=loadServiceWorker({sessionStorage:session,fetchImpl:async(url,options)=>{requests.push({url,options});return {ok:true,status:200,json:async()=>({data:[]})};}});
+  second.chrome.runtime.onMessage.listener({type:'frame-visibility',pageUrl:url,documentUrl:url,
+    documentToken:sample.documentToken,frames:[],observedAt:Date.now()},sender,()=>{});
+  await new Promise(resolve=>setImmediate(resolve));await vm.runInContext("tabQueues['7']",second.context);
+  const stored=(await session.get('tab:7'))['tab:7'];
+  assert.equal(stored.player?.episode,1);assert.equal(stored.player.paused,true);
+  const state=vm.runInContext("stateByTab['7']",second.context);
+  const event=second.context.captureProgressEvent(state);
+  assert.equal(second.context.progressEventCurrent(event,second.context.captureLocalWrite()),false);
+  state.recognition={title:'Fixture',url};state.match={status:'ok',exact:true,animeId:101,completionMetadataReady:true,resolvedAt:Date.now()};
+  requests.length=0;
+  await second.context.queueHistoryUpdate(state,state.player,null);
+  await second.context.maybeSyncProgress(state,true);
+  await second.context.maybeAutoMark(state);
+  assert.equal((await second.storage.local.get('watch-history'))['watch-history'],undefined);
+  assert.equal(requests.length,0);
+  sensor.replace();sensor.proof(2);const newer=sensor.progress().at(-1);
+  second.chrome.runtime.onMessage.listener(newer,sender,()=>{});
+  assert.equal(second.context.activePlayer(state),null, 'a newer receipt immediately fences the restored player');
+  await new Promise(resolve=>setImmediate(resolve));await vm.runInContext("tabQueues['7']",second.context);
+  assert.equal((await session.get('tab:7'))['tab:7'].player.episode,2);
+});
+
 test('Dream Cast fragment receipt uses the full current URL and rejects the old URL', () => {
   const {context}=loadServiceWorker({fetchImpl:async()=>({ok:true,status:200,json:async()=>({data:[]})})});
   const oldUrl='https://dreamerscast.com/home/release/621-test', newUrl=`${oldUrl}#chapter`;

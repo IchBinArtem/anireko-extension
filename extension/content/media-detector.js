@@ -25,6 +25,7 @@
   let dreamCastNavigatedAway = false;
   let dreamCastSequence = 0;
   let dreamCastMediaGeneration = 0;
+  let dreamCastLastValidVideo = null;
   let extensionContextAlive = true;
   const documentToken = globalThis.__anirekoDocumentToken ||= globalThis.crypto?.randomUUID?.()
     || `${Date.now()}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
@@ -335,22 +336,29 @@
     const runtime = videoRuntime.get(video) || { lastReportAt: 0, watchedEpisode: null };
     const dreamCast = isDreamCastRelease() || (initialDreamCastDocument && dreamCastNavigatedAway);
     if (dreamCast && !video.closest('#player') && !videoIds.has(video)) return;
+    const rawWatched = progressApi.isWatched(video.currentTime, video.duration);
+    if (!dreamCast && reason === 'timeupdate' && !rawWatched && now - runtime.lastReportAt < 5000) return;
+    const episode = readEpisode(true);
+    if (dreamCast) {
+      const videos = [...document.querySelectorAll('#player video')];
+      const current = videos.length === 1 && videos[0].isConnected ? videos[0] : null;
+      // A previous player may invalidate its last receipt once if proof is
+      // lost, but must not supersede an already valid replacement.
+      if (video !== current && (video !== dreamCastLastValidVideo || episode !== null)) return;
+    }
     if (dreamCast && (runtime.dreamCastSrc !== video.src || runtime.dreamCastCurrentSrc !== video.currentSrc)) {
       runtime.dreamCastSrc = video.src;
       runtime.dreamCastCurrentSrc = video.currentSrc;
       runtime.dreamCastMediaGeneration = ++dreamCastMediaGeneration;
     }
-    const rawWatched = progressApi.isWatched(video.currentTime, video.duration);
-    if (!dreamCast && reason === 'timeupdate' && !rawWatched && now - runtime.lastReportAt < 5000) return;
-    let episode = readEpisode(true);
     const unavailable = dreamCast && (episode === null || video !== dreamCastProof?.video);
-    if (unavailable) episode = null;
+    const reportedEpisode = unavailable ? null : episode;
     const watched = !unavailable && rawWatched;
     // Cheap pre-throttle BEFORE the episode scan: readEpisode() walks the DOM
     // (incl. shadow roots) and must not run on every discarded tick.
     if (reason === 'timeupdate' && !watched && now - runtime.lastReportAt < 5000
       && !(unavailable && runtime.dreamCastUnavailable !== true)) return;
-    const episodeKey = episode === null ? 'unknown' : String(episode);
+    const episodeKey = reportedEpisode === null ? 'unknown' : String(reportedEpisode);
     // The 80% transition is reported immediately; everything else (including
     // post-80% progress) keeps flowing under the regular 5s throttle.
     const watchedTransition = watched && runtime.watchedEpisode !== episodeKey;
@@ -358,6 +366,7 @@
       && !(unavailable && runtime.dreamCastUnavailable !== true)) return;
     runtime.lastReportAt = now;
     runtime.dreamCastUnavailable = unavailable;
+    if (dreamCast) dreamCastLastValidVideo = unavailable ? null : video;
     if (watched) runtime.watchedEpisode = episodeKey;
     videoRuntime.set(video, runtime);
     safeSendMessage({
@@ -365,7 +374,7 @@
       playerInstanceId: videoId(video),
       player: playerKind(),
       frameUrl: location.href,
-      episode,
+      episode: reportedEpisode,
       playerSequence: dreamCast ? ++dreamCastSequence : undefined,
       mediaGeneration: dreamCast ? runtime.dreamCastMediaGeneration : undefined,
       episodeAuthoritative: dreamCast ? true : undefined,
