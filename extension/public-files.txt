@@ -37,6 +37,7 @@ extension/tests/auto-mark.test.js
 extension/tests/activity.test.js
 extension/tests/bulk-progress.test.js
 extension/tests/bulk-response.test.js
+extension/tests/dreamcast-navigation.test.js
 extension/tests/i18n.test.js
 extension/tests/parsers.test.js
 extension/tests/popup-resume.test.js

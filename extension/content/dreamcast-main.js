@@ -2,6 +2,8 @@
   'use strict';
   if (location.hostname !== 'dreamerscast.com' || !/^\/home\/release\/\d+-[^/]+\/?$/.test(location.pathname)) return;
   const initialUrl = location.href;
+  const supportsNavigation = Boolean(window.navigation?.addEventListener);
+  let navigatedAway = false;
   let dash = null;
   let activation = null;
   let generation = 0;
@@ -17,7 +19,10 @@
   }
   function current() {
     try {
-      if (location.href !== initialUrl) return null;
+      if (supportsNavigation) {
+        if (location.href.split('#', 1)[0] !== initialUrl.split('#', 1)[0]) navigatedAway = true;
+        if (navigatedAway) return null;
+      } else if (location.href !== initialUrl) return null;
       const videos = [...document.querySelectorAll('#player video')];
       const player = window.pjs;
       const d = player?.api?.('dash');

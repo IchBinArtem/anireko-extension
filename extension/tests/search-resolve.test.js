@@ -7,6 +7,20 @@ const test = require('node:test');
 const extensionDir = path.join(__dirname, '..');
 const serviceWorkerPath = process.env.ANIREKO_SW_UNDER_TEST || path.join(extensionDir, 'service-worker.js');
 
+test('Dream Cast fragment receipt uses the full current URL and rejects the old URL', () => {
+  const {context}=loadServiceWorker({fetchImpl:async()=>({ok:true,status:200,json:async()=>({data:[]})})});
+  const oldUrl='https://dreamerscast.com/home/release/621-test', newUrl=`${oldUrl}#chapter`;
+  const scope={topFrame:true,documentId:'top',documentToken:'1234567890abcdef',documentUrl:newUrl};
+  const sender={documentId:'top',frameId:0,tab:{id:7,url:newUrl}};
+  context.fixtureScope=scope; context.fixtureUrl=newUrl;
+  vm.runInContext("latestTopDocumentByTab.set('7',{...fixtureScope,url:fixtureUrl})",context);
+  const message={type:'player-progress',playerSequence:1,mediaGeneration:1,playerInstanceId:'video-1'};
+  assert.equal(context.captureDreamCastReceipt(message,sender,{...scope,documentUrl:oldUrl}),false);
+  assert.equal(context.captureDreamCastReceipt(message,sender,scope),true);
+  assert.equal(context.dreamCastMessageReceiptCurrent(message,sender,scope),true);
+  assert.equal(context.dreamCastMessageReceiptCurrent(message,sender,{...scope,documentUrl:oldUrl}),false);
+});
+
 test('Dream Cast newer sensor receipt fences old progress before consent completes', async () => {
   const {context,storage,chrome}=loadServiceWorker({fetchImpl:async()=>({ok:true,status:200,json:async()=>({data:[]})})});
   const url='https://dreamerscast.com/home/release/621-test',token='1234567890abcdef',now=Date.now();

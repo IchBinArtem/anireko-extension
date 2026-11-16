@@ -383,6 +383,7 @@ test('public export contains every source and fixture used by release verificati
     '.github/workflows/extension-release.yml',
     'extension/api-contract.json',
     'extension/content/dreamcast-main.js',
+    'extension/tests/dreamcast-navigation.test.js',
     'extension/scripts/cws_publish.py',
     'extension/tests/search-resolve.test.js',
     'extension/tests/popup-resume.test.js',
@@ -410,7 +411,7 @@ test('public export contains every source and fixture used by release verificati
     assert.equal(fs.existsSync(path.join(repo, relative)), true, `public source misses ${relative}`);
   }
 
-  assert.equal(listed.size, 64, 'public export allowlist changed without an explicit review');
+  assert.equal(listed.size, 65, 'public export allowlist changed without an explicit review');
   const exactSupportFiles = new Set([
     '.github/dependabot.yml',
     '.github/workflows/extension-release.yml',

@@ -18,6 +18,11 @@
   let lastShadowScanAt = 0;
   let playerInteractionReported = false;
   let dreamCastProof = null;
+  const supportsNavigation = Boolean(window.navigation?.addEventListener);
+  const initialDreamCastUrl = location.href.split('#', 1)[0];
+  const initialDreamCastDocument = window === window.top
+    && recognitionApi.dreamCastRelease(location.hostname, location.pathname);
+  let dreamCastNavigatedAway = false;
   let dreamCastSequence = 0;
   let dreamCastMediaGeneration = 0;
   let extensionContextAlive = true;
@@ -220,11 +225,11 @@
     // initial value forever, but emit a composed episodeChange event whenever
     // the user switches the episode. Once observed, that live signal is more
     // authoritative than stale DOM attributes.
-    if (isDreamCastRelease()) {
+    if (isDreamCastRelease() || (initialDreamCastDocument && dreamCastNavigatedAway)) {
       const videos = [...document.querySelectorAll('#player video')];
       const labels = [...document.querySelectorAll('#player .pjs-player-active-pl')].map(node => node.textContent || '');
       const video = videos.length === 1 ? videos[0] : null;
-      return dreamCastProof && dreamCastProof.url === location.href && dreamCastProof.video === video
+      return !dreamCastNavigatedAway && dreamCastProof && dreamCastProof.url === (supportsNavigation ? location.href.split('#', 1)[0] : location.href) && dreamCastProof.video === video
         && video?.isConnected && video.src === dreamCastProof.src && video.currentSrc === dreamCastProof.src
         && recognitionApi.uniqueSelectedEpisode(labels) === dreamCastProof.episode
         ? dreamCastProof.episode : null;
@@ -328,7 +333,7 @@
     handleUrlChangeIfAny();
     const now = Date.now();
     const runtime = videoRuntime.get(video) || { lastReportAt: 0, watchedEpisode: null };
-    const dreamCast = isDreamCastRelease();
+    const dreamCast = isDreamCastRelease() || (initialDreamCastDocument && dreamCastNavigatedAway);
     if (dreamCast && !video.closest('#player') && !videoIds.has(video)) return;
     if (dreamCast && (runtime.dreamCastSrc !== video.src || runtime.dreamCastCurrentSrc !== video.currentSrc)) {
       runtime.dreamCastSrc = video.src;
@@ -451,7 +456,7 @@
     authoritative = false,
     sourceKind = window === window.top ? 'top-dom' : 'player-dom'
   ) {
-    if (isDreamCastRelease()) {
+    if (isDreamCastRelease() || (initialDreamCastDocument && dreamCastNavigatedAway)) {
       const video = document.querySelector('#player video');
       if (video) reportPlayerState(video, 'episode-change');
       return;
@@ -558,18 +563,19 @@
 
   document.addEventListener('anireko-dreamcast-prototype', event => {
     if (!isDreamCastRelease()) return;
+    if (supportsNavigation && location.href.split('#', 1)[0] !== initialDreamCastUrl) dreamCastNavigatedAway = true;
     const oldVideo = dreamCastProof?.video;
     const videos = [...document.querySelectorAll('#player video')];
     const video = videos.length === 1 ? videos[0] : null;
     let detail = null;
     try { if (typeof event.detail === 'string' && event.detail.length <= 80) detail = JSON.parse(event.detail); } catch {}
     const labels = [...document.querySelectorAll('#player .pjs-player-active-pl')].map(node => node.textContent || '');
-    const valid = video && video.isConnected && detail && typeof detail === 'object'
+    const valid = !dreamCastNavigatedAway && video && video.isConnected && detail && typeof detail === 'object'
       && !Array.isArray(detail) && Object.keys(detail).length === 1 && Number.isInteger(detail?.episode)
       && detail.episode > 0 && detail.episode <= 5000
       && recognitionApi.uniqueSelectedEpisode(labels) === detail.episode
       && video.readyState >= 2 && video.src && video.src === video.currentSrc;
-    dreamCastProof = valid ? {video, episode:detail.episode, src:video.currentSrc, url:location.href} : null;
+    dreamCastProof = valid ? {video, episode:detail.episode, src:video.currentSrc, url:supportsNavigation ? initialDreamCastUrl : location.href} : null;
     if (oldVideo && oldVideo !== video) reportPlayerState(oldVideo, 'episode-change');
     if (video) reportPlayerState(video, 'episode-change');
   }, true);
@@ -679,8 +685,9 @@
   // SPA navigation: content scripts don't reload on pushState, so re-evaluate
   // recognition whenever the top URL changed since the last report.
   function handleUrlChangeIfAny() {
+    if (supportsNavigation && location.href.split('#', 1)[0] !== initialDreamCastUrl) dreamCastNavigatedAway = true;
     if (location.href === observedUrl) return;
-    dreamCastProof = null;
+    if (!supportsNavigation || dreamCastNavigatedAway) dreamCastProof = null;
     lastEpisode = null;
     eventEpisode = null;
     lastVoice = '';
