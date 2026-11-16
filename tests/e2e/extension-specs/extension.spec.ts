@@ -824,8 +824,8 @@ test('renders browser-local activity as a calm calendar with honest missing days
       [key]: { watchedSeconds: 3600, episodeKeys: ['first::1', 'second::2'], detailsPartial: true,
         details: [
           { animeId: 101, titleKey: null, title: 'Первое аниме', episode: 1, voice: 'Озвучка А', watchedSeconds: 300, position: 120, duration: 1200, observedAt: Date.now() },
-          { animeId: 101, titleKey: null, title: 'Первое аниме', episode: 3, voice: 'Озвучка В', watchedSeconds: 40, position: 80, duration: 1200, observedAt: Date.now() },
-          { animeId: null, titleKey: 'second', title: 'Второе аниме', episode: 2, voice: 'Озвучка Б', watchedSeconds: 0, position: 20, duration: 900, observedAt: Date.now() },
+          { animeId: 101, titleKey: null, title: 'Первое аниме', episode: 3, voice: 'Озвучка В', watchedSeconds: 60, position: 80, duration: 1200, observedAt: Date.now() },
+          { animeId: null, titleKey: 'second', title: 'Второе аниме', episode: 2, voice: 'Озвучка Б', watchedSeconds: 59, position: 20, duration: 900, observedAt: Date.now() },
         ] },
       ...boundaryDays,
       '2025-01-01': { watchedSeconds: 100000, episodeKeys: [] },
@@ -858,9 +858,8 @@ test('renders browser-local activity as a calm calendar with honest missing days
   await expect(popup.locator('.activity-entry').nth(0).locator('.activity-observation')).toHaveCount(2);
   await expect(popup.locator('.activity-entry').nth(0).locator('p').first()).toContainText('Серия 1 · Озвучка А');
   await expect(popup.locator('.activity-entry').nth(0).locator('.activity-observation').nth(1)).toContainText('Серия 3 · Озвучка В');
-  await expect(popup.locator('.activity-entry').nth(1).locator('strong')).toHaveText('Второе аниме');
-  await expect(popup.locator('.activity-entry').nth(1).locator('p').first()).toContainText('Серия 2 · Озвучка Б');
-  await expect(popup.locator('#activity-entries')).toContainText('Зафиксировано без времени просмотра');
+  await expect(popup.locator('.activity-entry')).toHaveCount(1);
+  await expect(popup.locator('#activity-entries')).not.toContainText('Второе аниме');
   await expect(popup.locator('#activity-entries')).toContainText('Последняя позиция: 2:00 из 20:00');
   await expect(popup.locator('#activity-entries')).not.toContainText('Mutable decoy');
   await expect(popup.locator('#activity-entries')).not.toContainText('Wrong voice');

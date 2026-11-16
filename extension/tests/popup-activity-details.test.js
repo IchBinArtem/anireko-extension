@@ -31,8 +31,8 @@ test('production activity renderer selects days and preserves selection on refre
   const days = [{ date: yesterday, seconds: 60, level: 1 }, { date: today, seconds: 0, level: 0, today: true }];
   const history = { days: { [key(yesterday)]: { watchedSeconds: 60, episodeKeys: ['x'], detailsPartial: true,
     details: [{ animeId: 101, title: '<unsafe>', episode: 1, voice: 'Voice A', watchedSeconds: 60, position: 12, duration: 1200 },
-      { animeId: 101, title: '<unsafe>', episode: 2, voice: 'Voice B', watchedSeconds: 15, position: 55, duration: 900 },
-      { animeId: 202, title: '<unsafe>', episode: 3, voice: 'Other ID', watchedSeconds: 0, position: 0, duration: 900 },
+      { animeId: 101, title: '<unsafe>', episode: 2, voice: 'Voice B', watchedSeconds: 61, position: 55, duration: 900 },
+      { animeId: 202, title: '<unsafe>', episode: 3, voice: 'Other ID', watchedSeconds: 60, position: 0, duration: 900 },
       { animeId: null, titleKey: '<unsafe>', title: '<unsafe>', episode: 4, voice: 'Unbound', watchedSeconds: 1, position: 1, duration: 900 },
       { title: 'Second', episode: null, voice: 'Voice B', watchedSeconds: 0, position: 0, duration: 900 },
       { title: 'Short one', episode: 1, watchedSeconds: 1, position: 1, duration: 900 },
@@ -57,11 +57,8 @@ test('production activity renderer selects days and preserves selection on refre
   assert.ok(get('activity-entries').children[1].children[2].children[0].textContent.includes('Voice B'));
   assert.equal(get('activity-entries').children[1].children[2].children[1].textContent, 'activityPositionWithDuration:0:55,15:00');
   assert.equal(get('activity-entries').children[2].children[0].textContent, '<unsafe>', 'different ID remains separate');
-  assert.equal(get('activity-entries').children[3].children[0].textContent, '<unsafe>', 'unbound remains separate');
-  assert.ok(get('activity-entries').children[2].children[1].children[0].textContent.includes('activityObservedNoTime'));
-  assert.equal(get('activity-entries').children[4].children[1].children[1].textContent, 'activityPositionWithDuration:0:00,15:00');
-  assert.ok(get('activity-entries').children[5].children[1].children[0].textContent.includes('activityWatchedSeconds:1'));
-  assert.ok(get('activity-entries').children[6].children[1].children[0].textContent.includes('activityWatchedSeconds:59'));
+  assert.equal(get('activity-entries').children.length, 3, 'zero and sub-minute observations are hidden');
+  assert.equal(get('activity-entries').children[2].children[1].children[1].textContent, 'activityPositionWithDuration:0:00,15:00');
   context.render(history);
   assert.equal(chart.children[0].attrs['aria-pressed'], 'true');
   assert.equal(chart.children[0].tabIndex, 0);

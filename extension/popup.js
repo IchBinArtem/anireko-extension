@@ -367,7 +367,8 @@
         }
         const groups = new Map();
         for (const detail of storedDay.details) {
-          if (!detail || typeof detail.title !== 'string') continue;
+          if (!detail || typeof detail.title !== 'string'
+            || !Number.isFinite(detail.watchedSeconds) || detail.watchedSeconds < 60) continue;
           const groupKey = Number.isSafeInteger(detail.animeId) && detail.animeId > 0
             ? `anime:${detail.animeId}` : detail.animeId === null && typeof detail.titleKey === 'string' && detail.titleKey
               ? `title:${detail.titleKey}` : detail;
@@ -388,10 +389,7 @@
           const parts = [detail.episode == null ? t('activityFull') : t('episodeLabel', String(detail.episode))];
           if (detail.title !== group.title) parts.unshift(detail.title);
           if (detail.voice) parts.push(detail.voice);
-          if (Number.isFinite(detail.watchedSeconds) && detail.watchedSeconds >= 0) parts.push(detail.watchedSeconds === 0
-            ? t('activityObservedNoTime') : detail.watchedSeconds < 60
-              ? t('activityWatchedSeconds', String(detail.watchedSeconds))
-              : t('activityWatched', String(Math.floor(detail.watchedSeconds / 60))));
+          parts.push(t('activityWatched', String(Math.floor(detail.watchedSeconds / 60))));
           metadata.textContent = parts.join(' · ');
           row.append(metadata);
           if (Number.isFinite(detail.position) && detail.position >= 0) {
