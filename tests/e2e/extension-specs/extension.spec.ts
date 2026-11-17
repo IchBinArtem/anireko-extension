@@ -1218,11 +1218,31 @@ test('recognizes anime before playback and confirms player after playback starts
     expect(geometry).toEqual({ cardTop: 16, brandInside: true, aboveTitle: true, overlapsStatus: false });
   }
   await expect(popup.locator('#hint')).toBeHidden();
+  await expect(popup.locator('#account-label')).toHaveText('Авторизация — через сайт AniReko');
+  await expect(popup.locator('#account-login')).toBeVisible();
   await popup.setViewportSize({ width: 360, height: 850 });
-  expect(await popup.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+  const overflow = await popup.evaluate(() => {
+    const root = document.documentElement;
+    const width = root.clientWidth;
+    const offenders = [...document.querySelectorAll('body *')].map(element => {
+      const rect = element.getBoundingClientRect();
+      return { tag: element.tagName, id: element.id, left: rect.left, right: rect.right, scrollWidth: element.scrollWidth, clientWidth: element.clientWidth };
+    }).filter(element => element.left < 0 || element.right > width + 0.5).slice(0, 20);
+    return { width, scrollWidth: root.scrollWidth, innerWidth, offenders };
+  });
+  if (overflow.scrollWidth > overflow.width) console.log('popup-overflow:', JSON.stringify(overflow));
+  expect(overflow.scrollWidth <= overflow.width).toBe(true);
   // Classic desktop scrollbars can leave only 345 CSS pixels in a 360px viewport.
   await popup.setViewportSize({ width: 345, height: 850 });
   expect(await popup.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+  await popup.evaluate(() => { const sheet = document.styleSheets[0]; sheet.insertRule('#account, #account button { font-family: Arial, sans-serif !important; }', sheet.cssRules.length); });
+  try {
+    expect(await popup.locator('#account').evaluate(e => getComputedStyle(e).fontFamily)).toContain('Arial');
+    expect(await popup.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+    await popup.screenshot({ path: testInfo.outputPath('account-narrow-ru.png'), fullPage: true });
+  } finally {
+    await popup.evaluate(() => { const sheet = document.styleSheets[0]; sheet.deleteRule(sheet.cssRules.length - 1); });
+  }
   await popup.setViewportSize({ width: 360, height: 850 });
   const waitingScreenshot = testInfo.outputPath('compact-player-waiting-ru.png');
   await popup.screenshot({ path: waitingScreenshot, fullPage: true });
