@@ -1227,6 +1227,10 @@ test('recognizes anime before playback and confirms player after playback starts
   await expect(popup.locator('#hint')).toBeHidden();
   await popup.setViewportSize({ width: 360, height: 850 });
   expect(await popup.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+  // Classic desktop scrollbars can leave only 345 CSS pixels in a 360px viewport.
+  await popup.setViewportSize({ width: 345, height: 850 });
+  expect(await popup.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+  await popup.setViewportSize({ width: 360, height: 850 });
   const waitingScreenshot = testInfo.outputPath('compact-player-waiting-ru.png');
   await popup.screenshot({ path: waitingScreenshot, fullPage: true });
   await testInfo.attach('compact-player-waiting-ru', { path: waitingScreenshot, contentType: 'image/png' });
