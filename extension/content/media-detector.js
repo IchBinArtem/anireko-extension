@@ -13,14 +13,28 @@
   let lastEpisode = null;
   let eventEpisode = null;
   let lastVoice = '';
-  let metadataUrl = '';
+  let metadataSignature = '';
   let observedUrl = '';
   let lastShadowScanAt = 0;
+  let playerInteractionReported = false;
+  let dreamCastProof = null;
+  const supportsNavigation = Boolean(window.navigation?.addEventListener);
+  const initialDreamCastUrl = location.href.split('#', 1)[0];
+  const initialDreamCastDocument = window === window.top
+    && recognitionApi.dreamCastRelease(location.hostname, location.pathname);
+  let dreamCastNavigatedAway = false;
+  let dreamCastSequence = 0;
+  let dreamCastMediaGeneration = 0;
+  let dreamCastLastValidVideo = null;
   let extensionContextAlive = true;
   const documentToken = globalThis.__anirekoDocumentToken ||= globalThis.crypto?.randomUUID?.()
     || `${Date.now()}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
 
-  chrome.runtime.onMessage.addListener((message) => {
+  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message?.type === 'anireko-detector-status') {
+      if (extensionContextAlive) sendResponse({ ok: true, documentUrl: location.href, documentToken });
+      return;
+    }
     if (message?.type !== 'anireko-disable-detector') return;
     extensionContextAlive = false;
     mediaObserver?.disconnect();
@@ -124,6 +138,30 @@
     return false;
   }
 
+  function isPlayerInteractionTarget(target) {
+    const element = target instanceof Element ? target : target?.parentElement;
+    if (!element) return false;
+    if (element.closest(
+      'video, iframe, [id*="player" i], [class*="player" i]'
+    )) return true;
+    // Inside a cross-origin player frame, the clickable control may have a
+    // provider-specific name while its document still exposes a player shell.
+    return window !== window.top && hasPlayerElement();
+  }
+
+  function reportPlayerInteraction(event) {
+    if (playerInteractionReported || event.isTrusted !== true) return;
+    if (event.type === 'keydown' && !['Enter', ' ', 'Spacebar'].includes(event.key)) return;
+    if (!isPlayerInteractionTarget(event.target)) return;
+    playerInteractionReported = true;
+    safeSendMessage({
+      type: 'player-interaction',
+      interactionKind: event.type === 'keydown' ? 'keyboard' : 'pointer',
+      frameUrl: location.href,
+      observedAt: Date.now()
+    }).catch(() => {});
+  }
+
   // Diagnostic DOM probe (KAN-2714): a compact structural summary of the top
   // page so the "anime recognized but player unreadable" popup state can
   // export a useful report. Stays local — the user shares it manually.
@@ -188,6 +226,15 @@
     // initial value forever, but emit a composed episodeChange event whenever
     // the user switches the episode. Once observed, that live signal is more
     // authoritative than stale DOM attributes.
+    if (isDreamCastRelease() || (initialDreamCastDocument && dreamCastNavigatedAway)) {
+      const videos = [...document.querySelectorAll('#player video')];
+      const labels = [...document.querySelectorAll('#player .pjs-player-active-pl')].map(node => node.textContent || '');
+      const video = videos.length === 1 ? videos[0] : null;
+      return !dreamCastNavigatedAway && dreamCastProof && dreamCastProof.url === (supportsNavigation ? location.href.split('#', 1)[0] : location.href) && dreamCastProof.video === video
+        && video?.isConnected && video.src === dreamCastProof.src && video.currentSrc === dreamCastProof.src
+        && recognitionApi.uniqueSelectedEpisode(labels) === dreamCastProof.episode
+        ? dreamCastProof.episode : null;
+    }
     if (eventEpisode !== null) return eventEpisode;
     const attrEpisode = episodeFromPlayerAttributes();
     if (attrEpisode !== null) return attrEpisode;
@@ -287,17 +334,39 @@
     handleUrlChangeIfAny();
     const now = Date.now();
     const runtime = videoRuntime.get(video) || { lastReportAt: 0, watchedEpisode: null };
-    const watched = progressApi.isWatched(video.currentTime, video.duration);
+    const dreamCast = isDreamCastRelease() || (initialDreamCastDocument && dreamCastNavigatedAway);
+    if (dreamCast && !video.closest('#player') && !videoIds.has(video)) return;
+    const rawWatched = progressApi.isWatched(video.currentTime, video.duration);
+    if (!dreamCast && reason === 'timeupdate' && !rawWatched && now - runtime.lastReportAt < 5000) return;
+    const episode = readEpisode(true);
+    if (dreamCast) {
+      const videos = [...document.querySelectorAll('#player video')];
+      const current = videos.length === 1 && videos[0].isConnected ? videos[0] : null;
+      // A previous player may invalidate its last receipt once if proof is
+      // lost, but must not supersede an already valid replacement.
+      if (video !== current && (video !== dreamCastLastValidVideo || episode !== null)) return;
+    }
+    if (dreamCast && (runtime.dreamCastSrc !== video.src || runtime.dreamCastCurrentSrc !== video.currentSrc)) {
+      runtime.dreamCastSrc = video.src;
+      runtime.dreamCastCurrentSrc = video.currentSrc;
+      runtime.dreamCastMediaGeneration = ++dreamCastMediaGeneration;
+    }
+    const unavailable = dreamCast && (episode === null || video !== dreamCastProof?.video);
+    const reportedEpisode = unavailable ? null : episode;
+    const watched = !unavailable && rawWatched;
     // Cheap pre-throttle BEFORE the episode scan: readEpisode() walks the DOM
     // (incl. shadow roots) and must not run on every discarded tick.
-    if (reason === 'timeupdate' && !watched && now - runtime.lastReportAt < 5000) return;
-    const episode = readEpisode(true);
-    const episodeKey = episode === null ? 'unknown' : String(episode);
+    if (reason === 'timeupdate' && !watched && now - runtime.lastReportAt < 5000
+      && !(unavailable && runtime.dreamCastUnavailable !== true)) return;
+    const episodeKey = reportedEpisode === null ? 'unknown' : String(reportedEpisode);
     // The 80% transition is reported immediately; everything else (including
     // post-80% progress) keeps flowing under the regular 5s throttle.
     const watchedTransition = watched && runtime.watchedEpisode !== episodeKey;
-    if (reason === 'timeupdate' && !watchedTransition && now - runtime.lastReportAt < 5000) return;
+    if (reason === 'timeupdate' && !watchedTransition && now - runtime.lastReportAt < 5000
+      && !(unavailable && runtime.dreamCastUnavailable !== true)) return;
     runtime.lastReportAt = now;
+    runtime.dreamCastUnavailable = unavailable;
+    if (dreamCast) dreamCastLastValidVideo = unavailable ? null : video;
     if (watched) runtime.watchedEpisode = episodeKey;
     videoRuntime.set(video, runtime);
     safeSendMessage({
@@ -305,21 +374,25 @@
       playerInstanceId: videoId(video),
       player: playerKind(),
       frameUrl: location.href,
-      episode,
-      currentTime: Number.isFinite(video.currentTime) ? video.currentTime : null,
-      duration: Number.isFinite(video.duration) ? video.duration : null,
-      progress: progressApi.calculateProgress(video.currentTime, video.duration),
+      episode: reportedEpisode,
+      playerSequence: dreamCast ? ++dreamCastSequence : undefined,
+      mediaGeneration: dreamCast ? runtime.dreamCastMediaGeneration : undefined,
+      episodeAuthoritative: dreamCast ? true : undefined,
+      currentTime: !unavailable && Number.isFinite(video.currentTime) ? video.currentTime : null,
+      duration: !unavailable && Number.isFinite(video.duration) ? video.duration : null,
+      progress: unavailable ? null : progressApi.calculateProgress(video.currentTime, video.duration),
       watched,
-      playbackStarted: video.currentTime > 0 || !video.paused,
-      playing: !video.paused && !video.ended,
-      paused: video.paused,
-      ended: video.ended,
+      playbackStarted: !unavailable && (video.currentTime > 0 || !video.paused),
+      playing: !unavailable && !video.paused && !video.ended,
+      paused: unavailable || video.paused,
+      ended: !unavailable && video.ended,
+      seeking: video.seeking,
       muted: video.muted,
       volume: video.volume,
       playbackRate: Number.isFinite(video.playbackRate) ? video.playbackRate : 1,
       readyState: video.readyState,
       locallyVisible: isLocallyVisible(video),
-      seek,
+      seek: unavailable ? null : seek,
       reason,
       observedAt: now
     }).catch(() => {});
@@ -392,6 +465,11 @@
     authoritative = false,
     sourceKind = window === window.top ? 'top-dom' : 'player-dom'
   ) {
+    if (isDreamCastRelease() || (initialDreamCastDocument && dreamCastNavigatedAway)) {
+      const video = document.querySelector('#player video');
+      if (video) reportPlayerState(video, 'episode-change');
+      return;
+    }
     const episode = readEpisode();
     if (episode === null || (episode === lastEpisode && !authoritative)) return;
     lastEpisode = episode;
@@ -488,6 +566,29 @@
     }).catch(() => {});
   }
 
+  function isDreamCastRelease() {
+    return window === window.top && recognitionApi.dreamCastRelease(location.hostname, location.pathname);
+  }
+
+  document.addEventListener('anireko-dreamcast-prototype', event => {
+    if (!isDreamCastRelease()) return;
+    if (supportsNavigation && location.href.split('#', 1)[0] !== initialDreamCastUrl) dreamCastNavigatedAway = true;
+    const oldVideo = dreamCastProof?.video;
+    const videos = [...document.querySelectorAll('#player video')];
+    const video = videos.length === 1 ? videos[0] : null;
+    let detail = null;
+    try { if (typeof event.detail === 'string' && event.detail.length <= 80) detail = JSON.parse(event.detail); } catch {}
+    const labels = [...document.querySelectorAll('#player .pjs-player-active-pl')].map(node => node.textContent || '');
+    const valid = !dreamCastNavigatedAway && video && video.isConnected && detail && typeof detail === 'object'
+      && !Array.isArray(detail) && Object.keys(detail).length === 1 && Number.isInteger(detail?.episode)
+      && detail.episode > 0 && detail.episode <= 5000
+      && recognitionApi.uniqueSelectedEpisode(labels) === detail.episode
+      && video.readyState >= 2 && video.src && video.src === video.currentSrc;
+    dreamCastProof = valid ? {video, episode:detail.episode, src:video.currentSrc, url:supportsNavigation ? initialDreamCastUrl : location.href} : null;
+    if (oldVideo && oldVideo !== video) reportPlayerState(oldVideo, 'episode-change');
+    if (video) reportPlayerState(video, 'episode-change');
+  }, true);
+
   function likelyAnimePage(title) {
     // location.href в haystack: SPA-сайты (anilibria) не пишут «аниме» в
     // метаданные, но путь содержит /anime/ — лукараунды матчат по границе '/'.
@@ -502,11 +603,11 @@
     ].join(' ');
     const hasAnimeSignal = /(?<![a-zа-яё])(?:аниме|anime)(?![a-zа-яё])/iu.test(haystack)
       || recognitionApi.hasEpisodeMarker(haystack);
-    return hasAnimeSignal && hasPlayerElement();
+    return (hasAnimeSignal || isDreamCastRelease()) && hasPlayerElement();
   }
 
   function reportTopMetadata() {
-    if (window !== window.top || metadataUrl === location.href) return;
+    if (window !== window.top) return;
     const primaryHeadings = [...document.querySelectorAll('main h1, article h1')]
       .map((element) => element.textContent || '');
     const ogTitle = document.querySelector('meta[property="og:title"]')?.content || '';
@@ -516,12 +617,16 @@
       documentTitle: document.title
     });
     if (!title || !likelyAnimePage(title)) return;
-    metadataUrl = location.href;
+    const alternativeTitles = recognitionApi.currentTitleAlternatives(document, title);
+    const signature = JSON.stringify([location.href, title, alternativeTitles]);
+    if (metadataSignature === signature) return;
+    metadataSignature = signature;
     safeSendMessage({
       type: 'recognition',
       site: location.hostname,
       url: location.href,
       title,
+      alternativeTitles,
       episode: readEpisode(),
       confidence: 'candidate',
       voice: readVoiceLabel() || null,
@@ -589,10 +694,13 @@
   // SPA navigation: content scripts don't reload on pushState, so re-evaluate
   // recognition whenever the top URL changed since the last report.
   function handleUrlChangeIfAny() {
+    if (supportsNavigation && location.href.split('#', 1)[0] !== initialDreamCastUrl) dreamCastNavigatedAway = true;
     if (location.href === observedUrl) return;
+    if (!supportsNavigation || dreamCastNavigatedAway) dreamCastProof = null;
     lastEpisode = null;
     eventEpisode = null;
     lastVoice = '';
+    playerInteractionReported = false;
     observedUrl = location.href;
     if (window === window.top) {
       reportPageObserved();
@@ -616,6 +724,8 @@
       let visibilityChanged = false;
       for (const record of records) {
         if (record.type === 'attributes') {
+          if (isDreamCastRelease() && record.target?.closest?.('#player')
+            && ['class','src'].includes(record.attributeName)) episodeUiAdded = true;
           if (['episode', 'data-episode'].includes(record.attributeName)) {
             invalidateEpisodeAttrCache();
             episodeUiAdded = true;
@@ -643,6 +753,9 @@
       if (episodeUiAdded) invalidateEpisodeAttrCache();
       if (episodeUiAdded) reportEpisodeIfChanged();
       if (episodeUiAdded) reportVoiceIfChanged();
+      // Metadata can hydrate or disappear independently of player mutations.
+      // The signature suppresses unchanged rescans and repeated network work.
+      if (isTop) reportTopMetadata();
       if (mediaAdded || episodeUiAdded || visibilityChanged) {
         if (isTop) reportTopMetadata();
         reportFrameVisibility();
@@ -651,10 +764,22 @@
     mediaObserver.observe(document.documentElement, {
       childList: true,
       subtree: true,
+      characterData: true,
       attributes: true,
       attributeFilter: ['episode', 'data-episode', 'class', 'style', 'hidden', 'src']
     });
   }
+
+  document.addEventListener('pointerdown', reportPlayerInteraction, {
+    capture: true,
+    passive: true,
+  });
+  document.addEventListener('keydown', reportPlayerInteraction, true);
+
+  window.navigation?.addEventListener('currententrychange', event => {
+    if (!event.isTrusted || location.hostname !== 'dreamerscast.com') return;
+    if (location.href !== observedUrl) handleUrlChangeIfAny();
+  });
 
   function start() {
     const isTop = window === window.top;

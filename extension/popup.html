@@ -10,10 +10,7 @@
     <main>
       <header class="brand">
         <img class="brand-mark" src="brand-mark.svg" alt="" aria-hidden="true">
-        <div>
-          <h1>AniReko</h1>
-          <span data-i18n="brandTagline"></span>
-        </div>
+        <h1>AniReko</h1>
       </header>
       <section class="privacy-disclosure" id="privacy-disclosure" hidden>
         <strong data-i18n="privacyDisclosureTitle"></strong>
@@ -38,7 +35,7 @@
             <span id="anime-check-detail" data-i18n="checkingPageMetadata"></span>
             <div class="recognized-only">
               <h2 id="title">—</h2>
-              <p class="anime-meta"><span id="episode">—</span><span aria-hidden="true">·</span><span id="voice">—</span></p>
+              <p class="anime-meta"><span id="episode">—</span><span aria-hidden="true">·</span><span id="voice">—</span><span id="anime-year-separator" aria-hidden="true" hidden>·</span><span id="anime-year" hidden></span></p>
               <p class="taste-match" id="taste-match">—</p>
               <a class="primary-action" id="anime-primary-action" hidden target="_blank" rel="noopener"><span data-i18n="openInAniReko"></span> <span aria-hidden="true">→</span></a>
               <p class="catalog-note" id="anireko-match">—</p>
@@ -57,6 +54,10 @@
             </div>
           </div>
         </div>
+        <section class="resume-card" id="anime-fields">
+          <span id="resume-label" hidden data-i18n="resumeLabel"></span>
+          <strong id="resume" hidden>—</strong>
+        </section>
         <div class="check-card pending" id="player-check">
           <span class="check-icon" aria-hidden="true">·</span>
           <div class="check-copy">
@@ -70,9 +71,19 @@
           </div>
         </div>
       </section>
+      <section class="not-found-report" id="page-recovery" hidden>
+        <button id="reload-page" type="button" data-i18n="reloadPage"></button>
+        <p id="page-recovery-detail" data-i18n="detectorRecoveryDetail"></p>
+      </section>
       <section class="not-found-report" id="not-found-report" hidden>
         <button id="report-anime-miss" type="button" data-i18n="reportAnimeMiss"></button>
         <p id="report-anime-miss-detail" data-i18n="reportAnimeMissDetail"></p>
+      </section>
+      <section class="resume-card" id="watch-cycle-card" hidden>
+        <strong id="watch-completion"></strong>
+        <p id="watch-current"></p>
+        <p id="watch-feedback" aria-live="polite"></p>
+        <div id="watch-actions"></div>
       </section>
       <section class="stats-card" id="stats-card" data-i18n-aria-label="localStatsAria">
         <div class="stats-head">
@@ -82,28 +93,34 @@
           <strong id="today-episodes" data-i18n="zeroEpisodes"></strong>
           <span class="local-pill" data-i18n="locally"></span>
         </div>
-        <div class="week-chart" id="week-chart" data-i18n-aria-label="lastSevenDaysAria"></div>
-      </section>
-      <section class="resume-card" id="anime-fields">
-        <span id="resume-label" hidden data-i18n="resumeLabel"></span>
-        <strong id="resume" hidden>—</strong>
+        <p class="activity-heading" id="activity-heading" data-i18n="activityHeading"></p>
+        <div class="activity-map" id="week-chart" data-i18n-aria-label="activityCalendarAria"></div>
+        <p class="activity-detail" id="activity-detail" aria-live="polite" data-i18n="activityHint"></p>
+        <div class="activity-entries" id="activity-entries"></div>
+        <p class="activity-legend" id="activity-legend" data-i18n="activityLegend"></p>
       </section>
       <p class="hint" id="hint" data-i18n="localHistoryHint"></p>
       <div class="account" id="account">
         <span id="account-label" data-i18n="checkingAccount"></span>
         <a id="account-login" hidden target="_blank" rel="noopener" data-i18n="loginOnSite"></a>
-        <button id="resume-sync" type="button" data-i18n="syncButton" data-i18n-title="syncButtonTitle"></button>
+        <button id="resume-sync" type="button" disabled data-i18n="syncButton" data-i18n-title="syncButtonTitle"></button>
       </div>
       <p class="account-warning" id="account-warning" hidden></p>
       <label class="automark" id="automark">
         <input type="checkbox" id="auto-mark" disabled>
         <span data-i18n="syncDescription"></span>
       </label>
+      <label class="automark" id="diagnostics-option" hidden>
+        <input type="checkbox" id="diagnostics-setting" disabled>
+        <span data-i18n="diagnosticsConsent"></span>
+      </label>
+      <p class="preference-error" id="diagnostics-setting-error" role="status" aria-live="polite" hidden></p>
       <div class="privacy-controls">
         <a id="privacy-link" target="_blank" rel="noopener" data-i18n="privacyShort"></a>
         <button id="delete-local-data" type="button" disabled data-i18n="deleteLocalData"></button>
       </div>
     </main>
+    <script src="lib/activity.js"></script>
     <script src="popup.js"></script>
   </body>
 </html>

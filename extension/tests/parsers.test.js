@@ -14,6 +14,31 @@ function load(relativePath, exportedName) {
 const recognition = load('lib/recognition.js', 'AniRekoRecognition');
 const progress = load('lib/progress.js', 'AniRekoProgress');
 
+test('long bilingual titles retain a bounded primary name', () => {
+  const primary='Русское название '.repeat(8).trim(), secondary='English title '.repeat(8).trim();
+  assert.ok((primary+' / '+secondary).length>180);
+  assert.equal(recognition.chooseTitle([`${primary} / ${secondary}`]),primary);
+  assert.equal(recognition.chooseTitle(['K / K Project']),'K / K Project');
+  assert.equal(recognition.chooseTitle(['x'.repeat(181)]),'');
+});
+
+test('Dream Cast release and selected episode are narrow and unambiguous', () => {
+  assert.equal(recognition.dreamCastRelease('dreamerscast.com','/home/release/621-test'),true);
+  assert.equal(recognition.dreamCastRelease('notdreamerscast.com','/home/release/621-test'),false);
+  assert.equal(recognition.dreamCastRelease('dreamerscast.com','/'),false);
+  assert.equal(recognition.uniqueSelectedEpisode(['Серия 2','Серия 2']),2);
+  assert.equal(recognition.uniqueSelectedEpisode(['Серия 1','Серия 2']),null);
+  assert.equal(recognition.uniqueSelectedEpisode(['Серия 1-2']),null);
+  assert.equal(recognition.uniqueSelectedEpisode([]),null);
+});
+
+test('alternatives are bounded, Unicode preserving, deduplicated and contain no URL or markup', () => {
+  assert.deepEqual(Array.from(recognition.normalizeAlternativeTitles([
+    ' Primary ', 'Hantsu x Trash', 'HANTSU X TRASH', '…', '<b>Other</b>',
+    'https://example.test', 'ハンツー×トラッシュ', 'Third', 'Fourth', 'Fifth',
+  ], 'Primary')), ['Hantsu x Trash', 'ハンツー×トラッシュ', 'Third', 'Fourth']);
+});
+
 test('parses episode numbers from common label shapes', () => {
   assert.equal(recognition.parseEpisode(['Эпизод №7']), 7);
   assert.equal(recognition.parseEpisode(['2 серия']), 2);

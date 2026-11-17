@@ -30,6 +30,21 @@
     return null;
   }
 
+  function dreamCastRelease(hostname, pathname) {
+    return String(hostname).toLowerCase() === 'dreamerscast.com'
+      && /^\/home\/release\/\d+-[^/]+\/?$/u.test(pathname);
+  }
+
+  function uniqueSelectedEpisode(labels) {
+    const values = labels.map((label) => {
+      const match = /^\s*Серия\s+(\d{1,4})\s*$/iu.exec(label);
+      return match ? Number(match[1]) : null;
+    });
+    if (!values.length || values.some((value) => value === null || value < 1 || value > 5000)) return null;
+    const unique = [...new Set(values)];
+    return unique.length === 1 ? unique[0] : null;
+  }
+
   function episodeFromEventDetail(detail) {
     const candidates = detail && typeof detail === 'object'
       ? [detail.episodeNumber, detail.episode_number, detail.episode, detail.number]
@@ -130,15 +145,9 @@
   function chooseTitle(candidates) {
     for (const candidate of candidates) {
       const title = normalizeTitle(candidate);
-      if (title.length >= 2 && title.length <= 180) {
-        // Dual-title aggregators: «Игра лжецов / Liar Game» — the RU part
-        // matches our catalog search best.
-        const segments = title.split(' / ');
-        if (segments.length > 1 && segments[0].trim().length >= 2) {
-          return segments[0].trim();
-        }
-        return title;
-      }
+      const selected = title.split(' / ')[0].trim();
+      if (selected.length >= 2 && selected.length <= 180) return selected;
+      if (selected.length < 2 && title.length >= 2 && title.length <= 180) return title;
     }
     return '';
   }
@@ -171,16 +180,56 @@
     ]);
   }
 
+  function normalizeAlternativeTitles(values, title = '') {
+    if (!Array.isArray(values)) return [];
+    const key = (value) => value.normalize('NFKC').toLocaleLowerCase('ru').replace(/ё/gu, 'е');
+    const seen = new Set([key(cleanText(title))]);
+    const result = [];
+    for (const value of values.slice(0, 20)) {
+      if (typeof value !== 'string') continue;
+      const text = cleanText(value);
+      if (text.length < 2 || text.length > 180 || !/[\p{L}\p{N}]/u.test(text)
+        || /(?:https?:|www\.|[<>])/iu.test(text) || seen.has(key(text))) continue;
+      seen.add(key(text));
+      result.push(text);
+      if (result.length === 4) break;
+    }
+    return result;
+  }
+
+  // Only the unique current H1 and its immediately adjacent title list.
+  // No document-wide list/text harvesting, linked recommendations or nested text.
+  function currentTitleAlternatives(document, title) {
+    const ancillary = 'aside, nav, footer, [role="complementary"], .recommendations, .comments, #comments, [class*="recommend"], [class*="comment"]';
+    const primaryHeadings = [...document.querySelectorAll('main h1, article h1')]
+      .filter((heading) => !heading.closest(ancillary)
+        && normalizeTitle(heading.textContent) === normalizeTitle(title));
+    const headings = [...document.querySelectorAll('.titles > h1')]
+      .filter((heading) => !heading.closest(ancillary)
+        && normalizeTitle(heading.textContent) === normalizeTitle(title));
+    if (headings.length !== 1) return [];
+    if (primaryHeadings.length && (primaryHeadings.length !== 1 || primaryHeadings[0] !== headings[0])) return [];
+    const list = headings[0].nextElementSibling;
+    if (!list?.matches('ul.alt-names-list')) return [];
+    return normalizeAlternativeTitles([...list.children]
+      .filter((node) => node.tagName === 'LI' && node.children.length === 0)
+      .map((node) => node.textContent), title);
+  }
+
   global.AniRekoRecognition = {
     cleanText,
     hasEpisodeMarker,
     parseEpisode,
+    dreamCastRelease,
+    uniqueSelectedEpisode,
     episodeFromEventDetail,
     episodeFromPlayerMessage,
     episodeFromPlayerUrl,
     normalizeVoiceLabel,
     normalizeTitle,
     chooseTitle,
-    choosePageTitle
+    choosePageTitle,
+    normalizeAlternativeTitles,
+    currentTitleAlternatives
   };
 })(typeof globalThis !== 'undefined' ? globalThis : window);

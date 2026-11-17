@@ -10,7 +10,7 @@ function load(file, extras = {}) {
   return context;
 }
 
-test('store manifest uses Chrome native host controls with one static all-frame detector', () => {
+test('store manifest retains native host controls and limits the Dream Cast MAIN observer', () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'manifest.json'), 'utf8'));
   assert.deepEqual(manifest.permissions, ['storage']);
   assert.deepEqual(manifest.host_permissions, ['<all_urls>']);
@@ -21,6 +21,12 @@ test('store manifest uses Chrome native host controls with one static all-frame 
   assert.equal(manifest.optional_host_permissions, undefined);
   assert.equal(manifest.incognito, 'not_allowed');
   assert.deepEqual(manifest.content_scripts, [{
+    matches: ['*://dreamerscast.com/home/release/*'],
+    js: ['content/dreamcast-main.js'],
+    world: 'MAIN',
+    all_frames: false,
+    run_at: 'document_start',
+  }, {
     matches: ['<all_urls>'],
     js: ['lib/recognition.js', 'lib/progress.js', 'content/media-detector.js'],
     all_frames: true,
@@ -45,6 +51,10 @@ test('sensor messages require the real sender origin, top frame and fresh docume
   assert.equal(trust.validateSensorMessage({ ...message, documentUrl: 'https://evil.example' }, sender, 'extension-id').ok, false);
   assert.equal(trust.validateSensorMessage(message, { ...sender, frameId: 2 }, 'extension-id').reason, 'top_frame_required');
   assert.equal(trust.validateSensorMessage({ ...message, observedAt: now - 300_001 }, sender, 'extension-id').ok, false);
+  assert.equal(trust.validateSensorMessage({ ...message, alternativeTitles: ['ハンツー×トラッシュ'] }, sender, 'extension-id').ok, true);
+  for (const alternativeTitles of [{}, ['x'], ['x'.repeat(181)], Array(5).fill('Title'), [42]]) {
+    assert.equal(trust.validateSensorMessage({ ...message, alternativeTitles }, sender, 'extension-id').ok, false);
+  }
 });
 
 test('episode and voice signals reject malformed cross-frame payloads', () => {
@@ -70,6 +80,12 @@ test('episode and voice signals reject malformed cross-frame payloads', () => {
   }, sender, 'extension-id').reason, 'payload_invalid');
   assert.equal(trust.validateSensorMessage({
     ...envelope, type: 'voice-change', voice: 'x'.repeat(101),
+  }, sender, 'extension-id').reason, 'payload_invalid');
+  assert.equal(trust.validateSensorMessage({
+    ...envelope, type: 'player-interaction', interactionKind: 'pointer',
+  }, sender, 'extension-id').ok, true);
+  assert.equal(trust.validateSensorMessage({
+    ...envelope, type: 'player-interaction', interactionKind: 'synthetic',
   }, sender, 'extension-id').reason, 'payload_invalid');
 });
 
@@ -288,7 +304,8 @@ test('only the background allowlist owns network egress', () => {
   assert.equal(worker.includes("fetch.bind(globalThis)"), true);
   assert.equal(worker.includes("'api-base'"), false);
   assert.equal(/storage\.local\.(?:get|set|remove)\([^\n]*tab:/u.test(worker), false);
-  assert.equal(worker.includes('chrome.storage.session.set({ [storageKey]: current })'), true);
+  assert.equal(worker.includes('setSession(writeBinding, { [storageKey]: current })'), true);
+  assert.equal(/chrome\.storage\.local\.(?:set|remove|clear)\s*\(/u.test(popup), false);
   assert.equal(worker.includes('mediaSeconds: Math.round'), false);
   assert.equal(worker.includes('skips,'), false);
 });
@@ -309,18 +326,18 @@ test('runtime has no duplicate permission manager or provider-specific player or
 
 test('search cache invalidates pre-completion metadata and retries partial matches', () => {
   const worker = fs.readFileSync(path.join(__dirname, '..', 'service-worker.js'), 'utf8');
-  assert.equal(worker.includes('const SEARCH_CACHE_VERSION = 7;'), true);
+  assert.equal(worker.includes('const SEARCH_CACHE_VERSION = 8;'), true);
   assert.equal(worker.includes("['type', 'episodes', 'release_status']"), true);
   assert.equal(worker.includes('match.completionMetadataReady ? SEARCH_TTL_OK_MS : SEARCH_TTL_PARTIAL_MS'), true);
   assert.equal(worker.includes('current.match.completionMetadataReady !== true'), true);
-  assert.equal(worker.includes("{ forceRefresh: true }"), true);
+  assert.match(worker, /forceRefresh: true, alternativeTitles: event\.recognition\?\.alternativeTitles, writeBinding/u);
   assert.equal(worker.includes('completionMetadataRefreshedInSession.add(refreshKey)'), true);
 });
 
 test('public API contract and client action allowlist stay aligned', () => {
   const contract = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'api-contract.json'), 'utf8'));
   const client = fs.readFileSync(path.join(__dirname, '..', 'lib', 'api-client.js'), 'utf8');
-  assert.equal(contract.version, 3);
+  assert.equal(contract.version, 5);
   assert.deepEqual(contract.rate_limit, {
     status: 429,
     retry_after_header: 'Retry-After',
@@ -328,8 +345,11 @@ test('public API contract and client action allowlist stay aligned', () => {
   for (const action of Object.keys(contract.actions)) {
     assert.equal(client.includes(`case '${action}'`), true, `missing client action ${action}`);
   }
+  const clientActions = [...client.matchAll(/case '([^']+)'/g)].map((match) => match[1]);
+  assert.deepEqual([...new Set(clientActions)].sort(), Object.keys(contract.actions).sort());
   assert.deepEqual(Object.keys(contract.actions).sort(), [
-    'diagnostic', 'progress-all', 'progress-write', 'search', 'session-info',
+    'diagnostic', 'history-command', 'history-initialize', 'history-read', 'history-select', 'history-settle',
+    'progress-all', 'progress-write', 'search', 'session-info',
     'status-get', 'status-write', 'taste-match',
   ]);
 });
@@ -362,8 +382,23 @@ test('public export contains every source and fixture used by release verificati
     '.github/dependabot.yml',
     '.github/workflows/extension-release.yml',
     'extension/api-contract.json',
+    'extension/content/dreamcast-main.js',
+    'extension/tests/dreamcast-navigation.test.js',
     'extension/scripts/cws_publish.py',
     'extension/tests/search-resolve.test.js',
+    'extension/tests/popup-resume.test.js',
+    'extension/tests/watch-history-client.test.js',
+    'extension/tests/watch-command-journal.test.js',
+    'extension/lib/watch-command-journal.js',
+    'extension/lib/watch-request-hash.js',
+    'extension/tests/watch-request-hash.test.js',
+    'extension/tests/watch-request-hash-vectors.json',
+    'extension/lib/watch-write-barrier.js',
+    'extension/tests/watch-write-barrier.test.js',
+    'extension/lib/activity.js',
+    'extension/tests/activity.test.js',
+    'extension/tests/bulk-progress.test.js',
+    'extension/tests/bulk-response.test.js',
     'extension/tests/test_build_release.py',
     'extension/tests/test_cws_publish.py',
     'extension/tests/test_release_workflow.py',
@@ -376,7 +411,7 @@ test('public export contains every source and fixture used by release verificati
     assert.equal(fs.existsSync(path.join(repo, relative)), true, `public source misses ${relative}`);
   }
 
-  assert.equal(listed.size, 50, 'public export allowlist changed without an explicit review');
+  assert.equal(listed.size, 65, 'public export allowlist changed without an explicit review');
   const exactSupportFiles = new Set([
     '.github/dependabot.yml',
     '.github/workflows/extension-release.yml',
