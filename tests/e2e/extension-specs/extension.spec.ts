@@ -577,7 +577,7 @@ test('native movie Complete80 then close/reopen starts one repeat without popup 
   } finally { await popup?.close(); await page.close(); }
 });
 
-test('cycle settlement preserves lost-ACK intent across account transfer and popup reopen', async ({}, testInfo) => {
+test('cycle recovery silently settles a lost ACK across account transfer and popup reopen', async () => {
   await worker.evaluate(async () => {
     await chrome.storage.local.set({ 'auto-mark': true, 'sync-account': { id: 18, name: 'TestUser' } });
     const base = (globalThis as any).AniRekoRuntimeConfig.apiBase;
@@ -587,70 +587,73 @@ test('cycle settlement preserves lost-ACK intent across account transfer and pop
   const page = await context.newPage(); let popup: Page | null = null;
   const pending = () => worker.evaluate(async () =>
     (await chrome.storage.local.get('watch-command-pending-v1'))['watch-command-pending-v1']);
+  const recovery = () => worker.evaluate(async () =>
+    (await chrome.storage.local.get('watch-recovery-v1'))['watch-recovery-v1']);
   const receipts = () => worker.evaluate(async () => {
     const response = await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/cycle-history');
     return response.json();
   });
+  const setRecoveryTime = (timestamp: number | null) => worker.evaluate((timestamp) => {
+    const clock = globalThis as typeof globalThis & { originalRecoveryDateNow?: typeof Date.now };
+    if (timestamp === null) {
+      if (clock.originalRecoveryDateNow) Date.now = clock.originalRecoveryDateNow;
+      delete clock.originalRecoveryDateNow;
+    } else {
+      clock.originalRecoveryDateNow ??= Date.now;
+      Date.now = () => timestamp;
+    }
+  }, timestamp);
+  const expectSilentRecovery = async (popup: Page) => {
+    await expect(popup.locator('#watch-current')).toContainText('Пересматриваю');
+    await expect(popup.locator('#watch-feedback')).toBeEmpty();
+    await expect(popup.locator('#watch-actions')).toBeEmpty();
+  };
   try {
     await page.goto(`${siteBase}/anime.html`);
     const tabId = await extensionTabId(`${siteBase}/*`);
     await expect.poll(async () => (await storedTabState(tabId))?.match?.status).toBe('ok');
     popup = await openPopup(tabId);
     await startCycleFixture(popup, tabId);
-    await expect(popup.locator('#watch-feedback')).toHaveText('Сохранение не подтверждено.');
-    await expect(popup.locator('#watch-current')).not.toContainText('Запустите видео');
-    expect(await popup.locator('#watch-feedback').evaluate(node => ({
-      top: getComputedStyle(node).marginTop, bottom: getComputedStyle(node).marginBottom,
-    }))).toEqual({ top: '4px', bottom: '4px' });
+    await expectSilentRecovery(popup);
     const original = await pending();
     expect(original.version).toBe(1);
     expect(original.acknowledged).toBe(false);
     expect((await receipts()).posts).toHaveLength(1);
-    const pendingDetails = popup.locator('#watch-actions details');
-    await expect(pendingDetails).not.toHaveAttribute('open', '');
-    await expect(popup.getByRole('button', { name: 'Проверить результат', exact: true })).toBeHidden();
-    await expect(popup.getByRole('button', { name: 'Повторить исходную команду' })).toBeHidden();
-    await expect(pendingDetails.locator('.watch-choice-hint')).toBeHidden();
-    await popup.setViewportSize({ width: 390, height: 850 });
-    const pendingScreenshot = testInfo.outputPath('pending-collapsed-ru.png');
-    await popup.screenshot({ path: pendingScreenshot, fullPage: true });
-    await testInfo.attach('pending-collapsed-ru', { path: pendingScreenshot, contentType: 'image/png' });
-    await pendingDetails.locator('summary').click();
-    await expect(pendingDetails).toHaveAttribute('open', '');
-    await expect(pendingDetails.locator('.watch-choice-hint')).toBeVisible();
-    await expect(pendingDetails.locator('.watch-choice-hint')).toContainText('позднее выполнение будет запрещено');
-    await expect(popup.getByRole('button', { name: 'Проверить результат', exact: true })).toBeVisible();
-    await expect(popup.getByRole('button', { name: 'Повторить исходную команду' })).toBeVisible();
-    const expandedScreenshot = testInfo.outputPath('pending-expanded-ru.png');
-    await popup.screenshot({ path: expandedScreenshot, fullPage: true });
-    await testInfo.attach('pending-expanded-ru', { path: expandedScreenshot, contentType: 'image/png' });
-    expect((await receipts()).posts).toHaveLength(1, 'opening details does not retry');
-    expect((await receipts()).settlementPosts).toEqual([], 'opening details does not settle');
     await popup.close(); popup = null;
     await worker.evaluate(async () => {
       await chrome.storage.local.set({ 'sync-account': { id: 19, name: 'MergedOwner' } });
       await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/session?on=1&user=19');
     });
+    // Move past the worker's initial scan cooldown. Opening the popup schedules the saved intent.
+    await setRecoveryTime((await worker.evaluate(() => Date.now())) + 60_001);
     popup = await openPopup(tabId);
-    await expect(popup.locator('#watch-feedback')).toContainText('Неподтверждённое сохранение связано с другим аккаунтом');
-    const settle = () => popup!.getByRole('button', { name: 'Проверить результат', exact: true });
-    await popup.getByText('Подробнее', { exact: true }).click();
-    await expect(settle()).toBeVisible();
+    await expectSilentRecovery(popup);
+    await expect.poll(async () => (await recovery())?.commandId).toBe(original.request.command_id);
     expect(await pending()).toEqual(original);
     expect((await receipts()).settlementPosts).toEqual([]);
-    await settle().click();
-    await expect(settle()).toBeEnabled();
+
+    await popup.close(); popup = null;
+    await setRecoveryTime((await recovery()).nextAt);
+    expect((await receipts()).settlementPosts).toEqual([]);
+    popup = await openPopup(tabId);
     await expect.poll(async () => (await receipts()).settlementPosts.length).toBe(1);
+    await expectSilentRecovery(popup);
     expect(await pending()).toEqual(original);
+
     await popup.close(); popup = await openPopup(tabId);
-    await popup.getByText('Подробнее', { exact: true }).click();
-    await expect(settle()).toBeVisible();
+    await expectSilentRecovery(popup);
     expect((await receipts()).settlementPosts).toHaveLength(1);
     expect((await receipts()).posts).toHaveLength(1);
-    await settle().click();
+
+    await popup.close(); popup = null;
+    await setRecoveryTime((await recovery()).nextAt);
+    expect((await receipts()).settlementPosts).toHaveLength(1);
+    popup = await openPopup(tabId);
     await expect.poll(pending).toBeUndefined();
     await expect(popup.locator('#watch-current')).toContainText('Пересматриваю');
     await expect(popup.locator('#watch-completion')).toContainText('Уже просмотрено');
+    await expect(popup.locator('#watch-feedback')).toBeEmpty();
+    await expect(popup.getByText('Управление вручную', { exact: true })).toBeVisible();
     const observed = await receipts();
     expect(observed.posts).toHaveLength(1);
     expect(observed.settlementPosts).toHaveLength(2);
@@ -659,7 +662,11 @@ test('cycle settlement preserves lost-ACK intent across account transfer and pop
       expect(attempt.payload).toEqual({ ...observed.posts[0], operation: 'settle' });
       expect(attempt.payload.expected_user_id).toBe(18);
     }
-  } finally { await popup?.close(); await page.close(); }
+  } finally {
+    await setRecoveryTime(null);
+    await popup?.close();
+    await page.close();
+  }
 });
 
 test('Cancel survives actual MV3 worker stop while the same video keeps playing', async ({}, testInfo) => {

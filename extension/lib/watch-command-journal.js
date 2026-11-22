@@ -133,7 +133,7 @@
           return freeze(clone(captured));
         });
       },
-      // Explicit retry only; UUID/body/CAS never change. No startup replay/timer.
+      // UUID/body/CAS never change, including event-driven recovery.
       deliver(userId) {
         const admittedEpoch = epoch;
         return serial(async () => {
@@ -149,6 +149,16 @@
           const response = await client.request(record.action, clone(record.request), clone(record.binding));
           current(admittedEpoch);
           const payload = response?.payload;
+          // A lost prior settlement ACK can make exact replay return the
+          // already-stored not-applied fence. Only an exact hashed fence may
+          // request the owner-bound settlement proof; never infer it from 409.
+          if (response?.ok === true && response.status === 200 && payload?.outcome === 'not_applied') {
+            const fenceFields = ['settlement_version', 'outcome', 'history_id', 'anime_id',
+              'command_id', 'original_operation', 'command_kind', 'request_hash'];
+            try { exact(payload, fenceFields); } catch { return { acknowledged: false, response }; }
+            if (await proofMatches({ ...payload, current_user_id: userId }, record)) return { fenced: true };
+            return { acknowledged: false, response };
+          }
           const resultIds = record.request.command === 'start'
             ? [record.request.anime_id, record.request.expected_effective_anime_id] : [record.request.anime_id];
           if (response?.ok !== true || response.status !== 200
@@ -166,8 +176,7 @@
           return { acknowledged: true };
         });
       },
-      // Only an explicit human action may invoke this method. It proves the
-      // original outcome; it neither retries the writer nor publishes history.
+      // Proves the original outcome; it neither retries the writer nor publishes history.
       settle(userId) {
         const admittedEpoch = epoch;
         return serial(async () => {
@@ -202,7 +211,7 @@
           return { settled: true, outcome: proof.outcome };
         });
       },
-      refresh(userId) {
+      refresh(userId, beforeRelease) {
         const admittedEpoch = epoch;
         return serial(async () => {
           current(admittedEpoch);
@@ -222,6 +231,8 @@
             || !['ready', 'reconciliation_required'].includes(value.readiness)) {
             return { refreshed: false, response };
           }
+          if (beforeRelease) await beforeRelease(freeze(clone(record)));
+          current(admittedEpoch);
           await storage.remove(KEY);
           current(admittedEpoch);
           // Caller still verifies foreground/document/revision before event admission.

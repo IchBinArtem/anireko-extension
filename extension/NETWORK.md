@@ -48,7 +48,7 @@ Automatic and manual diagnostics contain no anime ID or title; the backend also 
 The `watch-command-journal` stores at most one unresolved immutable
 history command globally (70,000 UTF-8 bytes maximum), without source URLs or cookies.
 Admission uses the actual wire validator synchronously; persistence precedes delivery.
-Retry is explicit, preserves UUID/body/CAS, and never starts on extension startup.
+Retry preserves UUID/body/CAS and runs on later playback or popup events with persisted backoff.
 New Complete admission retains strict, separately domain-separated SHA-256 proofs
 of its original native media and top document/navigation context in
 the immutable local journal binding. The hash is not a wire field, request hash,
@@ -68,7 +68,7 @@ They must share account/mapping/document/player scope; complete origin paginatio
 an empty foreground are required. The existing durable command journal and server
 state expectations remain authoritative. A Start never increments completed totals.
 A local terminal barrier (`watch-terminal-barriers-v1`, at most 500 account/title
-scopes) is persisted before Complete delivery, including explicit retry. It stores
+scopes) is persisted before Complete delivery, including retry. It stores
 episode/duration and a SHA-256 native-media lineage, not source URLs. Backward seek
 cannot unlock the barrier; a series opening on an earlier episode or an opening
 after the original native terminal media ended is required. For movies/single episodes,
@@ -93,9 +93,11 @@ a tab removes only its own stops. A retry lacking the original live document con
 requires a new play for that account/title. This guard is local, never uploaded.
 Original retry/settlement revokes pre-command cycle capabilities; its receipt is
 not publication of current-document state, which requires an explicit fresh read.
-The popup places the explicit settlement check and its late-execution consequence
-in the same disclosure as the original target/action and retry. Opening the popup never
-posts a command or retries automatically. Day detail snapshots remain in local
+Pending commands retry their exact original UUID/body/CAS on eligible playback or popup
+events after a persisted delay, with exponential backoff from five minutes to six hours
+and the server's longer Retry-After. A fresh authorized matching account is required; unknown outcomes remain
+in the journal. Previously acknowledged results use a fresh read, not another command.
+Day detail snapshots remain in local
 watch-history storage only: up to 32 observed identity/episode/voice tuples per day,
 with bounded title/voice, same accepted watched delta and latest observed endpoint.
 Legacy and overflow days remain explicitly incomplete; no URL or day details are sent.

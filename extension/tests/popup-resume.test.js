@@ -217,7 +217,7 @@ test('cycle resume rejects malformed, terminal and zero-position current project
 test('actual repair renderer requires a human choice in every group and preserves text-only labels', async () => {
   const source = fs.readFileSync(path.join(__dirname, '..', 'popup.js'), 'utf8').replace(/\r\n/g, '\n');
   const start = source.indexOf('  async function renderWatchCycle() {');
-  const end = source.indexOf('\n  await renderWatchCycle();\n', start);
+  const end = source.indexOf('\n  chrome.storage.onChanged.addListener', start);
   assert.ok(start >= 0 && end > start);
   const nodes = [];
   const element = tag => {
@@ -279,7 +279,7 @@ test('actual repair renderer requires a human choice in every group and preserve
 test('failed explicit action remains visible after a fresh nonpending projection', async () => {
   const source = fs.readFileSync(path.join(__dirname, '..', 'popup.js'), 'utf8').replace(/\r\n/g, '\n');
   const start = source.indexOf('  async function renderWatchCycle() {');
-  const end = source.indexOf('\n  await renderWatchCycle();\n', start);
+  const end = source.indexOf('\n  chrome.storage.onChanged.addListener', start);
   const element = tag => ({ tagName: String(tag).toUpperCase(), children: [], events: {}, textContent: '',
     append(child) { this.children.push(child); }, replaceChildren(...children) { this.children = children; },
     addEventListener(type, callback) { this.events[type] = callback; },
@@ -334,7 +334,7 @@ test('late legacy bulk response cannot restore resume after adoption', async () 
 test('actual cycle renderer retains completion and shows only component tracked completions, not invented lifetime', async () => {
   const source = fs.readFileSync(path.join(__dirname, '..', 'popup.js'), 'utf8').replace(/\r\n/g, '\n');
   const start = source.indexOf('  async function renderWatchCycle() {');
-  const end = source.indexOf('\n  await renderWatchCycle();\n', start);
+  const end = source.indexOf('\n  chrome.storage.onChanged.addListener', start);
   assert.ok(start >= 0 && end > start);
   const elements = new Map();
   const element = tag => ({ tagName: String(tag).toUpperCase(), hidden: true, textContent: '', children: [],
@@ -411,7 +411,7 @@ test('actual cycle renderer retains completion and shows only component tracked 
   projection.pending = true;
   projection.pendingIntent = { animeId: 303, action: 'start', commandId: 'original-id' };
   await context.run();
-  assert.equal(elements.get('watch-feedback').textContent, 'watchCommandUnresolved');
+  assert.equal(elements.get('watch-feedback').textContent, '');
   assert.ok(elements.get('watch-current').textContent.includes('watchRewatching'), 'pending preserves the actual current viewing state');
   const savedOrigins = snapshot.origins;
   const savedForeground = snapshot.foreground;
@@ -419,7 +419,7 @@ test('actual cycle renderer retains completion and shows only component tracked 
   snapshot.foreground = null;
   await context.run();
   assert.equal(elements.get('watch-current').textContent, '', 'pending idle state does not repeat the player prompt');
-  assert.equal(elements.get('watch-feedback').textContent, 'watchCommandUnresolved', 'unconfirmed saving remains visible');
+  assert.equal(elements.get('watch-feedback').textContent, '', 'pending recovery stays out of the user interface');
   snapshot.readiness = 'reconciliation_required';
   await context.run();
   assert.equal(elements.get('watch-current').textContent, 'watchReconciliation', 'real reconciliation is not hidden');
@@ -430,27 +430,18 @@ test('actual cycle renderer retains completion and shows only component tracked 
   snapshot.origins = savedOrigins;
   snapshot.foreground = savedForeground;
   await context.run();
-  assert.equal(elements.get('watch-actions').children.length, 1);
-  assert.equal(elements.get('watch-actions').children[0].open, false);
-  assert.ok(elements.get('watch-actions').children[0].children[1].textContent.includes('watchOriginalTarget:303'));
-  elements.get('watch-actions').children[0].open = true;
-  await context.run();
-  assert.equal(elements.get('watch-actions').children[0].open, true, 'pending details retain disclosure state');
+  assert.equal(elements.get('watch-actions').children.length, 0, 'no technical recovery controls');
   projection.pendingIntent = null;
   await context.run();
   assert.equal(elements.get('watch-actions').children.length, 0, 'foreign account intent offers no retry');
   assert.equal(elements.get('watch-feedback').textContent.includes('303'), false);
   projection.settlementCapabilityId = 'opaque-check';
   await context.run();
-  assert.equal(elements.get('watch-actions').children.length, 1, 'generic check has one disclosure');
-  assert.equal(elements.get('watch-actions').children[0].children[1].textContent, 'watchSettlementHint');
-  assert.equal(elements.get('watch-actions').children[0].children[2].textContent, 'watchSettleOriginal');
-  assert.equal(elements.get('watch-actions').children[0].children.length, 3, 'foreign intent details remain absent');
+  assert.equal(elements.get('watch-actions').children.length, 0, 'foreign intent exposes no recovery controls');
   assert.equal(elements.get('watch-feedback').textContent.includes('303'), false);
   projection.pendingIntent = { animeId: 303, action: 'start', commandId: 'original-id' };
   await context.run();
-  assert.equal(elements.get('watch-actions').children[0].children.length, 5, 'retry and check remain distinct explicit actions');
-  assert.equal(elements.get('watch-actions').children[0].open, true, 'pending disclosure survives foreign-account projection');
+  assert.equal(elements.get('watch-actions').children.length, 0);
   projection.pending = false;
   projection.actions = [];
   snapshot.foreground.cycle_id = null;

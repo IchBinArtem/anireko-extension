@@ -35,6 +35,11 @@ const watchPreparedSnapshots = new WeakMap();
 let watchControllerGeneration = 0;
 let watchMutation = null;
 let watchSettlementCapability = null;
+const WATCH_RECOVERY_KEY = 'watch-recovery-v1';
+const WATCH_RECOVERY_INTERVAL_MS = 5 * 60_000;
+const WATCH_RECOVERY_MAX_INTERVAL_MS = 6 * 60 * 60_000;
+let watchRecoveryCheckAt = 0;
+let watchRecoveryFlight = null;
 const WATCH_TERMINAL_KEY = 'watch-terminal-barriers-v1';
 const watchObservationScopes = new WeakMap();
 const watchPlayObservations = new WeakMap();
@@ -1293,11 +1298,20 @@ function createWatchJournal(binding, event = null, mediaEvent = false) {
         // Session storage survives MV3 worker suspension without borrowing a
         // persisted playback sample as natural proof. Retry without the original
         // live document records a conservative stop requiring a new real play.
-        await setSession(binding, { [watchManualStopKey(request.expected_user_id,
-          request.expected_effective_anime_id, event?.tabId)]: {
-          documentId: event?.topDocumentId || null, navigationToken: event?.navigationToken || null,
-          observedAt: Date.now(),
-        } });
+        const stopKey = watchManualStopKey(request.expected_user_id, request.expected_effective_anime_id, event?.tabId);
+        const existingStops = await chrome.storage.session.get(null);
+        const stopPrefix = `watch-manual-stop:${request.expected_user_id}:${request.expected_effective_anime_id}:`;
+        const hasStop = Object.entries(existingStops).some(([key, stop]) => key.startsWith(stopPrefix)
+          && (stop?.commandId === request.command_id
+            || (!event && originalBinding?.document_id && originalBinding?.navigation_token
+              && stop?.documentId === originalBinding.document_id
+              && stop?.navigationToken === originalBinding.navigation_token)));
+        if (!hasStop) {
+          await setSession(binding, { [stopKey]: {
+            documentId: event?.topDocumentId || null, navigationToken: event?.navigationToken || null,
+            observedAt: Date.now(), commandId: request.command_id,
+          } });
+        }
         if (event && !await verifyWatchDocument(event, binding)) throw new Error('current_document_required');
       }
       if (action === 'history-command' && request.command === 'complete') {
@@ -1308,7 +1322,13 @@ function createWatchJournal(binding, event = null, mediaEvent = false) {
         if (event && !await verifyWatchDocument(event, binding)) throw new Error('current_document_required');
         if (mediaEvent && !progressEventCurrent(event, binding)) throw new Error('media_binding_changed');
       }
-      return apiClient.request(action, request);
+      requireLocalWrite(binding);
+      const response = await apiClient.request(action, request);
+      const commandId = action === 'history-settle' ? request.request?.command_id : request.command_id;
+      if (commandId && Number.isFinite(response?.retryAfterMs) && response.retryAfterMs > 0) {
+        await rememberWatchRetryAfter(binding, commandId, response.retryAfterMs);
+      }
+      return response;
     } },
   });
   watchCycleJournals.add(journal);
@@ -1533,6 +1553,9 @@ async function executeWatchCapability(id, binding, choiceCycleIds, automaticEven
       const delivered = await journal.deliver(capability.userId);
       if (!delivered.acknowledged) return { ok: false, status: 409, payload: { pending: true } };
       const refreshed = await journal.refresh(capability.userId);
+      if (Number.isFinite(refreshed.response?.retryAfterMs)) {
+        await rememberWatchRetryAfter(binding, intent.request.command_id, refreshed.response.retryAfterMs);
+      }
       if (!refreshed.refreshed) return { ok: false, status: 409, payload: { pending: true, acknowledged: true } };
     }
     // Accepted mutations retire every pre-command read, including other tabs and
@@ -1759,18 +1782,136 @@ async function retryWatchCommand(binding, expectedCommandId) {
       throw new Error('journal_intent_changed');
     }
     const account = await activeSyncAccount(binding);
-    if (account?.userId !== pending.request.expected_user_id) throw new Error('journal_account_changed');
-    const delivered = await journal.deliver(account.userId);
-    if (!delivered.acknowledged && !delivered.settled) return { ok: false, status: 409, payload: { pending: true } };
-    const refreshed = await journal.refresh(account.userId);
+    if (!account) throw new Error('journal_account_changed');
+    let delivered;
+    if (pending.version === 2) {
+      delivered = pending.terminalOutcome.current_user_id === account.userId
+        ? { settled: true, outcome: pending.terminalOutcome.outcome }
+        : await journal.settle(account.userId);
+    } else if (account.userId !== pending.request.expected_user_id) {
+      delivered = await journal.settle(account.userId);
+    } else {
+      delivered = await journal.deliver(account.userId);
+    }
+    if (delivered.fenced) delivered = await journal.settle(account.userId);
+    if (!delivered.acknowledged && !delivered.settled && delivered.response?.status === 409
+      && account.userId === pending.request.expected_user_id) {
+      requireLocalWrite(binding);
+      const fresh = await apiClient.request('history-read', { anime_id: pending.request.anime_id,
+        expected_user_id: account.userId });
+      requireLocalWrite(binding);
+      const snapshot = fresh?.payload;
+      const sameScope = fresh?.ok === true && fresh.status === 200 && snapshot?.user_id === account.userId
+        && snapshot.requested_anime_id === pending.request.anime_id
+        && snapshot.effective_anime_id === pending.request.expected_effective_anime_id
+        && snapshot.foreground?.anime_id === pending.request.expected_effective_anime_id
+        && Number.isSafeInteger(snapshot.foreground.generation);
+      let stale = sameScope && pending.action === 'history-command'
+        && snapshot.foreground.generation > pending.request.expected_foreground_generation;
+      if (sameScope && pending.action === 'history-command' && !stale) {
+        const origin = (Array.isArray(snapshot.origins) ? snapshot.origins : []).find(item =>
+          item?.history_id === pending.request.history_id && item.anime_id === pending.request.anime_id);
+        const start = snapshot.primary_history_id === pending.request.history_id
+          && snapshot.start_anime_id === pending.request.anime_id ? snapshot.start_state : null;
+        let state = origin?.state || start;
+        if (!state && pending.request.cycle_id && /^[a-f0-9]{64}$/u.test(snapshot.reconciliation_token || '')) {
+          requireLocalWrite(binding);
+          const page = await apiClient.request('history-read', { anime_id: pending.request.anime_id,
+            expected_user_id: account.userId, page: { selected_cycle_id: pending.request.cycle_id,
+              snapshot_token: snapshot.reconciliation_token } });
+          requireLocalWrite(binding);
+          if (Number.isFinite(page?.retryAfterMs)) await rememberWatchRetryAfter(binding, expectedCommandId, page.retryAfterMs);
+          const selected = page?.payload?.selected_origin;
+          if (page?.ok === true && page.status === 200 && page.payload?.user_id === account.userId
+            && page.payload.requested_anime_id === pending.request.anime_id
+            && page.payload.effective_anime_id === pending.request.expected_effective_anime_id
+            && page.payload.reconciliation_token === snapshot.reconciliation_token
+            && selected?.history_id === pending.request.history_id && selected.anime_id === pending.request.anime_id) {
+            state = selected.state;
+          }
+        }
+        stale = state?.anime_id === pending.request.anime_id && Number.isSafeInteger(state.version)
+          && state.version > pending.request.expected_version;
+      }
+      if (sameScope && pending.action === 'history-select'
+        && /^[a-f0-9]{64}$/u.test(snapshot.reconciliation_token || '')
+        && /^[a-f0-9]{64}$/u.test(pending.request.reconciliation_token || '')
+        && snapshot.reconciliation_token !== pending.request.reconciliation_token) stale = true;
+      if (stale) {
+        delivered = await journal.settle(account.userId);
+      }
+      if (Number.isFinite(fresh?.retryAfterMs)) await rememberWatchRetryAfter(binding, expectedCommandId, fresh.retryAfterMs);
+    }
+    if (!delivered.acknowledged && !delivered.settled) return { ok: false, status: 409,
+      payload: { pending: true, retryAfterMs: delivered.response?.retryAfterMs } };
+    const refreshed = await journal.refresh(account.userId, async () => {
+      if (['start', 'resume'].includes(pending.request.command)
+        && (delivered.acknowledged || delivered.outcome === 'accepted')) {
+        const stops = await chrome.storage.session.get(null);
+        const prefix = `watch-manual-stop:${account.userId}:${pending.request.expected_effective_anime_id}:`;
+        const keys = Object.keys(stops).filter(key => key.startsWith(prefix)
+          && (key === `${prefix}retry` || (stops[key]?.documentId === pending.binding.document_id
+            && stops[key]?.navigationToken === pending.binding.navigation_token)));
+        if (keys.length) await removeSession(binding, keys);
+      }
+    });
+    if (Number.isFinite(refreshed.response?.retryAfterMs)) {
+      await rememberWatchRetryAfter(binding, expectedCommandId, refreshed.response.retryAfterMs);
+    }
     if (refreshed.refreshed) invalidateWatchController();
     // This receipt is never a current-document projection. UI must explicitly reread.
     return { ok: refreshed.refreshed, status: refreshed.refreshed ? 200 : 409,
-      payload: { acknowledged: true, pending: !refreshed.refreshed, originalAnimeId: pending.request.anime_id } };
+      payload: { acknowledged: true, pending: !refreshed.refreshed, originalAnimeId: pending.request.anime_id,
+        retryAfterMs: refreshed.response?.retryAfterMs } };
   } finally {
     watchCycleJournals.delete(journal);
     if (watchMutation === reservation) watchMutation = null;
   }
+}
+
+async function rememberWatchRetryAfter(binding, commandId, retryAfterMs) {
+  if (!Number.isFinite(retryAfterMs) || retryAfterMs <= 0) return;
+  const old = (await chrome.storage.local.get(WATCH_RECOVERY_KEY))[WATCH_RECOVERY_KEY];
+  const nextAt = Math.max(Date.now() + retryAfterMs,
+    old?.commandId === commandId && Number.isFinite(old.nextAt) ? old.nextAt : 0);
+  await setLocal(binding, { [WATCH_RECOVERY_KEY]: { commandId, nextAt,
+    attempt: old?.commandId === commandId && Number.isSafeInteger(old.attempt) ? old.attempt : 0 } });
+}
+
+// Recover only the original same-account intent, using the existing idempotent
+// journal. Persist admission before network so worker restarts cannot burst.
+function recoverPendingWatch(binding) {
+  if (watchRecoveryFlight || watchMutation || Date.now() < watchRecoveryCheckAt) return;
+  watchRecoveryCheckAt = Date.now() + 60_000;
+  watchRecoveryFlight = (async () => {
+    const journal = createWatchJournal(binding);
+    try {
+      const pending = await journal.pending();
+      if (!pending || !localWriteCurrent(binding)) return;
+      const commandId = pending.request.command_id;
+      const stored = await chrome.storage.local.get(WATCH_RECOVERY_KEY);
+      const previous = stored[WATCH_RECOVERY_KEY];
+      const now = Date.now();
+      if (!previous || previous.commandId !== commandId || !Number.isFinite(previous.nextAt)) {
+        await setLocal(binding, { [WATCH_RECOVERY_KEY]: { commandId, nextAt: now + 60_000 } });
+        return;
+      }
+      if (now < previous.nextAt) { watchRecoveryCheckAt = Math.min(previous.nextAt, now + 60_000); return; }
+      const attempt = Number.isSafeInteger(previous.attempt) && previous.attempt >= 0
+        ? Math.min(previous.attempt + 1, 5) : 1;
+      const delay = Math.min(WATCH_RECOVERY_MAX_INTERVAL_MS, WATCH_RECOVERY_INTERVAL_MS * (3 ** (attempt - 1)));
+      const nextAt = now + delay;
+      await setLocal(binding, { [WATCH_RECOVERY_KEY]: { commandId, nextAt, attempt } });
+      watchRecoveryCheckAt = Math.min(nextAt, now + 60_000);
+      const outcome = await retryWatchCommand(binding, commandId);
+      const retryAfter = outcome?.payload?.retryAfterMs;
+      if (Number.isFinite(retryAfter) && retryAfter > delay && localWriteCurrent(binding)) {
+        await rememberWatchRetryAfter(binding, commandId, retryAfter);
+        watchRecoveryCheckAt = Date.now() + 60_000;
+      }
+      if (outcome?.ok) watchRecoveryCheckAt = 0;
+    } finally { watchCycleJournals.delete(journal); }
+  })().catch(() => {}).finally(() => { watchRecoveryFlight = null; });
 }
 
 async function settleWatchCommand(binding, capabilityId) {
@@ -1856,6 +1997,9 @@ async function deliverCapturedCycle(captured, event, binding, userId) {
     const delivered = await captured.journal.deliver(userId);
     if (!delivered.acknowledged) return false;
     const refreshed = await captured.journal.refresh(userId);
+    if (Number.isFinite(refreshed.response?.retryAfterMs)) {
+      await rememberWatchRetryAfter(binding, captured.intent.request.command_id, refreshed.response.retryAfterMs);
+    }
     if (!refreshed.refreshed) return false;
     invalidateWatchController();
     await loadWatchController(event, binding, userId);
@@ -2358,6 +2502,7 @@ function maybeSyncProgress(state, urgent, writeBinding = captureLocalWrite(), li
     .finally(() => {
       if (cycleCapture) watchCycleJournals.delete(cycleCapture.journal);
       if (progressSyncQueues.get(state) === queued) progressSyncQueues.delete(state);
+      if (event.player?.playbackStarted && localWriteCurrent(writeBinding)) recoverPendingWatch(writeBinding);
     });
   progressSyncQueues.set(state, queued);
   return queued;
@@ -3325,6 +3470,7 @@ async function handlePopupRequest(message, writeBinding = captureLocalWrite()) {
   }
   switch (message?.type) {
     case 'popup-runtime-info':
+      recoverPendingWatch(writeBinding);
       return {
         ok: true,
         status: 200,
@@ -3384,6 +3530,7 @@ async function handlePopupRequest(message, writeBinding = captureLocalWrite()) {
         } finally { watchCycleJournals.delete(journal); }
       }
       if (!watchDocumentCurrent(event, writeBinding)) throw new Error('current_document_required');
+      if (Object.hasOwn(storedPending, AniRekoWatchCommandJournal.key)) recoverPendingWatch(writeBinding);
       return { ok: true, status: 200, payload: { ...projection,
         pending: Object.hasOwn(storedPending, AniRekoWatchCommandJournal.key), pendingIntent, settlementCapabilityId } };
     }

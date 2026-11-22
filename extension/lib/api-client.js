@@ -287,7 +287,8 @@
       const payload = response.status === 204 ? null : action === 'progress-all'
         ? await readBulkJson(response).catch(() => null)
         : await response.json().catch(() => null);
-      const retryAfterMs = action === 'progress-all' ? responseRetryAfter(response) : undefined;
+      const retryAfterMs = ['progress-all', 'history-command', 'history-select', 'history-read', 'history-settle'].includes(action)
+        ? responseRetryAfter(response) : undefined;
       return { ok: response.ok, status: response.status, payload,
         ...(retryAfterMs === undefined ? {} : { retryAfterMs }) };
     }

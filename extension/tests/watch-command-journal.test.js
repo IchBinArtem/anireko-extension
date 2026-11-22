@@ -139,6 +139,20 @@ async function settlementProof(subject, currentUser = 1, outcome = 'not_applied'
     request_hash: await subject.hash('history-command', request) };
 }
 
+test('only the exact previously stored fence allows a subsequent settlement check', async () => {
+  let response;
+  const subject = fixture({ fetchImpl: async () => ({ ok: true, status: 200, json: async () => response }) });
+  const proof = await settlementProof(subject);
+  const { current_user_id, ...fence } = proof;
+  await subject.journal.admit(subject.journal.capture('history-command', request, binding));
+  response = { ...fence, request_hash: 'a'.repeat(64) };
+  assert.equal((await subject.journal.deliver(1)).fenced, undefined);
+  response = fence;
+  assert.equal((await subject.journal.deliver(1)).fenced, true);
+  response = proof;
+  assert.equal((await subject.journal.settle(1)).settled, true);
+});
+
 test('explicit settlement persists typed proof before fresh original-root GET, including transfer', async () => {
   const data = {}; let proof;
   const subject = fixture({ data, fetchImpl: async (_url, init) => ({ ok: true, status: 200,

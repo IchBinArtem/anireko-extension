@@ -920,40 +920,7 @@
           pauseSessionStateReload = false;
         }
       };
-      if (watchProjection.pending) {
-        watchFeedback.textContent = t('watchCommandUnresolved');
-        const original = watchProjection.pendingIntent;
-        if (!original) watchFeedback.textContent += ` · ${t('watchPendingOtherAccount')}`;
-        if (original || watchProjection.settlementCapabilityId) {
-          const details = document.createElement('details');
-          details.watchDisclosure = 'pendingDetailsOpen';
-          details.open = !!watchActions.pendingDetailsOpen;
-          const summary = document.createElement('summary');
-          summary.textContent = t('watchPendingDetails');
-          details.append(summary);
-          if (watchProjection.settlementCapabilityId) {
-            const hint = document.createElement('p');
-            hint.className = 'watch-choice-hint';
-            hint.textContent = t('watchSettlementHint');
-            const check = document.createElement('button');
-            check.type = 'button';
-            check.textContent = t('watchSettleOriginal');
-            const capabilityId = watchProjection.settlementCapabilityId;
-            check.addEventListener('click', () => run('popup-watch-settle', { capabilityId }));
-            details.append(hint); details.append(check);
-          }
-          if (original) {
-            const target = document.createElement('p');
-            target.textContent = `${t('watchOriginalTarget', String(original.animeId))} · ${t(`watchAction_${original.action}`)}`;
-            const retry = document.createElement('button');
-            retry.type = 'button';
-            retry.textContent = t('watchRetryOriginal');
-            retry.addEventListener('click', () => run('popup-watch-retry', { commandId: original.commandId }));
-            details.append(target); details.append(retry);
-          }
-          watchActions.append(details);
-        }
-      } else {
+      if (!watchProjection.pending) {
         if (watchProjection.repairComplete === false) watchFeedback.textContent = t('watchChoicesIncomplete');
         let manualActions = null;
         for (const action of watchProjection.actions || []) {
@@ -1049,6 +1016,12 @@
       set('watch-current', t('watchNoLegacyFallback'));
     }
   }
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === 'local' && changes['watch-command-pending-v1']?.oldValue
+      && changes['watch-command-pending-v1'].newValue === undefined && syncAccountActive) {
+      renderWatchCycle().then(() => renderResume(false)).catch(() => {});
+    }
+  });
   await renderWatchCycle();
 
   async function loadResumeBulk(force) {
