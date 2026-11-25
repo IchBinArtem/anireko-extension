@@ -216,7 +216,7 @@ test('cycle resume rejects malformed, terminal and zero-position current project
 
 test('actual repair renderer requires a human choice in every group and preserves text-only labels', async () => {
   const source = fs.readFileSync(path.join(__dirname, '..', 'popup.js'), 'utf8').replace(/\r\n/g, '\n');
-  const start = source.indexOf('  async function renderWatchCycle() {');
+  const start = source.indexOf('  let watchCycleRenderVersion = 0;');
   const end = source.indexOf('\n  chrome.storage.onChanged.addListener', start);
   assert.ok(start >= 0 && end > start);
   const nodes = [];
@@ -278,7 +278,7 @@ test('actual repair renderer requires a human choice in every group and preserve
 
 test('failed explicit action remains visible after a fresh nonpending projection', async () => {
   const source = fs.readFileSync(path.join(__dirname, '..', 'popup.js'), 'utf8').replace(/\r\n/g, '\n');
-  const start = source.indexOf('  async function renderWatchCycle() {');
+  const start = source.indexOf('  let watchCycleRenderVersion = 0;');
   const end = source.indexOf('\n  chrome.storage.onChanged.addListener', start);
   const element = tag => ({ tagName: String(tag).toUpperCase(), children: [], events: {}, textContent: '',
     append(child) { this.children.push(child); }, replaceChildren(...children) { this.children = children; },
@@ -333,7 +333,7 @@ test('late legacy bulk response cannot restore resume after adoption', async () 
 
 test('actual cycle renderer retains completion and shows only component tracked completions, not invented lifetime', async () => {
   const source = fs.readFileSync(path.join(__dirname, '..', 'popup.js'), 'utf8').replace(/\r\n/g, '\n');
-  const start = source.indexOf('  async function renderWatchCycle() {');
+  const start = source.indexOf('  let watchCycleRenderVersion = 0;');
   const end = source.indexOf('\n  chrome.storage.onChanged.addListener', start);
   assert.ok(start >= 0 && end > start);
   const elements = new Map();

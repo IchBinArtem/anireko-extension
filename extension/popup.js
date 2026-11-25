@@ -847,9 +847,9 @@
     const renderVersion = ++watchCycleRenderVersion;
     const renderEpoch = accountActivityEpoch;
     const renderRevision = localWriteRevision;
-    const canPublish = () => renderVersion === watchCycleRenderVersion
-      && syncAccountActive && accountActivityEpoch === renderEpoch
+    const isCurrentContext = () => syncAccountActive && accountActivityEpoch === renderEpoch
       && localWriteRevision === renderRevision;
+    const canPublish = () => renderVersion === watchCycleRenderVersion && isCurrentContext();
     watchProjection = null;
     await renderResume(false);
     if (!canPublish()) return;
@@ -916,7 +916,7 @@
         finally {
           await renderWatchCycle();
           await renderResume(false);
-          if (failed && canPublish() && !watchProjection?.pending) {
+          if (failed && isCurrentContext() && !watchProjection?.pending) {
             watchFeedback.textContent = [watchFeedback.textContent, t('watchActionFailed')].filter(Boolean).join(' · ');
             watchCard.hidden = false;
           }

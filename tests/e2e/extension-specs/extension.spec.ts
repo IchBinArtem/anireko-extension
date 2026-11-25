@@ -1945,11 +1945,10 @@ test('detects a shadow-DOM web-component player and joins the host episode attri
     currentTime: 60,
     paused: false,
   });
-  await waitForPlayerProgress(tabId, 60 / 310);
-  const state = await storedTabState(tabId);
   // Episode is only an attribute on the <fake-player> host in the top page;
   // the frame itself reports episode=null and must be backfilled.
-  expect(state.player.episode).toBe(3);
+  await waitForPlayerProgress(tabId, 60 / 310);
+  await expect.poll(async () => (await storedTabState(tabId))?.player?.episode ?? null).toBe(3);
 
   // A top-page script cannot forge player state with postMessage.
   await page.evaluate(() => {
