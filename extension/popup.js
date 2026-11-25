@@ -1,5 +1,14 @@
 (async function renderPopup() {
-  const requestBackground = (type, input = {}) => chrome.runtime.sendMessage({ type, ...input });
+  let localWriteRevision = null;
+  const requestBackground = (type, input = {}) => chrome.runtime.sendMessage({
+    type, ...input, ...(localWriteRevision ? { expectedRevision: localWriteRevision } : {}),
+  });
+  async function updatePreferences(operation, input = {}) {
+    const response = await requestBackground('popup-update-preferences', { operation, ...input });
+    if (!response?.ok || !response.payload?.localWriteRevision) throw new Error('write_binding_changed');
+    localWriteRevision = response.payload.localWriteRevision;
+    return response;
+  }
   const t = (key, substitutions) => chrome.i18n.getMessage(key, substitutions) || key;
   const uiLanguage = chrome.i18n.getUILanguage?.() || navigator.language || 'en';
   const siteLocale = /^ru(?:-|$)/iu.test(uiLanguage) ? 'ru' : 'en';
@@ -30,6 +39,7 @@
     const runtimeInfo = await requestBackground('popup-runtime-info');
     if (runtimeInfo?.ok && runtimeInfo.payload?.siteBase) {
       siteBase = runtimeInfo.payload.siteBase;
+      localWriteRevision = runtimeInfo.payload.localWriteRevision || null;
     }
   } catch { /* keep the fixed production link if the worker is restarting */ }
   const requestedTabId = Number(new URLSearchParams(location.search).get('tabId'));
@@ -56,9 +66,27 @@
   const consent = stored[PRIVACY_CONSENT_KEY];
   const consentAccepted = consent?.version === PRIVACY_CONSENT_VERSION
     && Number.isFinite(consent.acceptedAt);
+  // Persisted tab state can outlive the detector after an extension update.
+  // Check the top document itself, not an arbitrary responding player frame.
+  let detectorConnected = false;
+  let detectorDocumentToken = null;
+  const pageSupported = /^https?:\/\//iu.test(tab?.url || '');
+  if (consentAccepted && pageSupported && Number.isInteger(tab?.id)) {
+    try {
+      const reply = await chrome.tabs.sendMessage(tab.id,
+        { type: 'anireko-detector-status' }, { frameId: 0 });
+      detectorConnected = reply?.ok === true && reply.documentUrl === tab.url
+        && typeof reply.documentToken === 'string' && reply.documentToken.length > 0;
+      if (detectorConnected) detectorDocumentToken = reply.documentToken;
+    } catch { /* no receiver, revoked access, or an invalidated old context */ }
+  }
   const sessionStored = key ? await chrome.storage.session.get(key) : {};
   const state = sessionStored[key];
   const displayFingerprint = (value) => JSON.stringify([
+    Boolean(value),
+    Boolean(value?.probe),
+    value?.navigationToken || null,
+    value?.pageUrl || null,
     value?.recognition?.title || null,
     value?.match || null,
     value?.player ? {
@@ -98,30 +126,89 @@
   document.getElementById('privacy-link').href = privacyHref;
   const disclosure = document.getElementById('privacy-disclosure');
   disclosure.hidden = consentAccepted;
-  document.getElementById('diagnostics-consent').checked = consent?.diagnostics === true;
+  document.getElementById('diagnostics-consent').checked = consentAccepted && consent?.diagnostics === true;
+  const diagnosticsOption = document.getElementById('diagnostics-option');
+  const diagnosticsSetting = document.getElementById('diagnostics-setting');
+  const diagnosticsError = document.getElementById('diagnostics-setting-error');
+  let diagnosticsSaving = false;
+  let diagnosticsViewEpoch = 0;
+  let diagnosticsSnapshot = null;
+  const validDiagnosticsConsent = value => value?.version === PRIVACY_CONSENT_VERSION
+    && Number.isFinite(value.acceptedAt) && !Object.hasOwn(value, 'declinedAt');
+  const renderDiagnosticsSetting = value => {
+    diagnosticsSnapshot = value;
+    const accepted = validDiagnosticsConsent(value);
+    diagnosticsOption.hidden = !accepted;
+    diagnosticsSetting.checked = accepted && value.diagnostics === true;
+    diagnosticsSetting.indeterminate = false;
+    diagnosticsSetting.disabled = diagnosticsSaving || !accepted;
+  };
+  async function readDiagnosticsSetting() {
+    const epoch = diagnosticsViewEpoch;
+    try {
+      const fresh = await chrome.storage.local.get(PRIVACY_CONSENT_KEY);
+      if (epoch === diagnosticsViewEpoch) renderDiagnosticsSetting(fresh[PRIVACY_CONSENT_KEY]);
+    } catch {
+      if (epoch !== diagnosticsViewEpoch) return;
+      diagnosticsSnapshot = null;
+      diagnosticsOption.hidden = !consentAccepted;
+      diagnosticsSetting.indeterminate = true;
+      diagnosticsSetting.disabled = true;
+      diagnosticsError.textContent = t('diagnosticsSaveFailed');
+      diagnosticsError.hidden = false;
+    }
+  }
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area !== 'local' || !Object.hasOwn(changes, PRIVACY_CONSENT_KEY)) return;
+    diagnosticsViewEpoch++;
+    renderDiagnosticsSetting(changes[PRIVACY_CONSENT_KEY].newValue);
+  });
+  diagnosticsSetting.addEventListener('change', async () => {
+    const diagnostics = diagnosticsSetting.checked;
+    diagnosticsSaving = true;
+    diagnosticsSetting.disabled = true;
+    diagnosticsError.hidden = true;
+    try {
+      await updatePreferences('set-diagnostics', { diagnostics });
+      location.reload();
+    } catch {
+      // The local write may have committed before a port failure. Never invent
+      // an OFF state or retry the consent write; show authoritative storage.
+      await readDiagnosticsSetting();
+      diagnosticsError.textContent = t('diagnosticsSaveFailed');
+      diagnosticsError.hidden = false;
+    } finally {
+      diagnosticsSaving = false;
+      diagnosticsSetting.disabled = !validDiagnosticsConsent(diagnosticsSnapshot);
+    }
+  });
+  void readDiagnosticsSetting();
   document.getElementById('privacy-accept').addEventListener('click', async () => {
-    await chrome.storage.local.set({
-      [PRIVACY_CONSENT_KEY]: {
-        version: PRIVACY_CONSENT_VERSION,
-        acceptedAt: Date.now(),
-        diagnostics: document.getElementById('diagnostics-consent').checked,
-      },
-    });
-    if (Number.isInteger(tab?.id)) await chrome.tabs.reload(tab.id).catch(() => {});
-    window.close();
+    try {
+      await updatePreferences('accept-consent', { diagnostics: document.getElementById('diagnostics-consent').checked });
+      if (Number.isInteger(tab?.id)) await chrome.tabs.reload(tab.id).catch(() => {});
+      window.close();
+    } catch { document.getElementById('privacy-accept').textContent = t('syncFailed'); }
   });
   document.getElementById('privacy-decline').addEventListener('click', async () => {
-    await chrome.storage.local.set({
-      [PRIVACY_CONSENT_KEY]: { version: PRIVACY_CONSENT_VERSION, declinedAt: Date.now() },
-    });
-    window.close();
+    try {
+      await updatePreferences('decline-consent');
+      window.close();
+    } catch { document.getElementById('privacy-decline').textContent = t('syncFailed'); }
   });
 
   const deleteLocalDataButton = document.getElementById('delete-local-data');
   deleteLocalDataButton.addEventListener('click', async () => {
     if (!confirm(t('confirmDeleteLocalData'))) return;
-    await requestBackground('popup-delete-local-data');
-    location.reload();
+    deleteLocalDataButton.disabled = true;
+    try {
+      const response = await requestBackground('popup-delete-local-data');
+      if (!response?.ok) throw new Error('local_clear_failed');
+      location.reload();
+    } catch {
+      deleteLocalDataButton.textContent = t('syncFailed');
+      deleteLocalDataButton.disabled = false;
+    }
   });
   deleteLocalDataButton.dataset.ready = 'true';
   deleteLocalDataButton.disabled = false;
@@ -132,24 +219,41 @@
   // already-enabled extension would silently change the write target.
   const autoMarkToggle = document.getElementById('auto-mark');
   autoMarkToggle.checked = false;
+  document.getElementById('resume-sync').disabled = true;
   let syncAccountActive = false;
   let currentUserId = null;
 
   async function renderAccount() {
+    const requestedEpoch = accountActivityEpoch;
     const label = document.getElementById('account-label');
     const login = document.getElementById('account-login');
     const warning = document.getElementById('account-warning');
     const syncButton = document.getElementById('resume-sync');
     login.href = siteBase;
     try {
+      // Startup detector awaits precede our preference listener. Reconcile the
+      // small permission snapshot before account I/O; later changes use epoch.
+      const preferences = await chrome.storage.local.get([PRIVACY_CONSENT_KEY, 'auto-mark', SYNC_ACCOUNT_KEY]);
+      if (accountActivityEpoch !== requestedEpoch) return;
+      const permission = preferences[PRIVACY_CONSENT_KEY];
+      if (permission?.version !== PRIVACY_CONSENT_VERSION || !Number.isFinite(permission.acceptedAt)) {
+        renderPageUnavailable('consentRequiredTitle', 'syncOffUntilConsent');
+        return;
+      }
       const response = await requestBackground('popup-session-info');
+      if (accountActivityEpoch !== requestedEpoch) return;
       const payload = response?.payload;
+      // This background-owned capability also covers local controls for guests;
+      // a 401 account response must not strand clear behind the old account epoch.
+      if (typeof payload?.localWriteRevision === 'string') {
+        localWriteRevision = payload.localWriteRevision;
+      }
       if (response?.ok && payload?.success && payload.user) {
         currentUserId = Number(payload.user.id);
-        const bound = stored[SYNC_ACCOUNT_KEY];
+        const bound = preferences[SYNC_ACCOUNT_KEY];
         const boundUserId = Number(bound?.id);
         const sameAccount = Number.isInteger(boundUserId) && boundUserId === currentUserId;
-        syncAccountActive = sameAccount && stored['auto-mark'] === true;
+        syncAccountActive = sameAccount && preferences['auto-mark'] === true;
         const profile = document.createElement('a');
         profile.className = 'profile-link';
         profile.href = `${siteBase}/${siteLocale}/profile`;
@@ -168,8 +272,11 @@
           syncButton.disabled = true;
         }
         autoMarkToggle.addEventListener('change', async () => {
+          const previouslyActive = syncAccountActive;
+          autoMarkToggle.disabled = true;
+          try {
           if (!autoMarkToggle.checked) {
-            await chrome.storage.local.set({ 'auto-mark': false });
+            await updatePreferences('disable-sync');
             syncAccountActive = false;
             syncButton.disabled = true;
             return;
@@ -183,12 +290,13 @@
               return;
             }
           }
-          await chrome.storage.local.set({
-            'auto-mark': true,
-            [SYNC_ACCOUNT_KEY]: { id: currentUserId, name: payload.user.name || '' },
-          });
-          await chrome.storage.local.remove(['resume-bulk', 'resume-sync-at']);
+          await updatePreferences('enable-sync', { expectedUserId: currentUserId });
           location.reload();
+          } catch {
+            autoMarkToggle.checked = previouslyActive;
+            warning.hidden = false;
+            warning.textContent = t('syncFailed');
+          } finally { autoMarkToggle.disabled = false; }
         });
         return;
       }
@@ -217,34 +325,196 @@
     return `${year}-${month}-${day}`;
   }
 
-  function renderStats(history) {
+  let selectedActivityDate = null;
+  let accountActivityCache = null;
+  let accountActivityEpoch = 0;
+  let statsInitialized = false;
+  function activityTime(seconds) {
+    const value = Math.floor(seconds);
+    return `${Math.floor(value / 60)}:${String(value % 60).padStart(2, '0')}`;
+  }
+  function renderStats(history, accountCache = null, accountUserId = null) {
     const now = new Date();
-    const today = history?.days?.[dateKey(now)] || { watchedSeconds: 0, episodeKeys: [] };
-    set('today-time', t('minutesShort', String(Math.round(today.watchedSeconds / 60))));
-    set('today-episodes', countLabel('episodeCount', today.episodeKeys.length));
-    const days = [];
-    for (let offset = 6; offset >= 0; offset -= 1) {
-      const date = new Date(now);
-      date.setDate(now.getDate() - offset);
-      const value = history?.days?.[dateKey(date)]?.watchedSeconds || 0;
-      days.push({ date, value, today: offset === 0 });
-    }
-    const max = Math.max(60, ...days.map((day) => day.value));
+    const today = history?.days?.[dateKey(now)];
+    set('today-time', typeof today?.watchedSeconds === 'number' && Number.isFinite(today.watchedSeconds) && today.watchedSeconds >= 0
+      ? t('minutesShort', String(Math.floor(today.watchedSeconds / 60))) : t('activityUnknown'));
+    set('today-episodes', countLabel('episodeCount', Array.isArray(today?.episodeKeys) ? today.episodeKeys.length : 0));
+    document.getElementById('today-episodes').title = t('activityEpisodesDetail');
+    const accountDays = accountCache ? AniRekoActivity.accountDays(accountCache, accountUserId, now) : {};
+    const days = AniRekoActivity.calendar(history, now, 12, accountDays);
+    const hasAccountRecords = days.some(day => day.accountCount > 0);
+    set('activity-heading', t(hasAccountRecords ? 'activityHeadingAccount' : 'activityHeading'));
+    set('activity-legend', t('activityLegend') + (hasAccountRecords ? ` ${t('activityAccountLegend')}` : ''));
+    const dayLabel = day => `${day.date.toLocaleDateString(dateLocale, { day: 'numeric', month: 'short', year: 'numeric' })} · ${day.seconds === null
+      ? t('activityUnknown') : t('minutesShort', String(Math.floor(day.seconds / 60)))}${day.accountCount > 0 ? ` · ${t('activityAccountSaved')}` : ''}`;
     const chart = document.getElementById('week-chart');
-    chart.replaceChildren(...days.map((day) => {
-      const column = document.createElement('div');
-      column.className = `day-bar${day.today ? ' today' : ''}`;
-      column.title = t('minutesShort', String(Math.round(day.value / 60)));
-      const bar = document.createElement('i');
-      bar.style.height = `${Math.max(2, Math.round(day.value / max * 18))}px`;
-      const label = document.createElement('span');
-      label.textContent = day.date.toLocaleDateString(dateLocale, { weekday: 'short' }).replace('.', '');
-      column.append(bar, label);
-      return column;
+    if (!days.some(day => dateKey(day.date) === selectedActivityDate)) selectedActivityDate = dateKey(now);
+    const showDay = (day, label) => {
+      selectedActivityDate = dateKey(day.date);
+      set('activity-detail', label);
+      const entries = document.getElementById('activity-entries');
+      entries.replaceChildren();
+      const storedDay = history?.days?.[selectedActivityDate];
+      if (!Array.isArray(storedDay?.details) && !day.accountRecords?.length) {
+        const note = document.createElement('p');
+        note.textContent = t('activityDetailsUnavailable');
+        entries.append(note);
+      } else if (Array.isArray(storedDay?.details)) {
+        if (storedDay.detailsPartial) {
+          const note = document.createElement('p');
+          note.textContent = t('activityDetailsPartial');
+          entries.append(note);
+        }
+        const groups = new Map();
+        for (const detail of storedDay.details) {
+          if (!detail || typeof detail.title !== 'string'
+            || !Number.isFinite(detail.watchedSeconds) || detail.watchedSeconds < 60) continue;
+          const groupKey = Number.isSafeInteger(detail.animeId) && detail.animeId > 0
+            ? `anime:${detail.animeId}` : detail.animeId === null && typeof detail.titleKey === 'string' && detail.titleKey
+              ? `title:${detail.titleKey}` : detail;
+          let group = groups.get(groupKey);
+          if (!group) {
+            const element = document.createElement('div');
+            element.className = 'activity-entry';
+            const title = document.createElement('strong');
+            title.textContent = detail.title;
+            element.append(title);
+            group = { element, title: detail.title };
+            groups.set(groupKey, group);
+            entries.append(element);
+          }
+          const row = document.createElement('div');
+          row.className = 'activity-observation';
+          const metadata = document.createElement('p');
+          const parts = [detail.episode == null ? t('activityFull') : t('episodeLabel', String(detail.episode))];
+          if (detail.title !== group.title) parts.unshift(detail.title);
+          if (detail.voice) parts.push(detail.voice);
+          parts.push(t('activityWatched', String(Math.floor(detail.watchedSeconds / 60))));
+          metadata.textContent = parts.join(' · ');
+          row.append(metadata);
+          if (Number.isFinite(detail.position) && detail.position >= 0) {
+            const position = activityTime(detail.position);
+            const duration = Number.isFinite(detail.duration) && detail.duration > 0 ? activityTime(detail.duration) : null;
+            const positionLine = document.createElement('p');
+            positionLine.textContent = duration === null ? t('activityLastPosition', position)
+              : t('activityPositionWithDuration', [position, duration]);
+            row.append(positionLine);
+          }
+          group.element.append(row);
+        }
+      }
+      if (day.accountRecords?.length) {
+        const note = document.createElement('p');
+        note.className = 'activity-account-note';
+        note.textContent = t('activityAccountNote');
+        entries.append(note);
+        for (const record of day.accountRecords) {
+          const entry = document.createElement('div');
+          entry.className = 'activity-entry activity-account-entry';
+          const title = document.createElement('strong');
+          title.textContent = (/^ru/iu.test(dateLocale) ? record.title_ru || record.title : record.title || record.title_ru)
+            || t('activityAccountAnime', String(record.animeId));
+          const metadata = document.createElement('p');
+          const parts = [t('activityAccountSaveTime', new Date(record.savedAt).toLocaleTimeString(dateLocale,
+            { hour: '2-digit', minute: '2-digit' }))];
+          if (record.episode != null) parts.push(t('episodeLabel', String(record.episode)));
+          if (record.voice) parts.push(record.voice);
+          metadata.textContent = parts.join(' · ');
+          const position = document.createElement('p');
+          const endpoint = activityTime(record.position);
+          position.textContent = record.duration == null ? t('activityAccountPosition', endpoint)
+            : t('activityAccountPositionDuration', [endpoint, activityTime(record.duration)]);
+          entry.append(title); entry.append(metadata); entry.append(position);
+          entries.append(entry);
+        }
+        if (day.accountPartial) {
+          const note = document.createElement('p');
+          note.textContent = t('activityDetailsPartial');
+          entries.append(note);
+        }
+      }
+      for (const cell of chart.children) cell.setAttribute('aria-pressed', String(cell.activityDate === selectedActivityDate));
+    };
+    chart.replaceChildren(...days.map((day, index) => {
+      const cell = document.createElement('button');
+      cell.type = 'button';
+      cell.className = `activity-cell level-${day.level ?? 'unknown'}${day.today ? ' today' : ''}${day.accountCount > 0
+        ? ` has-account-records${day.seconds === null ? ' account-only' : ''}` : ''}`;
+      const label = dayLabel(day);
+      cell.title = label;
+      cell.setAttribute('aria-label', label);
+      cell.activityDate = dateKey(day.date);
+      cell.setAttribute('aria-pressed', String(cell.activityDate === selectedActivityDate));
+      cell.tabIndex = cell.activityDate === selectedActivityDate ? 0 : -1;
+      const showDetail = () => showDay(day, label);
+      cell.addEventListener('focus', () => {
+        for (const item of chart.children) item.tabIndex = item === cell ? 0 : -1;
+        showDetail();
+      });
+      cell.addEventListener('keydown', (event) => {
+        const moves = { ArrowLeft: -7, ArrowRight: 7, ArrowUp: -1, ArrowDown: 1 };
+        const target = event.key === 'Home' ? 0 : event.key === 'End' ? days.length - 1
+          : Object.hasOwn(moves, event.key) ? Math.max(0, Math.min(days.length - 1, index + moves[event.key])) : null;
+        if (target !== null) {
+          event.preventDefault();
+          chart.children[target].focus();
+        }
+      });
+      cell.addEventListener('click', showDetail);
+      return cell;
     }));
+    const selected = days.find(day => dateKey(day.date) === selectedActivityDate);
+    if (selected) {
+      showDay(selected, dayLabel(selected));
+    }
+    statsInitialized = true;
   }
 
   const reportSection = document.getElementById('not-found-report');
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area !== 'local' || ![SYNC_ACCOUNT_KEY, PRIVACY_CONSENT_KEY, 'auto-mark'].some(key => Object.hasOwn(changes, key))) return;
+    accountActivityEpoch++;
+    accountActivityCache = null;
+    syncAccountActive = false;
+    document.getElementById('resume').hidden = true;
+    document.getElementById('resume').textContent = '';
+    document.getElementById('resume-label').hidden = true;
+    document.getElementById('watch-cycle-card').hidden = true;
+    set('watch-completion', '');
+    set('watch-current', '');
+    set('watch-feedback', '');
+    document.getElementById('watch-actions').replaceChildren();
+    document.getElementById('resume-sync').disabled = true;
+    document.getElementById('resume-sync').dataset.accountAllowed = '0';
+    autoMarkToggle.checked = false;
+    autoMarkToggle.disabled = true;
+    if (statsInitialized) renderStats(stored['watch-history']);
+  });
+
+  async function refreshAccountActivity() {
+    if (!syncAccountActive || !Number.isSafeInteger(currentUserId)) return;
+    const userId = currentUserId;
+    const revision = localWriteRevision;
+    const epoch = accountActivityEpoch;
+    const current = () => syncAccountActive && currentUserId === userId
+      && localWriteRevision === revision && accountActivityEpoch === epoch;
+    try {
+      const response = await requestBackground('popup-progress-all', { expectedUserId: userId, purpose: 'activity' });
+      if (!current()) return;
+      if (response?.ok) {
+        accountActivityCache = { userId, byAnime: response.payload?.progress_all,
+          fetchedAt: response.payload?.fetchedAt || 0 };
+        renderStats(stored['watch-history'], accountActivityCache, userId);
+      } else {
+        accountActivityCache = null;
+        renderStats(stored['watch-history']);
+      }
+    } catch {
+      if (!current()) return;
+      accountActivityCache = null;
+      renderStats(stored['watch-history']);
+    }
+  }
   const reportButton = document.getElementById('report-anime-miss');
   const reportDetail = document.getElementById('report-anime-miss-detail');
   const animeDetailIds = [
@@ -260,6 +530,24 @@
     if (!canReport) {
       reportDetail.textContent = t('reloadBeforeReport');
     }
+  }
+
+  function renderPageUnavailable(title, detail, canReload = false) {
+    setCheck('anime-check', 'pending', '·', t(title), t(detail));
+    for (const id of animeDetailIds) document.getElementById(id).hidden = true;
+    reportSection.hidden = true;
+    reportButton.disabled = true;
+    const recovery = document.getElementById('page-recovery');
+    recovery.hidden = !canReload;
+    document.getElementById('reload-page').addEventListener('click', async () => {
+      if (!confirm(t('confirmReloadPage'))) return;
+      try {
+        await chrome.tabs.reload(tab.id);
+        window.close();
+      } catch {
+        document.getElementById('page-recovery-detail').textContent = t('reloadPageFailed');
+      }
+    });
   }
 
   reportButton.addEventListener('click', async () => {
@@ -288,14 +576,30 @@
     }
   });
 
-  if (!state) {
-    renderAnimeNotFound(false);
+  if (!consentAccepted) {
+    renderPageUnavailable('consentRequiredTitle', 'syncOffUntilConsent');
+    return;
+  }
+  if (!pageSupported) {
+    renderPageUnavailable('unsupportedPageTitle', 'unsupportedPageDetail');
+    return;
+  }
+  if (!detectorConnected) {
+    renderPageUnavailable('detectorDisconnectedTitle', 'detectorDisconnectedDetail', true);
+    return;
+  }
+  if (!state || state.navigationToken !== detectorDocumentToken || state.pageUrl !== tab.url) {
+    renderPageUnavailable('findingAnimePage', 'checkingPageMetadata');
     return;
   }
   const recognition = state.recognition;
   const player = state.player;
   const players = Object.values(state.players || {});
   const animeFound = Boolean(recognition?.title);
+  if (!animeFound && !state.probe) {
+    renderPageUnavailable('findingAnimePage', 'checkingPageMetadata');
+    return;
+  }
   if (!animeFound) {
     renderAnimeNotFound(Boolean(state.probe && Number.isInteger(tab?.id)));
     return;
@@ -303,13 +607,6 @@
   reportSection.hidden = true;
   for (const id of animeDetailIds) document.getElementById(id).hidden = false;
   document.getElementById('account-warning').hidden = true;
-  if (consentAccepted) {
-    await renderAccount();
-  } else {
-    document.getElementById('account-label').textContent = t('syncOffUntilConsent');
-    autoMarkToggle.disabled = true;
-    document.getElementById('resume-sync').disabled = true;
-  }
   renderStats(stored['watch-history']);
   const playerFound = Boolean(player);
   // Episode is optional — movies and unmarked players are still fully tracked.
@@ -341,10 +638,21 @@
   // (KAN-2715) — no user action needed, so no UI for it here.
   set('title', recognition?.title);
   const primaryAction = document.getElementById('anime-primary-action');
+  const catalogYear = match?.status === 'ok' && match.slug && Number.isSafeInteger(match.year) && match.year > 0
+    ? String(match.year) : '';
+  const yearElement = document.getElementById('anime-year');
+  yearElement.textContent = catalogYear;
+  yearElement.hidden = !catalogYear;
+  document.getElementById('anime-year-separator').hidden = !catalogYear;
   if (match?.status === 'ok' && match.slug) {
     primaryAction.href = `${siteBase}/${siteLocale}/anime/${match.slug}-${match.animeId}`;
     primaryAction.hidden = false;
-    set('anireko-match', `${t('catalogPrefix')} ${match.title}${match.year ? ` (${match.year})` : ''}${match.manual ? ` · ${t('manualMatchMark')}` : ''}`);
+    const sameTitle = typeof match.title === 'string' && typeof recognition.title === 'string'
+      && match.title.trim() === recognition.title.trim();
+    const catalogNote = sameTitle
+      ? (match.manual ? t('manualMatchMark') : '')
+      : `${t('catalogPrefix')} ${match.title}${match.manual ? ` · ${t('manualMatchMark')}` : ''}`;
+    set('anireko-match', catalogNote);
   } else {
     primaryAction.hidden = true;
     set('anireko-match', match?.status === 'ambiguous'
@@ -467,9 +775,37 @@
   });
   // Compatibility is supporting context here; the anime page is the popup's
   // single primary destination, so we deliberately avoid a competing link.
+  // Publish validated local fields before any account/history network wait.
+  const episode = player?.episode ?? recognition?.episode;
+  set('episode', episode != null ? t('episodeLabel', String(episode)) : t('episodeUnknown'));
+  set('voice', state.voice || recognition?.voice);
+  set('player', player?.player);
+  const playerCount = players.length || (player?.player === 'iframe-shell' ? 1 : null);
+  set('player-count', playerCount);
+  document.getElementById('player-count-label').textContent = playerCount
+    ? ` ${t(`playerCount${pluralCategory(playerCount)}`)}`
+    : '';
+  const rate = Number.isFinite(player?.playbackRate) ? player.playbackRate : 1;
+  const rateSuffix = rate !== 1 ? ` ×${rate}` : '';
+  set('status', player?.watched ? t('statusWatched')
+    : player?.playing ? `${t('statusWatching')}${rateSuffix}`
+      : player?.playbackStarted ? `${t('statusPaused')}${rateSuffix}` : playerFound ? t('statusWaiting') : null);
+  document.getElementById('status').className = `status-chip${player?.watched ? ' ok' : ''}`;
+  set('progress', player?.progress == null ? null : `${(player.progress * 100).toFixed(1)}%`);
+  const hint = document.getElementById('hint');
+  if (playerReady || (playerFound && matchConfirmed)) hint.hidden = true;
+  else set('hint', matchConfirmed
+    ? t('animeFoundPlayVideo')
+    : t('catalogMatchNotConfirmed'));
+
+  await renderAccount();
+  void refreshAccountActivity();
   const taste = state.taste;
+  const tasteAccountCurrent = Number.isInteger(currentUserId) && currentUserId > 0
+    && taste?.userKey === `user:${currentUserId}`
+    && Number(taste.animeId) === Number(match?.animeId);
   const tasteElement = document.getElementById('taste-match');
-  if (taste?.status === 'ok' && Number.isFinite(taste.percent)) {
+  if (tasteAccountCurrent && taste.status === 'ok' && Number.isFinite(taste.percent)) {
     const verdicts = {
       very_likely: t('verdictVeryLikely'),
       likely: t('verdictLikely'),
@@ -488,7 +824,7 @@
     tasteElement.replaceChildren(percent, ` · ${verdicts[taste.labelKey] || verdicts.mixed}`);
   } else {
     set('taste-match', taste?.status === 'guest' ? t('loginForMatch')
-      : taste?.status === 'no-data' ? t('notEnoughTasteData')
+      : tasteAccountCurrent && taste.status === 'no-data' ? t('notEnoughTasteData')
         : null);
   }
   // «Где остановился» (KAN-2725): открыл это аниме на любом сайте → сразу видно
@@ -499,38 +835,242 @@
   // Пока видео активно играет — строка не нужна (инфа живёт в «Прогресс») и
   // сеть не дёргаем вовсе. Кнопка «Синхронизировать» форсит bulk-GET с
   // кулдауном 60с (кейс: только что смотрел с другого устройства).
-  const RESUME_BULK_TTL_MS = 30 * 60 * 1000;
   const SYNC_COOLDOWN_MS = 60 * 1000;
+  // Unknown/adopted history must never borrow a previous cycle's legacy resume.
+  let watchProjection = null;
+  const watchCard = document.getElementById('watch-cycle-card');
+  const watchFeedback = document.getElementById('watch-feedback');
+  const watchActions = document.getElementById('watch-actions');
+  let watchCycleRenderVersion = 0;
+  async function renderWatchCycle() {
+    if (!matchConfirmed || !syncAccountActive) return;
+    const renderVersion = ++watchCycleRenderVersion;
+    const renderEpoch = accountActivityEpoch;
+    const renderRevision = localWriteRevision;
+    const isCurrentContext = () => syncAccountActive && accountActivityEpoch === renderEpoch
+      && localWriteRevision === renderRevision;
+    const canPublish = () => renderVersion === watchCycleRenderVersion && isCurrentContext();
+    watchProjection = null;
+    await renderResume(false);
+    if (!canPublish()) return;
+    watchCard.hidden = false;
+    for (const node of [...Array.from(watchActions.children), ...watchActions.querySelectorAll('details')]) {
+      if (node.tagName === 'DETAILS' && node.watchDisclosure) {
+        watchActions[node.watchDisclosure] = node.open;
+      }
+    }
+    watchActions.replaceChildren();
+    try {
+      const response = await requestBackground('popup-watch-history', { tabId: tab?.id });
+      if (!canPublish()) return;
+      if (!response?.ok || !response.payload?.snapshot) throw new Error('history_unavailable');
+      watchProjection = response.payload;
+      const snapshot = watchProjection.snapshot;
+      if (snapshot.history_adopted !== false) {
+        document.getElementById('resume-label').hidden = true;
+        const legacyResume = document.getElementById('resume');
+        legacyResume.hidden = true;
+        legacyResume.textContent = '';
+      }
+      const origins = [...(snapshot.origins || []), ...(snapshot.selected_origin ? [snapshot.selected_origin] : [])];
+      const currentOrigin = origins.find((origin) => origin.state?.current?.cycle_id === snapshot.foreground?.cycle_id);
+      let completion = snapshot.previously_completed ? t('watchPreviouslyCompleted') : '';
+      // Component totals are tracked completions, not an invented lifetime total.
+      const count = snapshot.totals?.completed;
+      if (Number.isSafeInteger(count) && count > 0) {
+        completion += `${completion ? ' · ' : ''}${t('watchTrackedCompletions', String(count))}`;
+      }
+      set('watch-completion', completion);
+      const current = currentOrigin?.state?.current;
+      const parts = [];
+      if (snapshot.readiness !== 'ready') parts.push(t('watchReconciliation'));
+      else if (current) {
+        parts.push(t(current.kind === 'rewatching' ? 'watchRewatching' : 'statusWatching'));
+        if (current.episode != null) parts.push(t('episodeLabel', String(current.episode)));
+        if (currentOrigin.anime_id !== snapshot.requested_anime_id) parts.push(t('watchOtherTitle'));
+      } else {
+        const paused = origins.filter((origin) => origin.state?.current?.status === 'paused');
+        const seenPaused = new Set();
+        for (const origin of paused) {
+          const cycle = origin.state.current;
+          if (seenPaused.has(cycle.cycle_id)) continue;
+          seenPaused.add(cycle.cycle_id);
+          parts.push(t('watchPaused')
+            + (cycle.episode == null ? '' : ` · ${t('episodeLabel', String(cycle.episode))}`));
+        }
+      }
+      set('watch-current', parts.join(' · '));
+      watchFeedback.textContent = '';
+      const run = async (type, input) => {
+        for (const button of watchActions.querySelectorAll('button')) button.disabled = true;
+        pauseSessionStateReload = true;
+        watchFeedback.textContent = t('syncUpdating');
+        watchProjection = null;
+        await renderResume(false);
+        let failed = false;
+        try {
+          const result = await requestBackground(type, input);
+          if (!result?.ok) throw new Error('command_unresolved');
+          watchFeedback.textContent = '';
+        } catch { failed = true; }
+        finally {
+          await renderWatchCycle();
+          await renderResume(false);
+          if (failed && isCurrentContext() && !watchProjection?.pending) {
+            watchFeedback.textContent = [watchFeedback.textContent, t('watchActionFailed')].filter(Boolean).join(' · ');
+            watchCard.hidden = false;
+          }
+          pauseSessionStateReload = false;
+        }
+      };
+      if (!watchProjection.pending) {
+        if (watchProjection.repairComplete === false) watchFeedback.textContent = t('watchChoicesIncomplete');
+        let manualActions = null;
+        for (const action of watchProjection.actions || []) {
+          // Playback owns ordinary initialization/start; do not ask users to do it twice.
+          if (action.command === 'initialize' || action.command === 'start') continue;
+          if (action.command === 'reconcile') {
+            const selected = new Map();
+            const groups = action.groups || [];
+            const hint = document.createElement('p');
+            hint.className = 'watch-choice-hint';
+            hint.textContent = t('watchChoicesHint');
+            watchActions.append(hint);
+            const apply = document.createElement('button');
+            apply.type = 'button';
+            apply.textContent = t('watchAction_reconcile');
+            apply.disabled = groups.length > 0;
+            groups.forEach((group, index) => {
+              const fieldset = document.createElement('fieldset');
+              fieldset.className = 'watch-choice-group';
+              const legend = document.createElement('legend');
+            legend.textContent = group.catalog?.title_ru || group.catalog?.title
+                || group.catalog?.title_en || t('watchChoiceGroup', String(index + 1));
+              fieldset.append(legend);
+              for (const [optionIndex, option] of group.options.entries()) {
+                const label = document.createElement('label');
+                const radio = document.createElement('input');
+                radio.type = 'radio';
+                radio.name = `watch-choice-${index}`;
+                radio.value = option.cycleId;
+                radio.checked = false;
+                const detail = document.createElement('span');
+                detail.textContent = [t(option.kind === 'rewatching' ? 'watchRewatching' : 'statusWatching'),
+                  t('watchChoiceOption', String(optionIndex + 1)),
+                  t('watchTrackedCycle', String(option.ordinal)),
+                  ...(option.episode == null ? [] : [t('episodeLabel', String(option.episode))])].join(' · ');
+                radio.addEventListener('change', () => {
+                  if (!radio.checked) return;
+                  selected.set(index, option.cycleId);
+                  apply.disabled = selected.size !== groups.length;
+                });
+                label.append(radio);
+                label.append(detail);
+                fieldset.append(label);
+                const identity = document.createElement('details');
+                identity.watchDisclosure = `choice:${option.cycleId}`;
+                identity.open = !!watchActions[identity.watchDisclosure];
+                const identitySummary = document.createElement('summary');
+                identitySummary.textContent = t('watchChoiceDetails', String(optionIndex + 1));
+                const identityText = document.createElement('p');
+                identityText.textContent = [t('watchOriginalTarget', String(option.animeId)),
+                  t('watchHistoryIdentity', String(option.historyId))].join(' · ');
+                identity.append(identitySummary); identity.append(identityText);
+                fieldset.append(identity);
+              }
+              watchActions.append(fieldset);
+            });
+            apply.addEventListener('click', () => {
+              if (apply.disabled || selected.size !== groups.length) return;
+              run('popup-watch-command', { capabilityId: action.capabilityId,
+                choiceCycleIds: groups.map((_, index) => selected.get(index)) });
+            });
+            watchActions.append(apply);
+            continue;
+          }
+          const label = t(`watchAction_${action.command}`);
+          const suffix = action.ordinal == null ? '' : ` · ${t('watchTrackedCycle', String(action.ordinal))}`;
+          if (!manualActions) {
+            manualActions = document.createElement('details');
+            manualActions.watchDisclosure = 'manualControlsOpen';
+            manualActions.open = !!watchActions.manualControlsOpen;
+            const summary = document.createElement('summary');
+            summary.textContent = t('watchManualControls');
+            manualActions.append(summary);
+            watchActions.append(manualActions);
+          }
+          const button = document.createElement('button');
+          button.type = 'button';
+          button.textContent = label + suffix;
+          button.addEventListener('click', () => run('popup-watch-command', { capabilityId: action.capabilityId }));
+          manualActions.append(button);
+        }
+      }
+      if (!completion && parts.length === 0 && !watchFeedback.textContent && watchActions.children.length === 0) {
+        watchCard.hidden = true;
+      }
+    } catch {
+      if (!canPublish()) return;
+      watchProjection = null;
+      document.getElementById('resume-label').hidden = true;
+      document.getElementById('resume').hidden = true;
+      document.getElementById('resume').textContent = '';
+      set('watch-completion', t('watchHistoryUnavailable'));
+      set('watch-current', t('watchNoLegacyFallback'));
+    }
+  }
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === 'local' && changes['watch-command-pending-v1']?.oldValue
+      && changes['watch-command-pending-v1'].newValue === undefined && syncAccountActive) {
+      renderWatchCycle().then(() => renderResume(false)).catch(() => {});
+    }
+  });
+  await renderWatchCycle();
 
   async function loadResumeBulk(force) {
+    const empty = () => ({ userId: null, byAnime: {}, fetchedAt: 0 });
     if (!syncAccountActive || !Number.isInteger(currentUserId)) {
-      return { userId: null, byAnime: {}, fetchedAt: 0 };
+      return empty();
     }
-    const cacheStored = await chrome.storage.local.get('resume-bulk');
-    const cached = cacheStored['resume-bulk'];
-    const bulk = cached?.userId === currentUserId
-      ? cached
-      : { userId: currentUserId, byAnime: {}, fetchedAt: 0 };
-    if (!force && Date.now() - (bulk.fetchedAt || 0) < RESUME_BULK_TTL_MS) return bulk;
+    const requestedUserId = currentUserId;
+    const requestedRevision = localWriteRevision;
+    const requestedEpoch = accountActivityEpoch;
+    const stillCurrent = () => syncAccountActive && currentUserId === requestedUserId
+      && localWriteRevision === requestedRevision && accountActivityEpoch === requestedEpoch;
     try {
+      // The worker owns cache admission and validated offline fallback too.
       const response = await requestBackground('popup-progress-all', {
-        expectedUserId: currentUserId,
+        expectedUserId: requestedUserId,
+        force: force === true,
       });
+      if (!stillCurrent()) return empty();
       if (response?.ok) {
         const payload = response.payload;
-        bulk.byAnime = payload?.progress_all || {};
-        bulk.fetchedAt = Date.now();
-      } else if (response?.status === 401 || response?.status === 409) {
-        // Гость: помечаем «спрошено», чтобы не долбить 401 на каждый попап.
-        bulk.fetchedAt = Date.now();
+        const bulk = { userId: requestedUserId, byAnime: payload?.progress_all || {},
+          fetchedAt: Number.isFinite(payload?.fetchedAt) ? payload.fetchedAt : Date.now() };
+        if (syncAccountActive && bulk.userId === currentUserId) {
+          accountActivityCache = bulk;
+          renderStats(stored['watch-history'], bulk, currentUserId);
+        }
+        return bulk;
       }
-      chrome.storage.local.set({ 'resume-bulk': bulk });
-    } catch { /* offline — живём на локальной истории */ }
-    return bulk;
+    } catch { /* A closed worker port is not validated permission to use its old cache. */ }
+    if (stillCurrent()) {
+      accountActivityCache = null;
+      renderStats(stored['watch-history']);
+    }
+    return empty();
   }
 
   async function renderResume(force) {
+    document.getElementById('resume-label').hidden = true;
+    document.getElementById('resume').hidden = true;
+    document.getElementById('resume').textContent = '';
     if (!animeFound || player?.playing) return;
+    const confirmedAnimeId = match?.status === 'ok'
+      ? (typeof match.animeId === 'number' || typeof match.animeId === 'string' ? Number(match.animeId) : NaN)
+      : null;
+    if (confirmedAnimeId !== null && (!Number.isSafeInteger(confirmedAnimeId) || confirmedAnimeId < 1)) return;
     const fmtTime = (sec) => {
       const s = Math.max(0, Math.round(sec));
       return s >= 3600
@@ -547,9 +1087,70 @@
       return new Date(ts).toLocaleDateString(dateLocale);
     };
     let resume = null;
-    if (match?.status === 'ok' && match.animeId) {
+    const cycleOwned = syncAccountActive && watchProjection?.snapshot?.history_adopted !== false;
+    if (cycleOwned) {
+      const snapshot = watchProjection?.snapshot;
+      if (confirmedAnimeId === null || snapshot?.history_adopted !== true
+        || snapshot.readiness !== 'ready' || watchProjection.pending
+        || snapshot.user_id !== currentUserId || snapshot.requested_anime_id !== confirmedAnimeId
+        || !Number.isSafeInteger(currentUserId) || currentUserId < 1
+        || !Array.isArray(snapshot.origins)) return;
+      const uuid = (value) => typeof value === 'string'
+        && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+      const origins = new Map();
+      for (const origin of [...snapshot.origins, ...(snapshot.selected_origin ? [snapshot.selected_origin] : [])]) {
+        if (!uuid(origin?.history_id) || !Number.isSafeInteger(origin.anime_id) || origin.anime_id < 1
+          || origin.state?.anime_id !== origin.anime_id || !Number.isSafeInteger(origin.state.version)
+          || origin.state.version < 0) return;
+        const current = origin.state.current;
+        if (current !== null && (!current || !uuid(current.cycle_id)
+          || !['active', 'paused'].includes(current.status)
+          || !['watching', 'rewatching'].includes(current.kind)
+          || !Number.isSafeInteger(current.position_sec) || current.position_sec < 0 || current.position_sec > 259200
+          || (current.episode !== null && (!Number.isSafeInteger(current.episode) || current.episode < 1 || current.episode > 5000))
+          || (current.voice !== null && (typeof current.voice !== 'string' || Array.from(current.voice).length > 100)))) return;
+        const key = origin.history_id + ':' + origin.anime_id;
+        const signature = JSON.stringify([origin.state.version, current && [
+          current.cycle_id, current.status, current.kind, current.tracked_start_ordinal,
+          current.episode, current.position_sec, current.duration_sec, current.voice]]);
+        if (origins.has(key) && origins.get(key).signature !== signature) return;
+        origins.set(key, { origin, signature });
+      }
+      const open = [...origins.values()].map(({ origin }) => origin).filter(origin => origin.state.current);
+      const foreground = snapshot.foreground?.cycle_id;
+      let selected = null;
+      if (uuid(foreground)) {
+        const matches = open.filter(origin => origin.anime_id === confirmedAnimeId
+          && origin.state.current.status === 'active' && origin.state.current.cycle_id === foreground);
+        if (matches.length !== 1) return;
+        selected = matches[0];
+      } else if (foreground === null) {
+        const page = snapshot.page;
+        if (page?.has_more !== false || page.next !== null || !Number.isSafeInteger(page.origins_total)
+          || page.origins_total !== origins.size || open.length !== 1
+          || open[0].anime_id !== confirmedAnimeId || open[0].state.current.status !== 'paused') return;
+        selected = open[0];
+      } else return;
+      const current = selected.state.current;
+      if (current.position_sec <= 0) return;
+      resume = { episode: current.episode, position: current.position_sec, voice: current.voice,
+        at: NaN, cycle: true };
+      // Historical pagination can omit this row. Its update time is not watch time.
+      const rows = (Array.isArray(snapshot.cycles) ? snapshot.cycles : []).filter(row =>
+        row?.history_id === selected.history_id && row.cycle?.anime_id === selected.anime_id
+        && row.cycle.cycle_id === current.cycle_id && row.cycle.status === current.status
+        && ['episode', 'position_sec', 'duration_sec', 'voice'].every(field => row.cycle[field] === current[field]));
+      const updatedAt = rows.length === 1 ? rows[0].cycle.updated_at : null;
+      if (typeof updatedAt === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(updatedAt)) {
+        const timestamp = Date.parse(updatedAt);
+        if (Number.isFinite(timestamp) && new Date(timestamp).toISOString().replace('.000Z', 'Z') === updatedAt) {
+          resume.at = timestamp;
+        }
+      }
+    }
+    if (!cycleOwned && confirmedAnimeId !== null) {
       const bulk = await loadResumeBulk(force);
-      const progress = bulk.byAnime?.[match.animeId] ?? bulk.byAnime?.[String(match.animeId)];
+      const progress = bulk.byAnime?.[confirmedAnimeId];
       if (progress) {
         resume = {
           episode: progress.episode,
@@ -559,10 +1160,13 @@
         };
       }
     }
-    if (!resume) {
+    if (!cycleOwned && !resume) {
       const titleKey = String(recognition.title).toLocaleLowerCase().replace(/\s+/gu, ' ').trim();
       const records = Object.entries(stored['watch-history']?.records || {})
-        .filter(([recordKey]) => recordKey.startsWith(`${titleKey}::`))
+        .filter(([recordKey, record]) => confirmedAnimeId !== null
+          ? (typeof record?.animeId === 'number' || typeof record?.animeId === 'string')
+            && Number(record.animeId) === confirmedAnimeId
+          : recordKey.startsWith(`${titleKey}::`))
         .map(([, record]) => record)
         .filter((record) => Number.isFinite(record.position) && record.position > 0);
       const last = records.sort((a, b) => (b.lastWatchedAt || 0) - (a.lastWatchedAt || 0))[0];
@@ -575,13 +1179,15 @@
         };
       }
     }
+    // A Start/adoption read can finish while the older bulk read awaits.
+    if (!cycleOwned && syncAccountActive && watchProjection?.snapshot?.history_adopted !== false) return;
     if (!resume) return;
     const parts = [];
     if (resume.episode != null) parts.push(t('episodeLabel', String(resume.episode)));
     parts.push(fmtTime(resume.position));
     if (resume.voice) parts.push(resume.voice);
     const when = fmtWhen(resume.at);
-    if (when) parts.push(when);
+    if (when) parts.push(resume.cycle ? t('resumeCycleUpdated', when) : when);
     document.getElementById('resume-label').hidden = false;
     const resumeElement = document.getElementById('resume');
     resumeElement.hidden = false;
@@ -597,6 +1203,7 @@
     if (!syncAccountActive) syncButton.disabled = true;
     const lastAt = (await chrome.storage.local.get('resume-sync-at'))['resume-sync-at'] || 0;
     const remaining = SYNC_COOLDOWN_MS - (Date.now() - lastAt);
+    syncButton.disabled = !syncAccountActive || remaining > 0;
     if (remaining > 0) {
       syncButton.disabled = true;
       syncButton.title = t('syncRecently', String(Math.ceil(remaining / 1000)));
@@ -610,7 +1217,10 @@
       pauseSessionStateReload = true;
       syncButton.disabled = true;
       syncButton.textContent = t('syncUpdating');
+      watchProjection = null;
+      await renderResume(false);
       const resumeSessionReload = () => setTimeout(() => { pauseSessionStateReload = false; }, 500);
+      let refreshLegacyBulk = false;
       try {
         let currentResponse = await requestBackground('popup-sync-current', {
           tabId: tab?.id,
@@ -624,7 +1234,6 @@
             syncButton.textContent = t('syncButton');
             syncButton.disabled = syncButton.dataset.accountAllowed !== '1';
           }, 2500);
-          resumeSessionReload();
           return;
         }
         if (currentResponse.payload?.confirmationRequired === true) {
@@ -634,7 +1243,6 @@
           if (!accepted) {
             syncButton.textContent = t('syncButton');
             syncButton.disabled = syncButton.dataset.accountAllowed !== '1';
-            resumeSessionReload();
             return;
           }
           currentResponse = await requestBackground('popup-sync-current', {
@@ -648,7 +1256,6 @@
               syncButton.textContent = t('syncButton');
               syncButton.disabled = syncButton.dataset.accountAllowed !== '1';
             }, 2500);
-            resumeSessionReload();
             return;
           }
         }
@@ -660,7 +1267,6 @@
             syncButton.textContent = t('syncButton');
             syncButton.disabled = syncButton.dataset.accountAllowed !== '1';
           }, 2500);
-          resumeSessionReload();
           return;
         }
         if (!wroteData) {
@@ -669,24 +1275,26 @@
             syncButton.textContent = t('syncButton');
             syncButton.disabled = syncButton.dataset.accountAllowed !== '1';
           }, 2500);
-          resumeSessionReload();
           return;
         }
-        await chrome.storage.local.set({ 'resume-sync-at': Date.now() });
-        try {
-          await loadResumeBulk(true);
-          await renderResume(false);
-        } catch { /* account writes succeeded; a read refresh must not invert their result */ }
+        await updatePreferences('mark-resume-sync', { expectedUserId: currentUserId });
+        refreshLegacyBulk = true;
         syncButton.textContent = t('syncUpdated');
-        resumeSessionReload();
       } catch {
         syncButton.textContent = t('syncFailed');
         setTimeout(() => {
           syncButton.textContent = t('syncButton');
           syncButton.disabled = syncButton.dataset.accountAllowed !== '1';
         }, 2500);
-        resumeSessionReload();
         return;
+      } finally {
+        try {
+          // Every terminal command result needs a fresh fenced projection, including no-op/cancel/error.
+          await renderWatchCycle();
+          if (refreshLegacyBulk && watchProjection?.snapshot?.history_adopted === false) await loadResumeBulk(true);
+          await renderResume(false);
+        } catch { /* Read failures keep resume cleared without changing the command outcome. */ }
+        resumeSessionReload();
       }
       setTimeout(() => {
         syncButton.textContent = t('syncButton');
@@ -694,25 +1302,4 @@
       }, SYNC_COOLDOWN_MS);
     });
   })();
-  const episode = player?.episode ?? recognition?.episode;
-  set('episode', episode != null ? t('episodeLabel', String(episode)) : t('episodeUnknown'));
-  set('voice', state.voice || recognition?.voice);
-  set('player', player?.player);
-  const playerCount = players.length || (player?.player === 'iframe-shell' ? 1 : null);
-  set('player-count', playerCount);
-  document.getElementById('player-count-label').textContent = playerCount
-    ? ` ${t(`playerCount${pluralCategory(playerCount)}`)}`
-    : '';
-  const rate = Number.isFinite(player?.playbackRate) ? player.playbackRate : 1;
-  const rateSuffix = rate !== 1 ? ` ×${rate}` : '';
-  set('status', player?.watched ? t('statusWatched')
-    : player?.playing ? `${t('statusWatching')}${rateSuffix}`
-      : player?.playbackStarted ? `${t('statusPaused')}${rateSuffix}` : playerFound ? t('statusWaiting') : null);
-  document.getElementById('status').className = `status-chip${player?.watched ? ' ok' : ''}`;
-  set('progress', player?.progress == null ? null : `${(player.progress * 100).toFixed(1)}%`);
-  const hint = document.getElementById('hint');
-  if (playerReady) hint.hidden = true;
-  else set('hint', animeFound
-    ? t('animeFoundPlayVideo')
-    : t('openAnimeWithPlayer'));
 })();

@@ -4,6 +4,7 @@
   ]);
   const ALLOWED_TYPES = new Set([
     ...TOP_ONLY, 'detector-handshake', 'voice-change', 'episode-observed', 'player-progress',
+    'player-interaction',
     'frame-visibility',
   ]);
 
@@ -174,6 +175,12 @@
       && (typeof message.title !== 'string' || message.title.length < 2 || message.title.length > 180)) {
       return { ok: false, reason: 'payload_invalid' };
     }
+    if (message.type === 'recognition' && message.alternativeTitles != null
+      && (!Array.isArray(message.alternativeTitles) || message.alternativeTitles.length > 4
+        || message.alternativeTitles.some((title) => typeof title !== 'string'
+          || title.length < 2 || title.length > 180))) {
+      return { ok: false, reason: 'payload_invalid' };
+    }
     if (message.type === 'scout-observed'
       && (typeof message.url !== 'string' || message.url.length > 2000
         || typeof message.title !== 'string' || message.title.length > 180
@@ -214,6 +221,10 @@
     }
     if (message.type === 'voice-change'
       && (typeof message.voice !== 'string' || message.voice.length < 1 || message.voice.length > 100)) {
+      return { ok: false, reason: 'payload_invalid' };
+    }
+    if (message.type === 'player-interaction'
+      && !['pointer', 'keyboard'].includes(message.interactionKind)) {
       return { ok: false, reason: 'payload_invalid' };
     }
     return {

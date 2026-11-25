@@ -1,20 +1,124 @@
 const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
+const crypto = require('node:crypto');
 
 let sessionUser = null;
+const fixturePort = Number(process.env.ANIREKO_EXTENSION_FIXTURE_PORT || 4178);
+if (!Number.isInteger(fixturePort) || fixturePort < 1024 || fixturePort > 65535) {
+  throw new Error('invalid_extension_fixture_port');
+}
 let watchStatus = null;
 let sessionInfoRequests = 0;
 let searchRequests = 0;
+const searchQueries = [];
 const statusPosts = [];
 const diagnosticPosts = [];
 const progressPosts = [];
+const progressSavedAt = new WeakMap();
+let progressReadCount = 0;
 let progressPostsInFlight = 0;
 let maxProgressPostsInFlight = 0;
 let resetGeneration = 0;
 let failProgressPosts = false;
+let holdTasteResponses = false;
+const pendingTasteResponses = [];
+const popupReadGates = Object.fromEntries(['session', 'history'].map(kind =>
+  [kind, { held: false, status: 200, pending: [] }]));
+function finishPopupRead(kind, response, finish) {
+  const gate = popupReadGates[kind];
+  if (gate.held) {
+    gate.pending.push(() => finishPopupRead(kind, response, finish));
+    return;
+  }
+  if (response.destroyed) return;
+  if (gate.status !== 200) {
+    response.writeHead(gate.status, { 'content-type': 'application/json' });
+    response.end('{}');
+    return;
+  }
+  finish();
+}
+function releasePopupReads(kind) {
+  const gate = popupReadGates[kind];
+  gate.held = false;
+  for (const finish of gate.pending.splice(0)) finish();
+}
+let cycleHistoryEnabled = false;
+let cycleMovie = false;
+let cycleCompleted = 1;
+let cycleRepairEnabled = false;
+let cycleLoseNextAck = false;
+let cycleLoseSettlementAck = false;
+const cycleSettlementPosts = [];
+let cycleCurrent = null;
+let cycleUpdatedAt = null;
+let cycleOmitDate = false;
+let cycleVersion = 0;
+let cycleGeneration = 0;
+const cyclePosts = [];
+const cycleHistoryId = '22222222-2222-4222-8222-222222222222';
+const cycleId = '33333333-3333-4333-8333-333333333333';
+function cycleSnapshot(animeId, page = null) {
+  const state = { anime_id: animeId, version: cycleVersion, current: cycleCurrent,
+    previously_completed: true, history_before_tracking_unknown: false,
+    lifetime_completed_count: cycleCompleted, tracked_completed_count: cycleCompleted, completed_count_lower_bound: cycleCompleted };
+  const snapshot = { user_id: sessionUser.id, requested_anime_id: animeId, effective_anime_id: animeId,
+    history_adopted: cycleHistoryEnabled, readiness: 'ready',
+    foreground: { anime_id: animeId, generation: cycleGeneration, cycle_id: cycleCurrent?.status === 'active' ? cycleId : null },
+    ...(cycleHistoryEnabled ? { primary_history_id: cycleHistoryId, start_anime_id: animeId,
+      start_state: state, previously_completed: true, reconciliation_token: 'a'.repeat(64),
+      origins: cycleCurrent ? [{ history_id: cycleHistoryId, anime_id: animeId, state }] : [],
+      totals: { started: cycleCurrent ? 2 : 1, completed: cycleCompleted, cancelled: 0, open: cycleCurrent ? 1 : 0 },
+      page: { has_more: false, next: null, origins_total: cycleCurrent ? 1 : 0 } } : {}) };
+  if (cycleHistoryEnabled && cycleCurrent && !cycleOmitDate) {
+    snapshot.cycles = [{ history_id: cycleHistoryId, cycle: { ...cycleCurrent, anime_id: animeId,
+      started_at: '2026-10-04T12:00:00Z', updated_at: cycleUpdatedAt, ended_at: null } }];
+  }
+  if (cycleRepairEnabled) {
+    const related = animeId + 1000;
+    const rows = [animeId, related].flatMap((group, index) => [1, 2].map(number => ({
+      effective_anime_id: group, anime_id: group + number - 1, history_id: cycleHistoryId,
+      cycle_id: `33333333-3333-4333-8333-${String(index * 2 + number).padStart(12, '0')}`,
+      competing: true, tracked_start_ordinal: number, episode: index * 4 + number,
+      kind: 'rewatching', catalog: { anime_id: group, title: index ? 'Связанный тайтл' : 'Текущий тайтл',
+        title_ru: null, title_en: null, season: null, season_year: null },
+    })));
+    const continuation = page?.after_choice != null;
+    const last = rows[1];
+    snapshot.readiness = 'reconciliation_required';
+    snapshot.component_choices = continuation ? rows.slice(2) : rows.slice(0, 2);
+    snapshot.page = { choices_has_more: !continuation, choices_next: continuation ? null : {
+      after_choice: { effective_anime_id: last.effective_anime_id, anime_id: last.anime_id,
+        history_id: last.history_id, cycle_id: last.cycle_id }, snapshot_token: snapshot.reconciliation_token,
+    } };
+  }
+  return snapshot;
+}
+
+function releaseTasteResponses() {
+  holdTasteResponses = false;
+  for (const finish of pendingTasteResponses.splice(0)) finish();
+}
 
 const pages = {
+  '/title-alternatives-decoy.html': ['text/html; charset=utf-8', `<!doctype html><html lang="ru"><head>
+    <meta charset="utf-8"><meta name="description" content="Смотреть аниме онлайн">
+    <title>Водное поло на грани фола</title></head><body>
+    <main><h1>Водное поло на грани фола</h1></main>
+    <aside class="recommendations"><div class="titles"><h1>Водное поло на грани фола</h1>
+    <ul class="alt-names-list"><li>Hantsu x Trash</li></ul></div></aside>
+    <iframe src="http://localhost:${fixturePort}/player.html" width="640" height="360"></iframe>
+    </body></html>`],
+  '/title-alternatives.html': ['text/html; charset=utf-8', `<!doctype html><html lang="ru"><head>
+    <meta charset="utf-8"><meta name="description" content="Смотреть аниме онлайн">
+    <meta property="og:title" content="Водное поло на грани фола — смотреть аниме онлайн">
+    <title>Водное поло на грани фола</title></head><body>
+    <div class="content-page"><div class="titles"><h1>Водное поло на грани фола</h1>
+    <ul class="alt-names-list"></ul></div></div>
+    <aside><h1>Рекомендации</h1><ul class="alt-names-list"><li>Other recommendation</li></ul></aside>
+    <iframe src="http://localhost:${fixturePort}/player.html" width="640" height="360"></iframe>
+    </body></html>`],
   '/health': ['text/plain', 'ok'],
   '/anime.html': ['text/html; charset=utf-8', `<!doctype html>
     <html lang="ru"><head>
@@ -106,10 +210,46 @@ const pages = {
       <title>Расхититель гробниц — аниме</title>
     </head><body>
       <main><h1>Расхититель гробниц аниме</h1></main>
+      <button class="display-flex" id="unrelated-action">Показать описание</button>
       <iframe id="opaque-player" src="http://localhost:4178/empty-player.html" width="800" height="450"></iframe>
     </body></html>`],
   '/empty-player.html': ['text/html; charset=utf-8', `<!doctype html>
-    <html><body><div id="proprietary-player">no html5 video here</div></body></html>`],
+    <html><body><div id="proprietary-player">
+      <button id="start-player">Play</button>
+      <span>no html5 video here</span>
+    </div></body></html>`],
+  '/click-to-play-anime.html': ['text/html; charset=utf-8', `<!doctype html>
+    <html lang="ru"><head>
+      <meta charset="utf-8">
+      <meta property="og:title" content="Расхититель гробниц — смотреть аниме онлайн">
+      <title>Расхититель гробниц — аниме</title>
+    </head><body>
+      <main><h1>Расхититель гробниц аниме</h1></main>
+      <iframe id="click-player" src="http://localhost:4178/click-player.html" width="800" height="450"></iframe>
+    </body></html>`],
+  '/click-player.html': ['text/html; charset=utf-8', `<!doctype html>
+    <html><body><div id="provider-player">
+      <button id="start-player">Play</button>
+    </div><script>
+      document.getElementById('start-player').addEventListener('click', () => {
+        const video = document.createElement('video');
+        video.id = 'started-video';
+        video.src = '/episode.mp4';
+        video.muted = true;
+        video.style.cssText = 'display:block;width:800px;height:450px';
+        document.getElementById('provider-player').appendChild(video);
+        video.play();
+      });
+    </script></body></html>`],
+  '/missing-catalog-broken-anime.html': ['text/html; charset=utf-8', `<!doctype html>
+    <html lang="ru"><head>
+      <meta charset="utf-8">
+      <meta property="og:title" content="Совсем неизвестное аниме — смотреть онлайн">
+      <title>Совсем неизвестное аниме</title>
+    </head><body>
+      <main><h1>Совсем неизвестное аниме</h1></main>
+      <iframe id="opaque-player" src="http://localhost:4178/empty-player.html" width="800" height="450"></iframe>
+    </body></html>`],
   '/shell-player.html?episode=6&translations=false': ['text/html; charset=utf-8', `<!doctype html>
     <html><body><div id="proprietary-player">video starts only after user interaction</div></body></html>`],
   // Movie page: full-length video, no episode markup anywhere (KAN-2714).
@@ -305,9 +445,116 @@ pages['/lazy-iframeCVH.html?episode=2'] = ['text/html; charset=utf-8', `<!doctyp
   </body></html>`];
 
 const server = http.createServer((request, response) => {
+  if (request.url.startsWith('/__test/cycle-history')) {
+    cycleHistoryEnabled = true;
+    const settings = new URL(request.url, 'http://localhost').searchParams;
+    if (['active', 'paused'].includes(settings.get('resume'))) {
+      cycleCurrent = { cycle_id: cycleId, status: settings.get('resume'), kind: 'rewatching',
+        tracked_start_ordinal: 2, episode: 1, position_sec: 1371, duration_sec: 1500, voice: 'Dream Cast' };
+      cycleVersion++; cycleGeneration++;
+      cycleUpdatedAt = '2026-10-05T12:00:00Z';
+      cycleOmitDate = settings.get('noDate') === '1';
+    }
+    if (settings.get('movie') === '1') cycleMovie = true;
+    if (settings.get('repair') === '1') cycleRepairEnabled = true;
+    if (settings.get('lostAck') === '1') { cycleLoseNextAck = true; cycleLoseSettlementAck = true; }
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ posts: cyclePosts, settlementPosts: cycleSettlementPosts }));
+    return;
+  }
+  if (request.url.startsWith('/api/extension/history.php')) {
+    const query = new URL(request.url, 'http://localhost').searchParams;
+    if (request.method === 'GET') {
+      finishPopupRead('history', response, () => {
+      if (!sessionUser || Number(query.get('expected_user_id')) !== sessionUser.id) {
+        response.writeHead(409, { 'content-type': 'application/json' }); response.end('{}'); return;
+      }
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify(cycleSnapshot(Number(query.get('anime_id')), query.has('page') ? JSON.parse(query.get('page')) : null)));
+      });
+      return;
+    }
+    let body = '';
+    request.on('data', (chunk) => { body += chunk; });
+    request.on('end', () => {
+      const payload = JSON.parse(body);
+      if (payload.operation === 'settle') {
+        const original = cyclePosts[0];
+        const currentUser = Number(request.headers['x-anireko-watch-expected-user']);
+        // A transport fixture, not the PostgreSQL settlement implementation.
+        if (!original || !sessionUser || currentUser !== sessionUser.id
+          || JSON.stringify(payload) !== JSON.stringify({ ...original, operation: 'settle' })) {
+          response.writeHead(409); response.end('{}'); return;
+        }
+        cycleSettlementPosts.push({ payload, currentUser });
+        const canonical = { history_id: original.history_id, anime_id: original.anime_id,
+          expected_effective_anime_id: original.expected_effective_anime_id,
+          expected_foreground_generation: original.expected_foreground_generation,
+          command: { command: 'start', command_id: original.command_id, expected_version: original.expected_version } };
+        const requestHash = crypto.createHash('sha256').update(JSON.stringify(canonical)).digest('hex');
+        if (cycleLoseSettlementAck) {
+          cycleLoseSettlementAck = false; response.writeHead(500); response.end('{}'); return;
+        }
+        response.writeHead(200, { 'content-type': 'application/json' });
+        response.end(JSON.stringify({ settlement_version: 1, outcome: 'accepted', current_user_id: currentUser,
+          history_id: original.history_id, anime_id: original.anime_id, command_id: original.command_id,
+          original_operation: 'command', command_kind: 'start', request_hash: requestHash }));
+        return;
+      }
+      if (payload.operation === 'select' && cycleRepairEnabled) {
+        const valid = sessionUser && payload.expected_user_id === sessionUser.id
+          && payload.history_id === cycleHistoryId && payload.cycle_id === null
+          && payload.reconciliation_token === 'a'.repeat(64) && payload.choices?.length === 2
+          && payload.choices[0].cycle_id === '33333333-3333-4333-8333-000000000002'
+          && payload.choices[1].cycle_id === '33333333-3333-4333-8333-000000000003';
+        if (!valid) { response.writeHead(409); response.end('{}'); return; }
+        cyclePosts.push(payload); cycleRepairEnabled = false;
+        const snapshot = cycleSnapshot(payload.anime_id);
+        response.writeHead(200, { 'content-type': 'application/json' });
+        response.end(JSON.stringify({ history_id: cycleHistoryId, anime_id: payload.anime_id,
+          foreground: snapshot.foreground, snapshot }));
+        return;
+      }
+      if (!sessionUser || payload.expected_user_id !== sessionUser.id || !cycleHistoryEnabled
+        || payload.history_id !== cycleHistoryId || payload.expected_version !== cycleVersion
+        || payload.expected_foreground_generation !== cycleGeneration) {
+        response.writeHead(409, { 'content-type': 'application/json' }); response.end('{}'); return;
+      }
+      cyclePosts.push(payload);
+      if (payload.command === 'start' && cycleCurrent === null) {
+        cycleCurrent = { cycle_id: cycleId, status: 'active', kind: 'rewatching', tracked_start_ordinal: 2,
+          episode: null, position_sec: 0, duration_sec: null, voice: null };
+        cycleGeneration++;
+      } else if (payload.command === 'pause' && cycleCurrent?.status === 'active') {
+        cycleCurrent = { ...cycleCurrent, status: 'paused' }; cycleGeneration++;
+      } else if (payload.command === 'cancel' && cycleCurrent !== null) {
+        cycleCurrent = null; cycleGeneration++;
+      } else if (payload.command === 'complete' && cycleCurrent?.status === 'active') {
+        cycleCurrent = null; cycleGeneration++; cycleCompleted++;
+      } else if (payload.command === 'resume' && cycleCurrent?.status === 'paused') {
+        cycleCurrent = { ...cycleCurrent, status: 'active' }; cycleGeneration++;
+      } else if (payload.command === 'progress' && cycleCurrent?.status === 'active') {
+        cycleCurrent = { ...cycleCurrent, episode: payload.episode, position_sec: payload.position_sec,
+          duration_sec: payload.duration_sec, voice: payload.voice };
+      } else {
+        response.writeHead(409, { 'content-type': 'application/json' }); response.end('{}'); return;
+      }
+      cycleVersion++;
+      cycleUpdatedAt = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+      const snapshot = cycleSnapshot(payload.anime_id);
+      if (cycleLoseNextAck) {
+        cycleLoseNextAck = false; response.writeHead(500); response.end('{}'); return;
+      }
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ history_id: cycleHistoryId, anime_id: payload.anime_id,
+        foreground: snapshot.foreground, state: snapshot.start_state }));
+    });
+    return;
+  }
   if (request.url.startsWith('/api/search')) {
     searchRequests += 1;
     const query = new URL(request.url, 'http://localhost').searchParams.get('q') || '';
+    searchQueries.push(query);
     const bookwormFourth = {
       id: 13124,
       title: 'Власть книжного червя: Приёмная дочь лорда',
@@ -319,7 +566,13 @@ const server = http.createServer((request, response) => {
       release_status: 'ONGOING',
       exact_alias_match: true,
     };
-    const data = /Honzuki no Gekokujou:.*4th Season$/iu.test(query)
+    const data = ['Hantsu x Torasshu', 'Hantsu x Trash', 'ハンツー×トラッシュ'].includes(query)
+      ? [{ id: 11758, title: 'Охотник и корзина', subtitle: 'Hantsu x Trash', slug: 'hantsu-x-trash',
+        type: 'OVA', episodes: 3, release_status: 'FINISHED', exact_alias_match: true }]
+      : cycleMovie && /расхититель гробниц/iu.test(query)
+      ? [{ id: 4242, title: 'Расхититель гробниц', type: 'MOVIE', episodes: 1,
+        release_status: 'FINISHED', exact_alias_match: true }]
+      : /Honzuki no Gekokujou:.*4th Season$/iu.test(query)
       ? [bookwormFourth]
       : /власть книжного червя/iu.test(query)
         ? [
@@ -430,6 +683,7 @@ const server = http.createServer((request, response) => {
   }
   if (request.url.startsWith('/api/auth/session-info.php')) {
     sessionInfoRequests += 1;
+    finishPopupRead('session', response, () => {
     response.writeHead(200, {
       'content-type': 'application/json; charset=utf-8',
       'cache-control': 'no-store',
@@ -437,9 +691,18 @@ const server = http.createServer((request, response) => {
     response.end(JSON.stringify(sessionUser
       ? { success: true, user: { ...sessionUser, avatar: '', provider: 'test', nsfw_show: false } }
       : { success: false, error: 'No session' }));
+    });
     return;
   }
   if (/^\/api\/anime\/\d+\/match/u.test(request.url)) {
+    if (holdTasteResponses) {
+      pendingTasteResponses.push(() => {
+        if (response.destroyed) return;
+        response.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+        response.end(JSON.stringify({ success: true, data: { has_profile: false, reason: 'guest' } }));
+      });
+      return;
+    }
     response.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
     response.end(JSON.stringify(sessionUser
       ? {
@@ -494,6 +757,7 @@ const server = http.createServer((request, response) => {
   }
   if (request.url.startsWith('/api/extension/progress.php')) {
     if (request.method === 'GET') {
+      progressReadCount++;
       const query = new URL(request.url, 'http://localhost').searchParams;
       if (!sessionUser || Number(query.get('expected_user_id')) !== sessionUser.id) {
         response.writeHead(409, { 'content-type': 'application/json' });
@@ -505,7 +769,8 @@ const server = http.createServer((request, response) => {
         position_sec: p.position_sec,
         duration_sec: p.duration_sec ?? null,
         voice: p.voice || '',
-        watched_at: new Date().toISOString(),
+        watched_at: progressSavedAt.get(p),
+        ...(p.anime_id === 4343 ? { title: 'Account-only anime', title_ru: 'Аниме из аккаунта' } : {}),
       });
       response.writeHead(200, { 'content-type': 'application/json' });
       if (query.get('all')) {
@@ -540,6 +805,7 @@ const server = http.createServer((request, response) => {
       setTimeout(() => {
         if (generation === resetGeneration) {
           progressPosts.push(payload);
+          progressSavedAt.set(payload, new Date().toISOString());
           progressPostsInFlight -= 1;
         }
         response.writeHead(204);
@@ -548,12 +814,29 @@ const server = http.createServer((request, response) => {
     });
     return;
   }
+  if (request.url.startsWith('/__test/progress-read-count')) {
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ reads: progressReadCount }));
+    return;
+  }
   if (request.url.startsWith('/__test/progress')) {
     response.writeHead(200, { 'content-type': 'application/json' });
     response.end(JSON.stringify(progressPosts));
     return;
   }
   // Test-only control endpoints for the e2e spec.
+  if (request.url.startsWith('/__test/popup-read-gate')) {
+    const query = new URL(request.url, 'http://localhost').searchParams;
+    const kind = query.get('kind');
+    const gate = popupReadGates[kind];
+    if (!gate) { response.writeHead(400); response.end('{}'); return; }
+    if (query.has('status')) gate.status = Number(query.get('status'));
+    if (query.get('hold') === '1') gate.held = true;
+    if (query.get('hold') === '0') releasePopupReads(kind);
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ held: gate.held, pending: gate.pending.length, status: gate.status }));
+    return;
+  }
   if (request.url.startsWith('/__test/session')) {
     const query = new URL(request.url, 'http://localhost').searchParams;
     const on = query.get('on') === '1';
@@ -569,14 +852,34 @@ const server = http.createServer((request, response) => {
     response.end(JSON.stringify({ ok: true, failProgressPosts }));
     return;
   }
+  if (request.url.startsWith('/__test/taste-hold')) {
+    const on = new URL(request.url, 'http://localhost').searchParams.get('on');
+    if (on === '1') holdTasteResponses = true;
+    if (on === '0') releaseTasteResponses();
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ pending: pendingTasteResponses.length }));
+    return;
+  }
   if (request.url.startsWith('/__test/reset')) {
+    for (const kind of Object.keys(popupReadGates)) {
+      popupReadGates[kind].status = 503;
+      releasePopupReads(kind);
+      popupReadGates[kind].status = 200;
+    }
+    cycleHistoryEnabled = false; cycleMovie = false; cycleCompleted = 1;
+    cycleRepairEnabled = false; cycleCurrent = null; cycleVersion = 0; cycleGeneration = 0; cyclePosts.length = 0;
+    cycleUpdatedAt = null; cycleOmitDate = false;
+    cycleLoseNextAck = false; cycleLoseSettlementAck = false; cycleSettlementPosts.length = 0;
+    releaseTasteResponses();
     sessionUser = null;
     watchStatus = null;
     sessionInfoRequests = 0;
     searchRequests = 0;
+    searchQueries.length = 0;
     statusPosts.length = 0;
     diagnosticPosts.length = 0;
     progressPosts.length = 0;
+    progressReadCount = 0;
     resetGeneration += 1;
     progressPostsInFlight = 0;
     maxProgressPostsInFlight = 0;
@@ -601,6 +904,7 @@ const server = http.createServer((request, response) => {
     response.writeHead(200, { 'content-type': 'application/json' });
     response.end(JSON.stringify({
       search: searchRequests,
+      searchQueries,
       sessionInfo: sessionInfoRequests,
       statusPosts: statusPosts.length,
       diagnostics: diagnosticPosts.length,
@@ -640,7 +944,7 @@ const server = http.createServer((request, response) => {
     'content-type': contentType,
     'cache-control': 'no-store',
   });
-  response.end(body);
+  response.end(typeof body === 'string' ? body.replaceAll(':4178', `:${fixturePort}`) : body);
 });
 
 function startFixtureServer() {
@@ -656,7 +960,7 @@ function startFixtureServer() {
     };
     server.once('error', onError);
     server.once('listening', onListening);
-    server.listen(4178, '0.0.0.0');
+    server.listen(fixturePort, '0.0.0.0');
   });
 }
 

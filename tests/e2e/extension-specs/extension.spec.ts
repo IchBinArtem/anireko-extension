@@ -1,12 +1,15 @@
-import { test, expect, chromium, type BrowserContext, type Page, type Worker } from '@playwright/test';
+import { test as baseTest, expect, chromium, type BrowserContext, type Page, type Worker } from '@playwright/test';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-const sourceExtensionPath = path.resolve(__dirname, '../../../extension');
-const apiBase = 'http://127.0.0.1:4178';
-const siteBase = 'http://127.0.0.2:4178';
-const playerBase = 'http://localhost:4178';
+const sourceExtensionPath = process.env.ANIREKO_EXTENSION_TEST_SOURCE
+  ? path.resolve(process.env.ANIREKO_EXTENSION_TEST_SOURCE)
+  : path.resolve(__dirname, '../../../extension');
+const fixturePort = Number(process.env.ANIREKO_EXTENSION_FIXTURE_PORT || 4178);
+const apiBase = `http://127.0.0.1:${fixturePort}`;
+const siteBase = `http://127.0.0.2:${fixturePort}`;
+const playerBase = `http://localhost:${fixturePort}`;
 
 let context: BrowserContext;
 let worker: Worker;
@@ -14,6 +17,69 @@ let extensionId: string;
 let userDataDir: string;
 let testRootDir: string;
 let extensionPath: string;
+
+async function cleanupExtensionFixture(
+  close: () => Promise<void>,
+  roots: [string | undefined, string][],
+  remove: (root: string) => void = (root) => fs.rmSync(root, { recursive: true, force: true })
+): Promise<unknown[]> {
+  const errors: unknown[] = [];
+  try { await close(); } catch (error) { errors.push(error); }
+  for (const [root, prefix] of roots) {
+    if (!root) continue;
+    try {
+      const resolved = path.resolve(root);
+      if (path.dirname(resolved) !== path.resolve(os.tmpdir()) || !path.basename(resolved).startsWith(prefix)
+        || (fs.existsSync(resolved) && fs.lstatSync(resolved).isSymbolicLink())) {
+        throw new Error('unsafe_extension_fixture_cleanup_target');
+      }
+      remove(resolved);
+    } catch (error) { errors.push(error); }
+  }
+  return errors;
+}
+
+const test = baseTest.extend<{}, { extensionLifecycle: void }>({
+  extensionLifecycle: [async ({}, use) => {
+    let setupError: unknown;
+    try {
+      await setupExtension();
+      await use();
+    } catch (error) {
+      setupError = error;
+      throw error;
+    } finally {
+      const errors = await cleanupExtensionFixture(() => context?.close() ?? Promise.resolve(),
+        [[userDataDir, 'anireko-extension-e2e-'], [testRootDir, 'anireko-extension-build-']]);
+      if (errors.length && setupError !== undefined) console.error('secondary extension fixture cleanup failures', errors);
+      else if (errors.length) throw new AggregateError(errors, 'extension fixture cleanup failed');
+    }
+  }, { scope: 'worker', auto: true }],
+});
+
+test('extension fixture cleanup attempts all owned roots and preserves foreign state', async () => {
+  const first = fs.mkdtempSync(path.join(os.tmpdir(), 'anireko-extension-e2e-'));
+  const second = fs.mkdtempSync(path.join(os.tmpdir(), 'anireko-extension-build-'));
+  const foreign = fs.mkdtempSync(path.join(os.tmpdir(), 'anireko-foreign-fixture-'));
+  fs.writeFileSync(path.join(foreign, 'sentinel'), 'preserve');
+  try {
+    const attempted: string[] = [];
+    const errors = await cleanupExtensionFixture(async () => { throw new Error('close failure'); },
+      [[first, 'anireko-extension-e2e-'], [second, 'anireko-extension-build-'], [foreign, 'anireko-extension-e2e-']],
+      (root) => { attempted.push(root); if (root === first) throw new Error('first delete failure'); fs.rmSync(root, { recursive: true }); });
+    expect(errors).toHaveLength(3);
+    expect(attempted).toEqual([first, second]);
+    expect(fs.existsSync(first)).toBe(true);
+    expect(fs.existsSync(second)).toBe(false);
+    expect(fs.readFileSync(path.join(foreign, 'sentinel'), 'utf8')).toBe('preserve');
+    // Partial setup: no browser/profile yet, but an exact build directory exists.
+    const partial = await cleanupExtensionFixture(async () => {}, [[undefined, 'anireko-extension-e2e-'], [first, 'anireko-extension-e2e-']]);
+    expect(partial).toEqual([]);
+    expect(fs.existsSync(first)).toBe(false);
+  } finally {
+    for (const root of [first, second, foreign]) fs.rmSync(root, { recursive: true, force: true });
+  }
+});
 
 async function setSyntheticPlayback(
   frame: ReturnType<Page['frameLocator']>,
@@ -27,6 +93,7 @@ async function setSyntheticPlayback(
         try {
           media.muted = true;
           if (!next.paused) await media.play();
+          else media.pause();
           if (Math.abs(media.currentTime - next.currentTime) > 0.05) {
             await new Promise<void>((seeked) => {
               media.addEventListener('seeked', () => seeked(), { once: true });
@@ -77,7 +144,7 @@ async function waitForDetectorReady(tabId: number) {
   }, { timeout: 10_000 }).toBeGreaterThan(0);
 }
 
-test.beforeAll(async () => {
+async function setupExtension() {
   expect(fs.existsSync(path.join(sourceExtensionPath, 'manifest.json'))).toBe(true);
   testRootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'anireko-extension-build-'));
   extensionPath = path.join(testRootDir, 'extension');
@@ -92,7 +159,7 @@ test.beforeAll(async () => {
   fs.writeFileSync(path.join(extensionPath, 'lib', 'runtime-config.js'), `
 (function initRuntimeConfig(global) {
   global.AniRekoRuntimeConfig = Object.freeze({
-    apiBase: 'http://127.0.0.1:4178',
+    apiBase: '${apiBase}',
     testMode: true,
   });
 })(typeof globalThis !== 'undefined' ? globalThis : self);
@@ -104,6 +171,7 @@ test.beforeAll(async () => {
     locale: 'ru-RU',
     args: [
       '--lang=ru',
+      '--enable-unsafe-extension-debugging',
       `--disable-extensions-except=${extensionPath}`,
       `--load-extension=${extensionPath}`,
     ],
@@ -130,17 +198,11 @@ test.beforeAll(async () => {
   const setupTabId = await extensionTabId(`${siteBase}/*`);
   await expect.poll(async () => (await storedTabState(setupTabId))?.match?.status ?? null).toBe('ok');
   await setupPage.close();
-});
-
-test.afterAll(async () => {
-  await context?.close();
-  fs.rmSync(userDataDir, { recursive: true, force: true });
-  fs.rmSync(testRootDir, { recursive: true, force: true });
-});
+}
 
 test.beforeEach(async () => {
   await worker.evaluate(async () => {
-    await fetch('http://127.0.0.1:4178/__test/reset');
+    await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/reset');
     (globalThis as any).AniRekoTestHooks.resetVolatileCaches();
     const access = await chrome.storage.local.get(['privacy-consent']);
     await chrome.storage.local.clear();
@@ -148,7 +210,858 @@ test.beforeEach(async () => {
   });
 });
 
-test('renders the English manifest and popup for an English Chrome UI', async () => {
+async function popupReadGate(kind: 'session' | 'history', query = '') {
+  return worker.evaluate(async ({ kind, query }) => {
+    const response = await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase
+      + '/__test/popup-read-gate?kind=' + kind + query);
+    return response.json();
+  }, { kind, query });
+}
+
+async function localPopupPage() {
+  await worker.evaluate(async () => {
+    const base = (globalThis as any).AniRekoRuntimeConfig.apiBase;
+    await fetch(base + '/__test/session?on=1&user=18');
+    await fetch(base + '/__test/cycle-history');
+  });
+  const page = await context.newPage();
+  await page.goto(`${siteBase}/anime.html`);
+  const tabId = await extensionTabId(`${siteBase}/*`);
+  await expect.poll(async () => (await storedTabState(tabId))?.match?.status).toBe('ok');
+  await waitForDetectorReady(tabId);
+  await setSyntheticPlayback(page.frameLocator('#main-player'), '#main-video', { currentTime: 1, paused: false });
+  await setSyntheticPlayback(page.frameLocator('#main-player'), '#main-video', { currentTime: 1, paused: true });
+  await expect.poll(async () => (await storedTabState(tabId))?.player?.playing).toBe(false);
+  await worker.evaluate(async () => {
+    await chrome.storage.local.set({ 'auto-mark': true, 'sync-account': { id: 18, name: 'TestUser' } });
+    const now = new Date();
+    const key = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+    await (globalThis as any).AniRekoTestHooks.seedLocalHistory({ records: {}, days: {
+      [key]: { watchedSeconds: 600, episodeKeys: ['local::2'] },
+    } });
+  });
+  return { page, tabId };
+}
+
+for (const status of ['active', 'paused', 'noDate'] as const) {
+  test(`popup current-cycle resume restores saved position and voice (${status})`, async ({}, testInfo) => {
+    const { page, tabId } = await localPopupPage();
+    let popup: Page | null = null;
+    try {
+      await worker.evaluate(async (mode) => {
+        const base = (globalThis as any).AniRekoRuntimeConfig.apiBase;
+        await fetch(base + '/__test/cycle-history?resume=' + (mode === 'noDate' ? 'paused&noDate=1' : mode));
+      }, status);
+      // Resume is intentionally hidden during active playback. Establish the
+      // sensor's paused state, not only its earlier seek position, before opening.
+      await setSyntheticPlayback(page.frameLocator('#main-player'), '#main-video', { currentTime: 1, paused: true });
+      await expect.poll(async () => (await storedTabState(tabId))?.player?.playing).toBe(false);
+      popup = await openPopup(tabId);
+      await expect(popup.locator('#resume-label')).toHaveText('Где остановился');
+      await expect(popup.locator('#resume')).toBeVisible();
+      await expect(popup.locator('#resume')).toContainText('Серия 1 · 22:51 · Dream Cast');
+      if (status === 'noDate') await expect(popup.locator('#resume')).toHaveText('Серия 1 · 22:51 · Dream Cast');
+      else await expect(popup.locator('#resume')).toContainText('Обновлено:');
+      const resumeBox = await popup.locator('#anime-fields').boundingBox();
+      const statsBox = await popup.locator('#stats-card').boundingBox();
+      expect(resumeBox).not.toBeNull(); expect(statsBox).not.toBeNull();
+      expect(resumeBox!.y).toBeLessThan(statsBox!.y);
+      for (const width of [360, 390]) {
+        await popup.setViewportSize({ width, height: 850 });
+        const positions = await popup.evaluate(() => {
+          const anime = document.getElementById('anime-check')!.getBoundingClientRect();
+          const resume = document.getElementById('anime-fields')!.getBoundingClientRect();
+          const player = document.getElementById('player-check')!.getBoundingClientRect();
+          const change = document.getElementById('match-change')!;
+          return { order: anime.bottom <= resume.top && resume.bottom <= player.top,
+            changeHeight: change.getBoundingClientRect().height,
+            changeBackground: getComputedStyle(change).backgroundColor };
+        });
+        expect(positions.order).toBe(true);
+        expect(positions.changeHeight).toBeGreaterThanOrEqual(24);
+        expect(positions.changeBackground).toBe('rgba(0, 0, 0, 0)');
+      }
+      await expect(popup.locator('#match-change')).toHaveText('Не то аниме?');
+      const commands = () => worker.evaluate(async () => (await (await fetch(
+        (globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/cycle-history')).json()).posts);
+      expect(await commands()).toEqual([], 'read-only resume opening cannot start, adopt or migrate');
+      await popup.setViewportSize({ width: 390, height: 850 });
+      const resumeScreenshot = testInfo.outputPath('current-cycle-resume.png');
+      await popup.screenshot({ path: resumeScreenshot, fullPage: true });
+      await testInfo.attach('current-cycle-resume', { path: resumeScreenshot, contentType: 'image/png' });
+      if (status === 'active') {
+        await popup.getByText('Управление вручную', { exact: true }).click();
+        await popup.getByRole('button', { name: /^Приостановить просмотр/ }).click();
+        await expect(popup.locator('#watch-current')).toContainText('Просмотр на паузе');
+        await expect(popup.locator('#resume')).toContainText('Серия 1 · 22:51 · Dream Cast');
+        expect((await commands()).map((item: any) => item.command)).toEqual(['pause']);
+      }
+      await popup.close();
+      popup = await openPopup(tabId);
+      await expect(popup.locator('#resume')).toContainText('Серия 1 · 22:51 · Dream Cast');
+    } finally {
+      await popup?.close();
+      await page.close();
+    }
+  });
+}
+
+test('popup manual Sync refreshes the authoritative cycle resume in the same popup', async () => {
+  const { page, tabId } = await localPopupPage();
+  let popup: Page | null = null;
+  try {
+    await worker.evaluate(async () => { await fetch(
+      (globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/cycle-history?resume=active'); });
+    popup = await openPopup(tabId);
+    await expect(popup.locator('#resume')).toContainText('22:51 · Dream Cast');
+    await expect(popup.locator('#resume-sync')).toBeEnabled();
+    await popup.locator('#resume-sync').click();
+    await expect(popup.locator('#resume-sync')).toHaveText('✓ обновлено');
+    await expect(popup.locator('#resume')).toContainText('Серия 2 · 0:01 · AniTime Voice');
+    await expect(popup.locator('#resume')).not.toContainText('Dream Cast');
+    const commands = await worker.evaluate(async () => (await (await fetch(
+      (globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/cycle-history')).json()).posts);
+    expect(commands.filter((item: any) => item.command === 'progress')).toHaveLength(1);
+    expect(commands.find((item: any) => item.command === 'progress')).toMatchObject({ episode: 2, position_sec: 1, voice: 'AniTime Voice' });
+  } finally {
+    await popup?.close();
+    await page.close();
+  }
+});
+
+for (const kind of ['session', 'history'] as const) {
+  for (const warm of [false, true]) {
+    test(`popup local fields precede held ${kind} HTTP response (${warm ? 'warm' : 'cold'})`, async ({}, testInfo) => {
+      const { page, tabId } = await localPopupPage();
+      let popup: Page | null = null;
+      try {
+        if (warm) {
+          const first = await openPopup(tabId);
+          await expect(first.locator('#watch-completion')).toContainText('Уже просмотрено');
+          await first.close();
+        }
+        const postsBefore = await worker.evaluate(async () => (await (await fetch(
+          (globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/cycle-history')).json()).posts);
+        await popupReadGate(kind, '&hold=1');
+        popup = await context.newPage();
+        await popup.addInitScript(() => {
+          const observer = new MutationObserver(() => {
+            const title = document.getElementById('anime-check-detail')?.textContent;
+            const progress = document.getElementById('progress')?.textContent;
+            if (title && progress && progress.includes('%') && (window as any).__localFirstMs == null) {
+              (window as any).__localFirstMs = performance.now();
+              observer.disconnect();
+            }
+          });
+          observer.observe(document, { subtree: true, childList: true, characterData: true });
+        });
+        await popup.goto(`chrome-extension://${extensionId}/popup.html?tabId=${tabId}`);
+        await expect.poll(async () => (await popupReadGate(kind)).pending).toBeGreaterThan(0);
+        await expect(popup.locator('#anime-check-detail')).toContainText('Расхититель гробниц', { timeout: 1500 });
+        await expect(popup.locator('#progress')).toHaveText(/\d+\.\d%/, { timeout: 1500 });
+        await expect(popup.locator('#episode')).toContainText('2');
+        await expect(popup.locator('#player')).not.toHaveText('—');
+        await expect(popup.locator('#status')).not.toHaveText('—');
+        await expect(popup.locator('#week-chart .activity-cell')).toHaveCount(84);
+        await expect(popup.locator('#today-time')).toHaveText('10 мин');
+        await expect(popup.locator('#resume')).toBeHidden();
+        await expect(popup.locator('#resume-sync')).toBeDisabled();
+        if (kind === 'session') {
+          await expect(popup.locator('#auto-mark')).toBeDisabled();
+          await expect(popup.locator('#taste-match')).toHaveText('—');
+          await expect(popup.locator('#watch-cycle-card')).toBeHidden();
+        }
+        const held = await popupReadGate(kind);
+        expect(held.held).toBe(true);
+        expect(held.pending).toBeGreaterThan(0);
+        const localFirstMs = await popup.evaluate(() => (window as any).__localFirstMs);
+        expect(Number.isFinite(localFirstMs)).toBe(true);
+        await testInfo.attach('local-before-network', { body: JSON.stringify({ kind, warm, localFirstMs, held }),
+          contentType: 'application/json' });
+        console.log('popup local-before-network ' + JSON.stringify({ kind, warm, localFirstMs }));
+        await popupReadGate(kind, '&hold=0');
+        await expect(popup.locator('#watch-completion')).toContainText('Уже просмотрено');
+        await expect(popup.locator('#resume-sync')).toBeEnabled();
+        await expect(popup.locator('#resume')).toBeHidden();
+        const postsAfter = await worker.evaluate(async () => (await (await fetch(
+          (globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/cycle-history')).json()).posts);
+        expect(postsAfter).toEqual(postsBefore, 'popup opening only reads, including warm cache');
+      } finally {
+        await popupReadGate(kind, '&hold=0&status=200');
+        await popup?.close();
+        await page.close();
+      }
+    });
+  }
+}
+
+test('popup keeps local UI on failed session and rejects old taste after an account switch during the read', async () => {
+  const { page, tabId } = await localPopupPage();
+  let popup: Page | null = null;
+  try {
+    await popupReadGate('session', '&hold=1');
+    popup = await openPopup(tabId);
+    await expect.poll(async () => (await popupReadGate('session')).pending).toBeGreaterThan(0);
+    await expect(popup.locator('#progress')).toHaveText(/\d+\.\d%/, { timeout: 1500 });
+    await worker.evaluate(async () => {
+      await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/session?on=1&user=953');
+    });
+    await popupReadGate('session', '&hold=0');
+    await expect(popup.locator('#account-label')).toContainText('Demo YooKassa');
+    await expect(popup.locator('#account-warning')).toBeVisible();
+    await expect(popup.locator('#resume-sync')).toBeDisabled();
+    await expect(popup.locator('#taste-match')).not.toContainText('87%');
+    await popup.close();
+    await popupReadGate('session', '&hold=1&status=503');
+    popup = await openPopup(tabId);
+    await expect.poll(async () => (await popupReadGate('session')).pending).toBeGreaterThan(0);
+    await expect(popup.locator('#progress')).toHaveText(/\d+\.\d%/, { timeout: 1500 });
+    await popupReadGate('session', '&hold=0');
+    await expect(popup.locator('#account-login')).toBeVisible();
+    await expect(popup.locator('#auto-mark')).toBeDisabled();
+    await expect(popup.locator('#resume-sync')).toBeDisabled();
+    await expect(popup.locator('#taste-match')).not.toContainText('%');
+  } finally {
+    await popupReadGate('session', '&hold=0&status=200');
+    await popup?.close();
+    await page.close();
+  }
+});
+
+// Test setup only: the user-facing Start control is intentionally absent.
+// Exercise the existing immutable capability transport to create recovery fixtures.
+async function startCycleFixture(popup: Page, tabId: number) {
+  // The removed button used to provide this readiness wait implicitly.
+  await expect(popup.locator('#watch-completion')).toContainText('Уже просмотрено');
+  const outcome = await popup.evaluate(async (tabId) => {
+    const runtime = await chrome.runtime.sendMessage({ type: 'popup-runtime-info' });
+    const expectedRevision = runtime.payload.localWriteRevision;
+    const history = await chrome.runtime.sendMessage({ type: 'popup-watch-history', tabId, expectedRevision });
+    const start = history.payload?.actions?.find((action: any) => action.command === 'start');
+    if (!start) throw new Error('synthetic_start_capability_missing');
+    const reply = await chrome.runtime.sendMessage({ type: 'popup-watch-command', capabilityId: start.capabilityId, expectedRevision });
+    const pending = await chrome.storage.local.get('watch-command-pending-v1');
+    return { ok: reply?.ok === true, status: reply?.status, error: reply?.payload?.error || reply?.error,
+      pending: Object.hasOwn(pending, 'watch-command-pending-v1') };
+  }, tabId);
+  if (!outcome.ok && !outcome.pending) throw new Error('synthetic_start_not_admitted: ' + JSON.stringify(outcome));
+  await popup.reload();
+}
+
+test('paused playback preserves previous completion and exposes optional manual controls', async ({}, testInfo) => {
+  await worker.evaluate(async () => {
+    await chrome.storage.local.set({ 'auto-mark': true, 'sync-account': { id: 18, name: 'TestUser' } });
+    const base = (globalThis as any).AniRekoRuntimeConfig.apiBase;
+    await fetch(base + '/__test/session?on=1&user=18');
+    await fetch(base + '/__test/cycle-history');
+  });
+  const page = await context.newPage();
+  let popup: Page | null = null;
+  try {
+    await page.goto(`${siteBase}/anime.html`);
+    const tabId = await extensionTabId(`${siteBase}/*`);
+    await expect.poll(async () => (await storedTabState(tabId))?.match?.status).toBe('ok');
+    popup = await openPopup(tabId);
+    await popup.setViewportSize({ width: 390, height: 600 });
+    await expect(popup.locator('#watch-cycle-card')).toBeVisible();
+    await expect(popup.locator('#watch-completion')).toHaveText('Уже просмотрено · Завершено с начала учёта: 1');
+    await expect(popup.locator('#watch-current')).toBeEmpty();
+    await expect(popup.getByRole('button', { name: 'Начать новый просмотр', exact: true })).toHaveCount(0);
+    await expect(popup.getByRole('button', { name: 'Подключить историю просмотров', exact: true })).toHaveCount(0);
+    const commands = () => worker.evaluate(async () => {
+      const response = await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/cycle-history');
+      return (await response.json()).posts;
+    });
+    expect(await commands()).toEqual([]);
+    await startCycleFixture(popup, tabId);
+    await expect(popup.locator('#watch-current')).toContainText('Пересматриваю');
+    await popup.getByText('Управление вручную', { exact: true }).click();
+    await expect(popup.locator('#watch-actions details')).toHaveAttribute('open', '');
+    const completionBox = await popup.locator('#watch-completion').boundingBox();
+    const activityBox = await popup.locator('#stats-card').boundingBox();
+    expect(completionBox).not.toBeNull(); expect(activityBox).not.toBeNull();
+    expect(completionBox!.y + completionBox!.height).toBeLessThanOrEqual(600);
+    expect(completionBox!.y).toBeLessThan(activityBox!.y);
+    await expect(popup.locator('#watch-current')).not.toContainText('Цикл');
+    await expect(popup.locator('#watch-completion')).toHaveText('Уже просмотрено · Завершено с начала учёта: 1');
+    expect((await commands()).map((command: any) => command.command)).toEqual(['start']);
+    const screenshotPath = testInfo.outputPath('watch-cycle-popup.png');
+    await popup.screenshot({ path: screenshotPath, fullPage: true });
+    await testInfo.attach('watch-cycle-popup', { path: screenshotPath, contentType: 'image/png' });
+    await popup.getByRole('button', { name: /Приостановить просмотр/ }).click();
+    await expect(popup.locator('#watch-current')).toContainText('Просмотр на паузе');
+    await expect(popup.locator('#watch-actions details')).toHaveAttribute('open', '');
+    await expect(popup.getByRole('button', { name: /Продолжить просмотр/ })).toBeVisible();
+    await expect(popup.locator('#watch-completion')).toHaveText('Уже просмотрено · Завершено с начала учёта: 1');
+    await expect(popup.locator('#watch-current')).toContainText('Просмотр на паузе');
+    expect((await commands()).map((command: any) => command.command)).toEqual(['start', 'pause']);
+    await expect(popup.locator('#resume')).toBeHidden();
+  } finally {
+    await popup?.close();
+    await page.close();
+  }
+});
+
+test('natural playback starts a repeat without popup and later confirms already watched', async ({}, testInfo) => {
+  await worker.evaluate(async () => {
+    await chrome.storage.local.set({ 'auto-mark': true, 'sync-account': { id: 18, name: 'TestUser' } });
+    const base = (globalThis as any).AniRekoRuntimeConfig.apiBase;
+    await fetch(base + '/__test/session?on=1&user=18');
+    await fetch(base + '/__test/cycle-history');
+  });
+  const page = await context.newPage(); let popup: Page | null = null;
+  const commands = () => worker.evaluate(async () => (await (await fetch(
+    (globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/cycle-history')).json()).posts);
+  try {
+    await page.goto(`${siteBase}/anime.html`);
+    const tabId = await extensionTabId(`${siteBase}/*`);
+    await expect.poll(async () => (await storedTabState(tabId))?.match?.status).toBe('ok');
+    await waitForDetectorReady(tabId);
+    expect(await commands()).toEqual([], 'opening a paused page is not a new watch');
+    await page.frameLocator('#main-player').locator('#episode-select').selectOption({ label: '1 серия' });
+    await setSyntheticPlayback(page.frameLocator('#main-player'), '#main-video', { currentTime: 0, paused: false });
+    await expect.poll(async () => (await commands()).filter((request: any) => request.command === 'start').length,
+      { timeout: 18000 }).toBe(1);
+    expect((await commands())[0].command).toBe('start', 'no retrobound progress before Start');
+    popup = await openPopup(tabId);
+    await popup.setViewportSize({ width: 390, height: 600 });
+    await expect(popup.locator('#watch-completion')).toHaveText('Уже просмотрено · Завершено с начала учёта: 1');
+    await expect(popup.locator('#watch-current')).toContainText('Пересматриваю');
+    const completionBox = await popup.locator('#watch-completion').boundingBox();
+    const activityBox = await popup.locator('#stats-card').boundingBox();
+    expect(completionBox).not.toBeNull(); expect(activityBox).not.toBeNull();
+    expect(completionBox!.y + completionBox!.height).toBeLessThanOrEqual(600);
+    expect(completionBox!.y).toBeLessThan(activityBox!.y);
+    await expect(popup.getByRole('button', { name: 'Начать новый просмотр', exact: true })).toBeHidden();
+    const screenshotPath = testInfo.outputPath('automatic-repeat-popup.png');
+    await popup.screenshot({ path: screenshotPath, fullPage: true });
+    await testInfo.attach('automatic-repeat-popup', { path: screenshotPath, contentType: 'image/png' });
+    expect((await commands()).filter((request: any) => request.command === 'start')).toHaveLength(1);
+  } finally { await popup?.close(); await page.close(); }
+});
+
+test('native movie Complete80 then close/reopen starts one repeat without popup and preserves completion', async () => {
+  test.setTimeout(45000);
+  await worker.evaluate(async () => {
+    await chrome.storage.local.set({ 'auto-mark': true, 'sync-account': { id: 18, name: 'TestUser' } });
+    const base = (globalThis as any).AniRekoRuntimeConfig.apiBase;
+    await fetch(base + '/__test/session?on=1&user=18');
+    await fetch(base + '/__test/cycle-history?movie=1');
+  });
+  const commands = () => worker.evaluate(async () => (await (await fetch(
+    (globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/cycle-history')).json()).posts);
+  let page = await context.newPage(); let popup: Page | null = null;
+  try {
+    await page.goto(`${siteBase}/movie-anime.html`);
+    let tabId = await extensionTabId(`${siteBase}/movie-anime.html`);
+    await waitForDetectorReady(tabId);
+    await setSyntheticPlayback(page.frameLocator('#movie-player'), '#movie-video', { currentTime: 0, paused: false });
+    await expect.poll(async () => (await commands()).filter((r: any) => r.command === 'start').length,
+      { timeout: 18000 }).toBe(1);
+    await setSyntheticPlayback(page.frameLocator('#movie-player'), '#movie-video', { currentTime: 255, paused: false });
+    await expect.poll(async () => (await commands()).filter((r: any) => r.command === 'complete').length,
+      { timeout: 12000 }).toBe(1);
+    expect(await page.frameLocator('#movie-player').locator('#movie-video').evaluate(v => (v as HTMLVideoElement).ended)).toBe(false);
+    await page.close(); page = await context.newPage();
+    await page.goto(`${siteBase}/movie-anime.html`);
+    tabId = await extensionTabId(`${siteBase}/movie-anime.html`);
+    await waitForDetectorReady(tabId);
+    expect((await commands()).filter((r: any) => r.command === 'start')).toHaveLength(1);
+    await setSyntheticPlayback(page.frameLocator('#movie-player'), '#movie-video', { currentTime: 0, paused: false });
+    await expect.poll(async () => (await commands()).filter((r: any) => r.command === 'start').length,
+      { timeout: 18000 }).toBe(2);
+    popup = await openPopup(tabId);
+    await expect(popup.locator('#watch-completion')).toHaveText('Уже просмотрено · Завершено с начала учёта: 2');
+    await expect(popup.locator('#watch-current')).toContainText('Пересматриваю');
+    expect((await commands()).filter((r: any) => r.command === 'complete')).toHaveLength(1);
+  } finally { await popup?.close(); await page.close(); }
+});
+
+test('cycle recovery silently settles a lost ACK across account transfer and popup reopen', async () => {
+  await worker.evaluate(async () => {
+    await chrome.storage.local.set({ 'auto-mark': true, 'sync-account': { id: 18, name: 'TestUser' } });
+    const base = (globalThis as any).AniRekoRuntimeConfig.apiBase;
+    await fetch(base + '/__test/session?on=1&user=18');
+    await fetch(base + '/__test/cycle-history?lostAck=1');
+  });
+  const page = await context.newPage(); let popup: Page | null = null;
+  const pending = () => worker.evaluate(async () =>
+    (await chrome.storage.local.get('watch-command-pending-v1'))['watch-command-pending-v1']);
+  const recovery = () => worker.evaluate(async () =>
+    (await chrome.storage.local.get('watch-recovery-v1'))['watch-recovery-v1']);
+  const receipts = () => worker.evaluate(async () => {
+    const response = await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/cycle-history');
+    return response.json();
+  });
+  const setRecoveryTime = (timestamp: number | null) => worker.evaluate((timestamp) => {
+    const clock = globalThis as typeof globalThis & { originalRecoveryDateNow?: typeof Date.now };
+    if (timestamp === null) {
+      if (clock.originalRecoveryDateNow) Date.now = clock.originalRecoveryDateNow;
+      delete clock.originalRecoveryDateNow;
+    } else {
+      clock.originalRecoveryDateNow ??= Date.now;
+      Date.now = () => timestamp;
+    }
+  }, timestamp);
+  const expectSilentRecovery = async (popup: Page) => {
+    await expect(popup.locator('#watch-current')).toContainText('Пересматриваю');
+    await expect(popup.locator('#watch-feedback')).toBeEmpty();
+    await expect(popup.locator('#watch-actions')).toBeEmpty();
+  };
+  try {
+    await page.goto(`${siteBase}/anime.html`);
+    const tabId = await extensionTabId(`${siteBase}/*`);
+    await expect.poll(async () => (await storedTabState(tabId))?.match?.status).toBe('ok');
+    popup = await openPopup(tabId);
+    await startCycleFixture(popup, tabId);
+    await expectSilentRecovery(popup);
+    const original = await pending();
+    expect(original.version).toBe(1);
+    expect(original.acknowledged).toBe(false);
+    expect((await receipts()).posts).toHaveLength(1);
+    await popup.close(); popup = null;
+    await worker.evaluate(async () => {
+      await chrome.storage.local.set({ 'sync-account': { id: 19, name: 'MergedOwner' } });
+      await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/session?on=1&user=19');
+    });
+    // Move past the worker's initial scan cooldown. Opening the popup schedules the saved intent.
+    await setRecoveryTime((await worker.evaluate(() => Date.now())) + 60_001);
+    popup = await openPopup(tabId);
+    await expectSilentRecovery(popup);
+    await expect.poll(async () => (await recovery())?.commandId).toBe(original.request.command_id);
+    expect(await pending()).toEqual(original);
+    expect((await receipts()).settlementPosts).toEqual([]);
+
+    await popup.close(); popup = null;
+    await setRecoveryTime((await recovery()).nextAt);
+    expect((await receipts()).settlementPosts).toEqual([]);
+    popup = await openPopup(tabId);
+    await expect.poll(async () => (await receipts()).settlementPosts.length).toBe(1);
+    await expectSilentRecovery(popup);
+    expect(await pending()).toEqual(original);
+
+    await popup.close(); popup = await openPopup(tabId);
+    await expectSilentRecovery(popup);
+    expect((await receipts()).settlementPosts).toHaveLength(1);
+    expect((await receipts()).posts).toHaveLength(1);
+
+    await popup.close(); popup = null;
+    await setRecoveryTime((await recovery()).nextAt);
+    expect((await receipts()).settlementPosts).toHaveLength(1);
+    popup = await openPopup(tabId);
+    await expect.poll(pending).toBeUndefined();
+    await expect(popup.locator('#watch-current')).toContainText('Пересматриваю');
+    await expect(popup.locator('#watch-completion')).toContainText('Уже просмотрено');
+    await expect(popup.locator('#watch-feedback')).toBeEmpty();
+    await expect(popup.getByText('Управление вручную', { exact: true })).toBeVisible();
+    const observed = await receipts();
+    expect(observed.posts).toHaveLength(1);
+    expect(observed.settlementPosts).toHaveLength(2);
+    for (const attempt of observed.settlementPosts) {
+      expect(attempt.currentUser).toBe(19);
+      expect(attempt.payload).toEqual({ ...observed.posts[0], operation: 'settle' });
+      expect(attempt.payload.expected_user_id).toBe(18);
+    }
+  } finally {
+    await setRecoveryTime(null);
+    await popup?.close();
+    await page.close();
+  }
+});
+
+test('Cancel survives actual MV3 worker stop while the same video keeps playing', async ({}, testInfo) => {
+  // Includes two fresh detector intervals after a real worker stop and another
+  // real play; this new lifecycle scenario has a bounded 45s budget, no retries.
+  test.setTimeout(45000);
+  await worker.evaluate(async () => {
+    await chrome.storage.local.set({ 'auto-mark': true, 'sync-account': { id: 18, name: 'TestUser' } });
+    const base = (globalThis as any).AniRekoRuntimeConfig.apiBase;
+    await fetch(base + '/__test/session?on=1&user=18');
+    await fetch(base + '/__test/cycle-history');
+  });
+  const page = await context.newPage(); let popup: Page | null = null; let observer: Page | null = null;
+  const commands = () => (observer || popup || worker).evaluate(async base =>
+    (await (await fetch(base + '/__test/cycle-history')).json()).posts, apiBase);
+  const session = await context.newCDPSession(page);
+  try {
+    await page.goto(`${siteBase}/anime.html`);
+    await page.frameLocator('#main-player').locator('#episode-select').selectOption({ label: '1 серия' });
+    const tabId = await extensionTabId(`${siteBase}/*`);
+    await expect.poll(async () => (await storedTabState(tabId))?.match?.status).toBe('ok');
+    popup = await openPopup(tabId);
+    await startCycleFixture(popup, tabId);
+    await expect(popup.locator('#watch-current')).toContainText('Пересматриваю');
+    await popup.close(); popup = null;
+    await setSyntheticPlayback(page.frameLocator('#main-player'), '#main-video', { currentTime: 0, paused: false });
+    await expect.poll(async () => (await storedTabState(tabId))?.player?.playing).toBe(true);
+    popup = await openPopup(tabId);
+    await popup.getByText('Управление вручную', { exact: true }).click();
+    await popup.getByRole('button', { name: /Отменить этот просмотр/ }).click();
+    await expect(popup.locator('#watch-current')).toBeEmpty();
+    await expect(popup.getByRole('button', { name: 'Начать новый просмотр', exact: true })).toHaveCount(0);
+    await expect(popup.locator('#watch-completion')).toContainText('Уже просмотрено');
+    expect((await commands()).filter((request: any) => request.command === 'cancel')).toHaveLength(1);
+    await expect.poll(() => worker.evaluate(async () =>
+      (await chrome.storage.local.get('watch-command-pending-v1'))['watch-command-pending-v1'])).toBeUndefined();
+    const original = await storedTabState(tabId);
+    const originalRevision = await popup.evaluate(async () =>
+      (await chrome.runtime.sendMessage({ type: 'popup-runtime-info' })).payload.localWriteRevision);
+    await popup.close(); popup = null;
+    let versionId: string | undefined;
+    let stopped = false;
+    session.on('ServiceWorker.workerVersionUpdated', ({ versions }) => {
+      const own = versions.find(version => version.scriptURL === `chrome-extension://${extensionId}/service-worker.js`);
+      if (own) { versionId = own.versionId; if (own.runningStatus === 'stopped') stopped = true; }
+    });
+    await session.send('ServiceWorker.enable');
+    await expect.poll(() => versionId).toBeTruthy();
+    stopped = false;
+    await session.send('ServiceWorker.stopWorker', { versionId: versionId! });
+    await expect.poll(() => stopped).toBe(true);
+    // Explicitly wake the stopped registration; this tests a real worker restart,
+    // not extension reload or automatic wake-up behavior.
+    await session.send('ServiceWorker.startWorker', { scopeURL: `chrome-extension://${extensionId}/` });
+    // The old Playwright Worker handle does not follow a new execution context.
+    // Read through a real popup; require a changed runtime revision as proof.
+    popup = await openPopup(tabId);
+    const newRevision = await popup.evaluate(async () =>
+      (await chrome.runtime.sendMessage({ type: 'popup-runtime-info' })).payload.localWriteRevision);
+    expect(newRevision).not.toBe(originalRevision);
+    await popup.close(); popup = null;
+    // Read-only native extension storage observer, in the disposable fixture
+    // copy only. No popup reload subscription and no emulated Chrome APIs.
+    fs.writeFileSync(path.join(extensionPath, 'fixture-observer.html'), '<!doctype html><html><body>Read-only test observer</body></html>');
+    observer = await context.newPage();
+    await observer.goto(`chrome-extension://${extensionId}/fixture-observer.html`);
+    const freshState = () => observer!.evaluate(async key =>
+      (await chrome.storage.session.get(key))[key], `tab:${tabId}`);
+    const firstFresh = await freshState();
+    await expect.poll(async () => (await freshState())?.player?.observedAt,
+      { timeout: 18000 }).toBeGreaterThan(firstFresh.player.observedAt + 5500);
+    const current = await freshState();
+    expect(current.topDocumentId).toBe(original.topDocumentId);
+    expect(current.navigationToken).toBe(original.navigationToken);
+    expect(current.player.playerInstanceId).toBe(original.player.playerInstanceId);
+    expect(current.player.currentTime).toBeGreaterThan(original.player.currentTime);
+    expect((await commands()).filter((request: any) => request.command === 'start')).toHaveLength(1);
+    await page.frameLocator('#main-player').locator('#main-video').evaluate(video => (video as HTMLVideoElement).pause());
+    await expect.poll(async () => (await freshState())?.player?.paused).toBe(true);
+    await page.frameLocator('#main-player').locator('#main-video').evaluate(async video => (video as HTMLVideoElement).play());
+    await expect.poll(async () => (await commands()).filter((request: any) => request.command === 'start').length,
+      { timeout: 18000 }).toBe(2);
+  } catch (error) {
+    if (popup && !popup.isClosed()) {
+      const artifact = testInfo.outputPath('cancel-restart-popup.png');
+      await popup.screenshot({ path: artifact, fullPage: true });
+      await testInfo.attach('cancel-restart-popup', { path: artifact, contentType: 'image/png' });
+    }
+    throw error;
+  } finally {
+    await session.detach(); await observer?.close(); await popup?.close(); await page.close();
+    // Only after the assertions: restore the shared fixture's Playwright worker
+    // handle using its already-supported loader, without uninstall/data clearing.
+    const loader = await context.browser()!.newBrowserCDPSession();
+    try {
+      const restored = context.waitForEvent('serviceworker');
+      const loaded = await loader.send('Extensions.loadUnpacked', { path: extensionPath });
+      expect(loaded.id).toBe(extensionId);
+      worker = await restored;
+    } finally { await loader.detach(); }
+  }
+});
+
+test('cycle repair requires separate explicit choices for complete related groups', async ({}, testInfo) => {
+  await worker.evaluate(async () => {
+    await chrome.storage.local.set({ 'auto-mark': true, 'sync-account': { id: 18, name: 'TestUser' } });
+    const base = (globalThis as any).AniRekoRuntimeConfig.apiBase;
+    await fetch(base + '/__test/session?on=1&user=18');
+    await fetch(base + '/__test/cycle-history?repair=1');
+  });
+  const page = await context.newPage(); let popup: Page | null = null;
+  try {
+    await page.goto(`${siteBase}/anime.html`);
+    const tabId = await extensionTabId(`${siteBase}/*`);
+    await expect.poll(async () => (await storedTabState(tabId))?.match?.status).toBe('ok');
+    popup = await openPopup(tabId);
+    const groups = popup.locator('.watch-choice-group');
+    await expect(groups).toHaveCount(2);
+    await expect(groups.nth(1).locator('legend')).toHaveText('Связанный тайтл');
+    const apply = popup.getByRole('button', { name: 'Выбрать историю просмотра', exact: true });
+    await expect(apply).toBeDisabled();
+    expect(await popup.locator('.watch-choice-group input:checked').count()).toBe(0);
+    await groups.nth(0).getByRole('radio').nth(1).check();
+    await expect(apply).toBeDisabled();
+    await groups.nth(1).getByRole('radio').nth(0).check();
+    await expect(apply).toBeEnabled();
+    await expect(popup.locator('#watch-completion')).toContainText('Уже просмотрено');
+    const screenshotPath = testInfo.outputPath('watch-choice-popup.png');
+    await popup.screenshot({ path: screenshotPath, fullPage: true });
+    await testInfo.attach('watch-choice-popup', { path: screenshotPath, contentType: 'image/png' });
+    await apply.click();
+    await expect(groups).toHaveCount(0);
+    await expect(popup.locator('#watch-completion')).toContainText('Уже просмотрено');
+    const posts = await worker.evaluate(async () => {
+      const response = await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/cycle-history');
+      return (await response.json()).posts;
+    });
+    expect(posts).toHaveLength(1);
+    expect(posts[0].operation).toBe('select');
+    expect(posts[0].choices.map((choice: any) => choice.cycle_id)).toEqual([
+      '33333333-3333-4333-8333-000000000002', '33333333-3333-4333-8333-000000000003']);
+  } finally { await popup?.close(); await page.close(); }
+});
+
+test('renders browser-local activity as a calm calendar with honest missing days', async ({}, testInfo) => {
+  const page = await context.newPage();
+  await page.goto(`${siteBase}/anime.html`);
+  const tabId = await extensionTabId(`${siteBase}/*`);
+  await expect.poll(async () => (await storedTabState(tabId))?.match?.status).toBe('ok');
+  await worker.evaluate(async () => {
+    const now = new Date();
+    const key = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+    const boundaryDays = Object.fromEntries([899, 1799, 3599].map((seconds, index) => {
+      const day = new Date(now);
+      day.setDate(day.getDate() - index - 1);
+      const date = `${day.getFullYear()}-${String(day.getMonth() + 1).padStart(2, '0')}-${String(day.getDate()).padStart(2, '0')}`;
+      return [date, { watchedSeconds: seconds, episodeKeys: [] }];
+    }));
+    await (globalThis as any).AniRekoTestHooks.seedLocalHistory({ records: {
+      'first::1': { title: 'Mutable decoy', voice: 'Wrong voice', position: 9999, lastWatchedAt: Date.now() },
+    }, days: {
+      [key]: { watchedSeconds: 3600, episodeKeys: ['first::1', 'second::2'], detailsPartial: true,
+        details: [
+          { animeId: 101, titleKey: null, title: 'Первое аниме', episode: 1, voice: 'Озвучка А', watchedSeconds: 300, position: 120, duration: 1200, observedAt: Date.now() },
+          { animeId: 101, titleKey: null, title: 'Первое аниме', episode: 3, voice: 'Озвучка В', watchedSeconds: 60, position: 80, duration: 1200, observedAt: Date.now() },
+          { animeId: null, titleKey: 'second', title: 'Второе аниме', episode: 2, voice: 'Озвучка Б', watchedSeconds: 59, position: 20, duration: 900, observedAt: Date.now() },
+        ] },
+      ...boundaryDays,
+      '2025-01-01': { watchedSeconds: 100000, episodeKeys: [] },
+    } });
+    (globalThis as any).AniRekoTestHooks.resetVolatileCaches();
+  });
+  const popup = await openPopup(tabId);
+  await popup.setViewportSize({ width: 390, height: 900 });
+  expect(await popup.evaluate(async () => Object.keys((await chrome.storage.local.get('watch-history'))['watch-history'].days))).toHaveLength(5);
+  await expect(popup.locator('#week-chart .activity-cell')).toHaveCount(84);
+  const grid = await popup.locator('#week-chart').boundingBox();
+  const firstCell = await popup.locator('#week-chart .activity-cell').first().boundingBox();
+  const lastCell = await popup.locator('#week-chart .activity-cell').last().boundingBox();
+  expect(grid).not.toBeNull(); expect(firstCell).not.toBeNull(); expect(lastCell).not.toBeNull();
+  expect(Math.abs(firstCell!.width - firstCell!.height)).toBeLessThan(1);
+  expect(Math.abs(lastCell!.x + lastCell!.width - (grid!.x + grid!.width))).toBeLessThan(1);
+  expect(firstCell!.width).toBeGreaterThan(12);
+  await expect(popup.locator('#week-chart .level-unknown')).toHaveCount(80);
+  await expect(popup.locator('.activity-cell.level-1')).toHaveAttribute('aria-label', /14 мин/);
+  await expect(popup.locator('.activity-cell.level-2')).toHaveAttribute('aria-label', /29 мин/);
+  await expect(popup.locator('.activity-cell.level-3')).toHaveAttribute('aria-label', /59 мин/);
+  await expect(popup.locator('.activity-heading')).toContainText('этот браузер');
+  await expect(popup.locator('.activity-cell.today')).toHaveClass(/level-4/);
+  await popup.locator('.activity-cell.today').click();
+  await expect(popup.locator('#activity-detail')).toContainText('60 мин');
+  await expect(popup.locator('.activity-cell.today')).toHaveAttribute('aria-pressed', 'true');
+  await expect(popup.locator('#activity-entries')).toContainText('Подробности за этот день неполные');
+  await expect(popup.locator('.activity-entry').nth(0).locator('strong')).toHaveText('Первое аниме');
+  await expect(popup.locator('.activity-entry').nth(0).locator('strong')).toHaveCount(1);
+  await expect(popup.locator('.activity-entry').nth(0).locator('.activity-observation')).toHaveCount(2);
+  await expect(popup.locator('.activity-entry').nth(0).locator('p').first()).toContainText('Серия 1 · Озвучка А');
+  await expect(popup.locator('.activity-entry').nth(0).locator('.activity-observation').nth(1)).toContainText('Серия 3 · Озвучка В');
+  await expect(popup.locator('.activity-entry')).toHaveCount(1);
+  await expect(popup.locator('#activity-entries')).not.toContainText('Второе аниме');
+  await expect(popup.locator('#activity-entries')).toContainText('Последняя позиция: 2:00 из 20:00');
+  await expect(popup.locator('#activity-entries')).not.toContainText('Mutable decoy');
+  await expect(popup.locator('#activity-entries')).not.toContainText('Wrong voice');
+  for (const width of [360, 390]) {
+    await popup.setViewportSize({ width, height: 900 });
+    const detailScreenshot = testInfo.outputPath(`activity-day-detail-grouped-ru-${width}.png`);
+    await popup.screenshot({ path: detailScreenshot, fullPage: true });
+    await testInfo.attach(`activity-day-detail-grouped-ru-${width}`, { path: detailScreenshot, contentType: 'image/png' });
+  }
+  await popup.locator('.activity-cell.today').press('ArrowUp');
+  await expect(popup.locator('#activity-entries')).toContainText('Подробности за этот день недоступны');
+  await expect(popup.locator('.activity-cell[tabindex="0"]')).toHaveAttribute('aria-pressed', 'true');
+  await popup.locator('.activity-cell[tabindex="0"]').press('ArrowDown');
+  await expect(popup.locator('#activity-entries')).toContainText('Первое аниме');
+  await expect(popup.locator('#today-episodes')).toHaveAttribute('title', /не обязательно досмотренные/);
+  await expect(popup.locator('.activity-cell.today')).toHaveCSS('background-color', 'rgb(52, 211, 153)');
+  await expect(popup.locator('.activity-cell[tabindex="0"]')).toHaveCount(1);
+  await popup.locator('.activity-cell.today').press('ArrowLeft');
+  await expect(popup.locator('#activity-detail')).toContainText('Нет записи');
+  await popup.locator('.activity-cell.level-unknown').first().focus();
+  await expect(popup.locator('#activity-detail')).toContainText('Нет записи');
+  await popup.screenshot({ path: test.info().outputPath('activity-heatmap.png'), fullPage: true });
+  await popup.close();
+  await page.close();
+});
+
+for (const kind of ['session', 'history'] as const) {
+  test(`account UI rejects held ${kind} after preference revocation`, async () => {
+    const originalConsent = await worker.evaluate(async () => (await chrome.storage.local.get('privacy-consent'))['privacy-consent']);
+    const { page, tabId } = await localPopupPage();
+    let popup: Page | null = null;
+    try {
+      await worker.evaluate(async () => {
+        await chrome.storage.local.set({ 'resume-bulk': { userId: 18, fetchedAt: Date.now(), byAnime: {
+          4343: { title: 'Remote-only record', episode: 7, position_sec: 1260, duration_sec: 1440,
+            voice: 'Remote-only voice', watched_at: new Date().toISOString() },
+        } } });
+      });
+      await popupReadGate(kind, '&hold=1');
+      popup = await context.newPage();
+      await popup.addInitScript(() => {
+        const runtime = (chrome as any).runtime;
+        const send = runtime.sendMessage.bind(runtime);
+        (window as any).__settledAccountReads = {};
+        chrome.storage.onChanged.addListener((changes, area) => {
+          if (area === 'local' && (changes['auto-mark'] || changes['privacy-consent'])) (window as any).__preferenceSeen = true;
+        });
+        runtime.sendMessage = (...args: any[]) => {
+          const pending = send(...args);
+          const type = args[0]?.type;
+          if (!['popup-session-info', 'popup-watch-history'].includes(type)) return pending;
+          return pending.then((response: any) => {
+            (window as any).__settledAccountReads[type] = true;
+            return response;
+          });
+        };
+      });
+      await popup.goto(`chrome-extension://${extensionId}/popup.html?tabId=${tabId}`);
+      await expect.poll(async () => (await popupReadGate(kind)).pending).toBeGreaterThan(0);
+      await worker.evaluate(async (kind) => {
+        await chrome.storage.local.set(kind === 'session'
+          ? { 'privacy-consent': { version: 1, declinedAt: Date.now() } }
+          : { 'auto-mark': false });
+      }, kind);
+      await popup.waitForFunction(() => (window as any).__preferenceSeen === true);
+      await popupReadGate(kind, '&hold=0');
+      await popup.waitForFunction((kind) => (window as any).__settledAccountReads[
+        kind === 'session' ? 'popup-session-info' : 'popup-watch-history'] === true, kind);
+      await expect(popup.locator('#watch-cycle-card')).toBeHidden();
+      await expect(popup.locator('#resume-sync')).toBeDisabled();
+      await expect(popup.locator('.activity-account-entry')).toHaveCount(0);
+      await expect(popup.locator('#resume')).not.toContainText('Remote-only voice');
+      await expect(popup.locator('#today-time')).toHaveText('10 мин');
+    } finally {
+      await popupReadGate(kind, '&hold=0&status=200');
+      await popup?.close(); await page.close();
+      await worker.evaluate(async (consent) => {
+        if (consent === undefined) await chrome.storage.local.remove('privacy-consent');
+        else await chrome.storage.local.set({ 'privacy-consent': consent });
+      }, originalConsent);
+    }
+  });
+}
+
+test('account calendar reuses one bounded bulk read and hides records after opt-out', async ({}, testInfo) => {
+  await worker.evaluate(async () => {
+    const base = (globalThis as any).AniRekoRuntimeConfig.apiBase;
+    await fetch(base + '/__test/session?on=1&user=18');
+    const seed = await fetch(base + '/api/extension/progress.php', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({
+        expected_user_id: 18, anime_id: 4343, episode: 7, position_sec: 1260, duration_sec: 1440, voice: 'Account Voice',
+      }) });
+    if (!seed.ok) throw new Error('synthetic_progress_seed_failed');
+  });
+  const page = await context.newPage();
+  let popup: Page | null = null;
+  try {
+    await page.goto(`${siteBase}/anime.html`);
+    const tabId = await extensionTabId(`${siteBase}/*`);
+    await waitForDetectorReady(tabId);
+    popup = await openPopup(tabId);
+    const localTime = await popup.locator('#today-time').innerText();
+    await expect(popup.locator('.activity-account-entry')).toHaveCount(0);
+    await popup.close(); popup = null;
+    await worker.evaluate(async () => {
+      await chrome.storage.local.set({ 'auto-mark': true, 'sync-account': { id: 18, name: 'TestUser' } });
+    });
+    const reads = () => worker.evaluate(async () => {
+      const response = await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/progress-read-count');
+      return (await response.json()).reads;
+    });
+    popup = await openPopup(tabId);
+    await expect(popup.locator('#activity-heading')).toContainText('браузер + аккаунт');
+    await expect(popup.locator('#week-chart .has-account-records')).toHaveCount(1);
+    await expect(popup.locator('.activity-account-entry')).toHaveCount(1);
+    await expect(popup.locator('.activity-account-entry')).toContainText('Аниме из аккаунта');
+    await expect(popup.locator('.activity-account-entry')).toContainText('Серия 7');
+    await expect(popup.locator('.activity-account-entry')).toContainText('Account Voice');
+    await expect(popup.locator('.activity-account-entry')).toContainText('Сохранённая позиция: 21:00 из 24:00');
+    await expect(popup.locator('#resume')).toBeHidden();
+    await expect(popup.locator('#today-time')).toHaveText(localTime);
+    expect(await reads()).toBe(1);
+    await popup.close(); popup = await openPopup(tabId);
+    await expect(popup.locator('.activity-account-entry')).toHaveCount(1);
+    expect(await reads()).toBe(1, 'reopening reuses the same account snapshot, not another GET');
+    const stored = await worker.evaluate(async () => (await chrome.storage.local.get('resume-bulk'))['resume-bulk']);
+    expect(stored.userId).toBe(18);
+    expect(Object.keys(stored.byAnime)).toEqual(['4343']);
+    await popup.setViewportSize({ width: 390, height: 850 });
+    await popup.screenshot({ path: testInfo.outputPath('account-calendar-ru.png'), fullPage: true });
+    await worker.evaluate(async () => { await chrome.storage.local.set({ 'auto-mark': false }); });
+    await expect(popup.locator('.activity-account-entry')).toHaveCount(0);
+    await expect(popup.locator('#week-chart .has-account-records')).toHaveCount(0);
+    expect(await reads()).toBe(1);
+  } finally { await popup?.close(); await page.close(); }
+});
+
+for (const signedIn of [false, true]) {
+test(`diagnostics choice stays available below sync after onboarding (${signedIn ? 'account' : 'guest'})`, async ({}, testInfo) => {
+  const originalConsent = await worker.evaluate(async () => (await chrome.storage.local.get('privacy-consent'))['privacy-consent']);
+  await worker.evaluate(async (signedIn) => {
+    if (signedIn) await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/session?on=1&user=18');
+    await chrome.storage.local.set({ 'auto-mark': signedIn, 'sync-account': { id: 18, name: 'Synthetic' },
+      'preference-sentinel': { keep: true } });
+  }, signedIn);
+  const page = await context.newPage();
+  let popup: Page | null = null;
+  try {
+    await page.goto(`${siteBase}/anime.html`);
+    const tabId = await extensionTabId(`${siteBase}/*`);
+    await waitForDetectorReady(tabId);
+    const documentTimeOrigin = await page.evaluate(() => performance.timeOrigin);
+    popup = await openPopup(tabId);
+    await expect(popup.locator('#privacy-disclosure')).toBeHidden();
+    await expect(popup.locator('#diagnostics-option')).toBeVisible();
+    await expect(popup.locator('#diagnostics-setting')).not.toBeChecked();
+    await expect(popup.locator('#diagnostics-setting')).toBeEnabled();
+    if (signedIn) await expect(popup.locator('#auto-mark')).toBeChecked();
+    else await expect(popup.locator('#auto-mark')).toBeDisabled();
+    const boxes = await popup.evaluate(() => ({
+      sync: document.getElementById('automark')!.getBoundingClientRect().bottom,
+      diagnostics: document.getElementById('diagnostics-option')!.getBoundingClientRect().top,
+    }));
+    expect(boxes.sync).toBeLessThanOrEqual(boxes.diagnostics);
+    await Promise.all([popup.waitForEvent('domcontentloaded'), popup.locator('#diagnostics-setting').check()]);
+    await expect(popup.locator('#diagnostics-setting')).toBeChecked();
+    await expect.poll(async () => (await worker.evaluate(async () =>
+      (await chrome.storage.local.get('privacy-consent'))['privacy-consent'])).diagnostics).toBe(true);
+    await popup.close(); popup = await openPopup(tabId);
+    await expect(popup.locator('#diagnostics-setting')).toBeChecked();
+    await popup.setViewportSize({ width: 390, height: 900 });
+    await popup.screenshot({ path: testInfo.outputPath('persistent-diagnostics-ru.png'), fullPage: true });
+    await Promise.all([popup.waitForEvent('domcontentloaded'), popup.locator('#diagnostics-setting').uncheck()]);
+    await expect.poll(async () => (await worker.evaluate(async () =>
+      (await chrome.storage.local.get('privacy-consent'))['privacy-consent'])).diagnostics).toBe(false);
+    await popup.close(); popup = await openPopup(tabId);
+    await expect(popup.locator('#diagnostics-setting')).not.toBeChecked();
+    const saved = await worker.evaluate(async () => chrome.storage.local.get([
+      'privacy-consent', 'auto-mark', 'sync-account', 'preference-sentinel',
+    ]));
+    expect(saved['privacy-consent'].acceptedAt).toBe(originalConsent.acceptedAt);
+    expect(saved['auto-mark']).toBe(signedIn);
+    expect(saved['sync-account'].id).toBe(18);
+    expect(saved['preference-sentinel']).toEqual({ keep: true });
+    expect(await page.evaluate(() => performance.timeOrigin)).toBe(documentTimeOrigin);
+    expect(await worker.evaluate(async () => (await (await fetch(
+      (globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/diagnostics')).json()))).toEqual([]);
+  } finally {
+    await popup?.close(); await page.close();
+    await worker.evaluate(async (consent) => { await chrome.storage.local.set({ 'privacy-consent': consent }); }, originalConsent);
+  }
+});
+}
+
+test('renders the English manifest and popup for an English Chrome UI', async ({}, testInfo) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'anireko-extension-en-'));
   const englishExtensionPath = path.join(root, 'extension');
   const englishProfilePath = path.join(root, 'profile');
@@ -172,21 +1085,116 @@ test('renders the English manifest and popup for an English Chrome UI', async ()
     await englishPopup.goto(`chrome-extension://${englishExtensionId}/popup.html`);
 
     await expect(englishPopup.locator('html')).toHaveAttribute('lang', 'en');
-    await expect(englishPopup.locator('.brand span')).toHaveText('Anime watch tracker');
+    await expect(englishPopup.locator('.brand h1')).toHaveText('AniReko');
     await expect(englishPopup.locator('#privacy-accept')).toHaveText('Got it, enable AniReko');
-    await expect(englishPopup.locator('#anime-check-title')).toHaveText('Anime not found');
+    await expect(englishPopup.locator('#anime-check-title')).toHaveText('Enable AniReko');
+    await expect(englishPopup.locator('#page-recovery')).toBeHidden();
     await expect(englishPopup.locator('#privacy-policy')).toHaveAttribute(
       'href', 'https://anireko.com/en/privacy#browser-extension',
     );
     await expect.poll(() => englishWorker.evaluate(() => chrome.runtime.getManifest().name))
       .toBe('AniReko — Anime Tracker');
+    // Presentation-only fixture: the real popup renderer and English i18n with
+    // deterministic local state; no matcher or live service claim is made.
+    const preview = await englishContext.newPage();
+    await preview.addInitScript(() => {
+      const title = 'A very long anime title which should remain fully readable and leave enough room for the primary action';
+      const pageUrl = 'https://layout.example.test/watch';
+      const state = { navigationToken: 'fixture-token', pageUrl, recognition: { title, episode: 1 },
+        match: { status: 'ok', exact: true, animeId: 1, slug: 'fixture', title, year: 2024 },
+        player: { player: 'HTML5', playing: false, playbackStarted: true, episode: 1,
+          currentTime: 20, duration: 1200, progress: 20 / 1200 } };
+      chrome.tabs.get = async () => ({ id: 1, url: pageUrl } as chrome.tabs.Tab);
+      chrome.tabs.sendMessage = async () => ({ ok: true, documentUrl: pageUrl, documentToken: 'fixture-token' });
+      chrome.storage.local.get = async () => ({ 'privacy-consent': { version: 1, acceptedAt: 1 }, 'watch-history': { records: {}, days: {} } });
+      chrome.storage.session.get = async () => ({ 'tab:1': state });
+      chrome.runtime.sendMessage = async (message: any) => message.type === 'popup-runtime-info'
+        ? { ok: true, payload: { siteBase: 'https://anireko.com', localWriteRevision: 'fixture' } }
+        : { ok: false };
+    });
+    await preview.goto(`chrome-extension://${englishExtensionId}/popup.html?tabId=1`);
+    await expect(preview.locator('#title')).toContainText('A very long anime title');
+    const englishGeometry = [];
+    for (const width of [360, 390]) {
+      await preview.setViewportSize({ width, height: 850 });
+      const geometry = await preview.evaluate(() => {
+        const box = (selector: string) => {
+          const rect = document.querySelector(selector)!.getBoundingClientRect();
+          return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+        };
+        return { header: box('.brand'), anime: box('#anime-check'), title: box('#title'),
+          player: box('#player-check'), button: box('#anime-primary-action'),
+          viewport: document.documentElement.clientWidth, scroll: document.documentElement.scrollWidth };
+      });
+      await testInfo.attach(`compact-geometry-en-${width}`, { body: JSON.stringify(geometry), contentType: 'application/json' });
+      const screenshot = testInfo.outputPath(`compact-long-title-en-${width}.png`);
+      await preview.screenshot({ path: screenshot, fullPage: true });
+      await testInfo.attach(`compact-long-title-en-${width}`, { path: screenshot, contentType: 'image/png' });
+      englishGeometry.push(geometry);
+    }
+    await expect(englishPopup.locator('.brand span')).toHaveCount(0);
+    for (const geometry of englishGeometry) {
+      expect(geometry.header.height).toBeLessThanOrEqual(32);
+      expect(geometry.button.height).toBeGreaterThanOrEqual(38);
+      expect(geometry.title.x - geometry.anime.x).toBeLessThan(16);
+      expect(geometry.player.height).toBeLessThanOrEqual(81);
+      expect(geometry.scroll).toBeLessThanOrEqual(geometry.viewport);
+    }
+    await preview.locator('#anime-primary-action').focus();
+    await expect(preview.locator('#anime-primary-action')).toBeFocused();
   } finally {
     await englishContext?.close();
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
 
-test('recognizes anime before playback and confirms player after playback starts', async () => {
+test('compact popup keeps a long recognized title and action usable at 360 and 390', async ({}, testInfo) => {
+  const { page, tabId } = await localPopupPage();
+  let popup: Page | null = null;
+  const longTitle = 'Очень длинное название аниме, которое должно полностью помещаться без обрезки и освобождать место для основной кнопки';
+  try {
+    await worker.evaluate(async ({ key, title }) => {
+      const stored = await chrome.storage.session.get(key);
+      const state = structuredClone(stored[key]);
+      state.recognition.title = title;
+      state.match.title = title;
+      await chrome.storage.session.set({ [key]: state });
+    }, { key: `tab:${tabId}`, title: longTitle });
+    popup = await openPopup(tabId);
+    await expect(popup.locator('#title')).toHaveText(longTitle);
+    const geometries = [];
+    for (const width of [360, 390]) {
+      await popup.setViewportSize({ width, height: 850 });
+      const geometry = await popup.evaluate(() => {
+        const rect = (selector: string) => {
+          const bounds = document.querySelector(selector)!.getBoundingClientRect();
+          return { x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height };
+        };
+        return { header: rect('.brand'), anime: rect('#anime-check'), title: rect('#title'),
+          player: rect('#player-check'), button: rect('#anime-primary-action'),
+          viewport: document.documentElement.clientWidth, scroll: document.documentElement.scrollWidth };
+      });
+      await testInfo.attach(`compact-geometry-${width}`, { body: JSON.stringify(geometry), contentType: 'application/json' });
+      const screenshot = testInfo.outputPath(`compact-long-title-ru-${width}.png`);
+      await popup.screenshot({ path: screenshot, fullPage: true });
+      await testInfo.attach(`compact-long-title-ru-${width}`, { path: screenshot, contentType: 'image/png' });
+      geometries.push(geometry);
+    }
+    for (const geometry of geometries) {
+      expect(geometry.header.height).toBeLessThanOrEqual(32);
+      expect(geometry.button.height).toBeGreaterThanOrEqual(38);
+      expect(geometry.title.x - geometry.anime.x).toBeLessThan(16);
+      expect(geometry.button.width).toBeGreaterThan(geometry.anime.width - 30);
+      expect(geometry.player.height).toBeLessThanOrEqual(81);
+      expect(geometry.scroll).toBeLessThanOrEqual(geometry.viewport);
+    }
+    await popup.locator('#anime-primary-action').focus();
+    await expect(popup.locator('#anime-primary-action')).toBeFocused();
+    await expect(popup.locator('#match-change')).toBeVisible();
+  } finally { await popup?.close(); await page.close(); }
+});
+
+test('recognizes anime before playback and confirms player after playback starts', async ({}, testInfo) => {
   const page = await context.newPage();
   await page.goto(`${siteBase}/anime.html`);
   const tabId = await extensionTabId(`${siteBase}/*`);
@@ -201,12 +1209,62 @@ test('recognizes anime before playback and confirms player after playback starts
   await expect(popup.locator('#anime-check .recognized-only')).toBeVisible();
   await expect(popup.locator('#anime-check-detail')).toHaveText('Расхититель гробниц');
   await expect(popup.locator('#player-check')).not.toHaveClass(/success/);
+  for (const width of [390, 360]) {
+    await popup.setViewportSize({ width, height: 850 });
+    const geometry = await popup.evaluate(() => {
+      const brand = document.querySelector('.brand')!.getBoundingClientRect();
+      const card = document.querySelector('#anime-check')!.getBoundingClientRect();
+      const title = document.querySelector('#title')!.getBoundingClientRect();
+      const status = document.createRange();
+      status.selectNodeContents(document.querySelector('#anime-check-title')!);
+      return { cardTop: card.top, brandInside: brand.top >= card.top && brand.right <= card.right,
+        aboveTitle: brand.bottom <= title.top,
+        overlapsStatus: [...status.getClientRects()].some(rect => rect.left < brand.right && rect.right > brand.left
+          && rect.top < brand.bottom && rect.bottom > brand.top) };
+    });
+    expect(geometry).toEqual({ cardTop: 16, brandInside: true, aboveTitle: true, overlapsStatus: false });
+  }
+  await expect(popup.locator('#hint')).toBeHidden();
+  await expect(popup.locator('#account-label')).toHaveText('Авторизация — через сайт AniReko');
+  await expect(popup.locator('#account-login')).toBeVisible();
+  await popup.setViewportSize({ width: 360, height: 850 });
+  const overflow = await popup.evaluate(() => {
+    const root = document.documentElement;
+    const width = root.clientWidth;
+    const offenders = [...document.querySelectorAll('body *')].map(element => {
+      const rect = element.getBoundingClientRect();
+      return { tag: element.tagName, id: element.id, left: rect.left, right: rect.right, scrollWidth: element.scrollWidth, clientWidth: element.clientWidth };
+    }).filter(element => element.left < 0 || element.right > width + 0.5).slice(0, 20);
+    return { width, scrollWidth: root.scrollWidth, innerWidth, offenders };
+  });
+  if (overflow.scrollWidth > overflow.width) console.log('popup-overflow:', JSON.stringify(overflow));
+  expect(overflow.scrollWidth <= overflow.width).toBe(true);
+  // Classic desktop scrollbars can leave only 345 CSS pixels in a 360px viewport.
+  await popup.setViewportSize({ width: 345, height: 850 });
+  expect(await popup.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+  await popup.evaluate(() => { const sheet = document.styleSheets[0]; sheet.insertRule('#account, #account button { font-family: Arial, sans-serif !important; }', sheet.cssRules.length); });
+  try {
+    expect(await popup.locator('#account').evaluate(e => getComputedStyle(e).fontFamily)).toContain('Arial');
+    expect(await popup.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+    await popup.screenshot({ path: testInfo.outputPath('account-narrow-ru.png'), fullPage: true });
+  } finally {
+    await popup.evaluate(() => { const sheet = document.styleSheets[0]; sheet.deleteRule(sheet.cssRules.length - 1); });
+  }
+  await popup.setViewportSize({ width: 360, height: 850 });
+  const waitingScreenshot = testInfo.outputPath('compact-player-waiting-ru.png');
+  await popup.screenshot({ path: waitingScreenshot, fullPage: true });
+  await testInfo.attach('compact-player-waiting-ru', { path: waitingScreenshot, contentType: 'image/png' });
 
+  await setSyntheticPlayback(page.frameLocator('#main-player'), '#main-video', {
+    currentTime: 60,
+    paused: true,
+  });
+  // Assert exact seek while the real media clock is stationary, then start it.
+  await waitForPlayerProgress(tabId, 60 / 310);
   await setSyntheticPlayback(page.frameLocator('#main-player'), '#main-video', {
     currentTime: 60,
     paused: false,
   });
-  await waitForPlayerProgress(tabId, 60 / 310);
   await expect.poll(async () => {
     const history = await worker.evaluate(async () => (await chrome.storage.local.get('watch-history'))['watch-history']);
     const record = Object.values(history?.records || {})[0] as { watchedSeconds?: number } | undefined;
@@ -233,10 +1291,14 @@ test('recognizes anime before playback and confirms player after playback starts
   await popup.waitForTimeout(250);
   expect(popupReloads).toBe(0);
   await expect(popup.locator('#title')).toHaveText('Расхититель гробниц');
-  await expect(popup.locator('#anireko-match')).toHaveText('В каталоге: Расхититель гробниц (2024)');
+  await expect(popup.locator('.anime-meta #anime-year')).toHaveText('2024');
+  await expect(popup.locator('#anireko-match')).toBeHidden();
+  const yearBox = await popup.locator('#anime-year').boundingBox();
+  const actionBox = await popup.locator('#anime-primary-action').boundingBox();
+  expect(yearBox!.y + yearBox!.height).toBeLessThanOrEqual(actionBox!.y);
   await expect(popup.locator('#anime-primary-action')).toHaveText('Открыть в AniReko →');
   await expect(popup.locator('#anime-primary-action'))
-    .toHaveAttribute('href', 'http://127.0.0.1:4178/ru/anime/tomb-raider-4242');
+    .toHaveAttribute('href', `${apiBase}/ru/anime/tomb-raider-4242`);
   await expect(popup.locator('#voice')).toHaveText('AniTime Voice');
   await expect(popup.locator('.local-pill')).toHaveText('локально');
   await expect(popup.locator('#account-label')).toHaveText('Авторизация — через сайт AniReko');
@@ -330,7 +1392,7 @@ test('falls back to player URL episode and labeled combobox voice', async () => 
       'auto-mark': true,
       'sync-account': { id: 18, name: 'TestUser' },
     });
-    await fetch('http://127.0.0.1:4178/__test/session?on=1&user=18');
+    await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/session?on=1&user=18');
   });
   const page = await context.newPage();
   await page.goto(`${siteBase}/url-metadata-anime.html`);
@@ -354,7 +1416,7 @@ test('falls back to player URL episode and labeled combobox voice', async () => 
   await page.frameLocator('#main-player').locator('#url-video')
     .evaluate((video) => (video as HTMLVideoElement).pause());
   const readProgress = () => worker.evaluate(async () =>
-    (await (await fetch('http://127.0.0.1:4178/__test/progress')).json()));
+    (await (await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/progress')).json()));
   await expect.poll(async () => (await readProgress()).at(-1)?.episode ?? null).toBe(8);
   const urlDerivedProgress = (await readProgress()).at(-1);
   expect(urlDerivedProgress.voice).toBe('AniDUB');
@@ -417,7 +1479,7 @@ test('shows only an anime-not-found state and manually reports a recognition mis
   // after beforeEach reset. Clear counters at this test's observation boundary
   // so only requests caused by this generic-page popup are measured.
   await worker.evaluate(async () => {
-    await fetch('http://127.0.0.1:4178/__test/reset');
+    await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/reset');
   });
   const popup = await openPopup(tabId);
   await expect(popup.locator('#anime-check-title')).toHaveText('Аниме не найдено');
@@ -431,13 +1493,13 @@ test('shows only an anime-not-found state and manually reports a recognition mis
   }
 
   const before = await worker.evaluate(async () =>
-    (await (await fetch('http://127.0.0.1:4178/__test/request-counts')).json()));
+    (await (await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/request-counts')).json()));
   expect(before).toMatchObject({ search: 0, sessionInfo: 0, diagnostics: 0 });
 
   await popup.locator('#report-anime-miss').click();
   await expect(popup.locator('#report-anime-miss')).toHaveText('Отправлено, спасибо');
   const diagnostics = await worker.evaluate(async () =>
-    (await (await fetch('http://127.0.0.1:4178/__test/diagnostics')).json()));
+    (await (await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/diagnostics')).json()));
   expect(diagnostics).toHaveLength(1);
   expect(diagnostics[0]).toMatchObject({
     report_kind: 'recognition_miss',
@@ -451,15 +1513,151 @@ test('shows only an anime-not-found state and manually reports a recognition mis
   expect(serialized).not.toContain('Kimi WebBridge');
 
   const after = await worker.evaluate(async () =>
-    (await (await fetch('http://127.0.0.1:4178/__test/request-counts')).json()));
+    (await (await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/request-counts')).json()));
   expect(after).toMatchObject({ search: 0, sessionInfo: 0, diagnostics: 1 });
   await popup.close();
   await page.close();
 });
 
-test('requires a choice for duplicate exact matches, stores it locally, and syncs immediately', async () => {
+test('detects a disconnected old document despite saved recognition and recovers only after confirmation', async ({}, testInfo) => {
+  const page = await context.newPage();
+  await page.goto(`${siteBase}/anime.html`);
+  const tabId = await extensionTabId(`${siteBase}/anime.html`);
+  await expect.poll(async () => (await storedTabState(tabId))?.match?.status).toBe('ok');
+  const savedTitle = (await storedTabState(tabId)).recognition.title;
+  // Use the production shutdown path: its old document remains mounted and
+  // session recognition remains saved, but the detector no longer responds.
+  await worker.evaluate(async (id) => {
+    await chrome.tabs.sendMessage(id, { type: 'anireko-disable-detector' }, { frameId: 0 });
+    await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/reset');
+  }, tabId);
+  let navigations = 0;
+  page.on('framenavigated', (frame) => { if (frame === page.mainFrame()) navigations += 1; });
+  const popup = await openPopup(tabId);
+  await expect(popup.locator('#anime-check-title')).toHaveText('Нет подключения к странице');
+  await popup.setViewportSize({ width: 360, height: 850 });
+  expect(await popup.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+  const disconnectedScreenshot = testInfo.outputPath('compact-disconnected-ru.png');
+  await popup.screenshot({ path: disconnectedScreenshot, fullPage: true });
+  await testInfo.attach('compact-disconnected-ru', { path: disconnectedScreenshot, contentType: 'image/png' });
+  await expect(popup.locator('#not-found-report')).toBeHidden();
+  await expect(popup.locator('#report-anime-miss')).toBeDisabled();
+  await expect(popup.locator('#automark')).toBeHidden();
+  expect((await storedTabState(tabId)).recognition.title).toBe(savedTitle);
+  expect(navigations).toBe(0);
+
+  const cancelDialog = new Promise<void>((resolve) => popup.once('dialog', async (dialog) => {
+    expect(dialog.message()).toContain('прервёт воспроизведение');
+    await dialog.dismiss();
+    resolve();
+  }));
+  await popup.locator('#reload-page').click();
+  await cancelDialog;
+  expect(navigations).toBe(0);
+  const counts = await worker.evaluate(async () =>
+    (await (await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/request-counts')).json()));
+  expect(counts.diagnostics).toBe(0);
+
+  const navigation = page.waitForEvent('framenavigated', (frame) => frame === page.mainFrame());
+  popup.once('dialog', (dialog) => void dialog.accept());
+  await popup.locator('#reload-page').click();
+  await navigation;
+  await expect.poll(() => worker.evaluate(async (id) => {
+    const reply = await chrome.tabs.sendMessage(id, { type: 'anireko-detector-status' }, { frameId: 0 });
+    return reply?.ok;
+  }, tabId)).toBe(true);
+  await expect.poll(async () => (await storedTabState(tabId))?.match?.status).toBe('ok');
+  const recoveredPopup = await openPopup(tabId);
+  await expect(recoveredPopup.locator('#anime-check-title')).toHaveText('Аниме найдено');
+  await expect(recoveredPopup.locator('#page-recovery')).toBeHidden();
+  await recoveredPopup.close();
+  if (!popup.isClosed()) await popup.close();
+  await page.close();
+});
+
+test('does not render old-document recognition when a new detector is connected at the same URL', async () => {
+  const page = await context.newPage();
+  await page.goto(`${siteBase}/anime.html`);
+  const tabId = await extensionTabId(`${siteBase}/anime.html`);
+  await expect.poll(async () => (await storedTabState(tabId))?.match?.status).toBe('ok');
+  await waitForDetectorReady(tabId);
+  const oldState = await storedTabState(tabId);
   await worker.evaluate(async () => {
-    await fetch('http://127.0.0.1:4178/__test/session?on=1&user=18');
+    (globalThis as any).AniRekoTestHooks.resetVolatileCaches();
+    await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/session?on=1&user=18');
+    await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/taste-hold?on=1');
+  });
+  try {
+    // A real old-document sensor message blocks on the held taste API response.
+    await page.frameLocator('#main-player').locator('#episode-select').selectOption({ label: '12 серия' });
+    await expect.poll(() => worker.evaluate(async () =>
+      (await (await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/taste-hold')).json()).pending)).toBeGreaterThan(0);
+    await page.reload();
+    await expect.poll(() => worker.evaluate(async (id) =>
+      (await chrome.tabs.sendMessage(id, { type: 'anireko-detector-status' }, { frameId: 0 })).documentToken,
+    tabId)).not.toBe(oldState.navigationToken);
+    expect((await storedTabState(tabId)).navigationToken).toBe(oldState.navigationToken);
+    const popup = await openPopup(tabId);
+    await expect(popup.locator('#anime-check-title')).toHaveText('Ищем страницу аниме');
+    await expect(popup.locator('#anime-check .recognized-only')).toBeHidden();
+    await expect(popup.locator('#not-found-report')).toBeHidden();
+    await expect(popup.locator('#automark')).toBeHidden();
+    await worker.evaluate(async () => {
+      await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/taste-hold?on=0');
+    });
+    await expect(popup.locator('#anime-check-title')).toHaveText('Аниме найдено');
+    await popup.close();
+  } finally {
+    await worker.evaluate(async () => {
+      await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/taste-hold?on=0');
+    });
+    await page.close();
+  }
+});
+
+test('detects actual extension reload in an already-open tab and restores on page reload', async () => {
+  const page = await context.newPage();
+  await page.goto(`${siteBase}/anime.html`);
+  const tabId = await extensionTabId(`${siteBase}/anime.html`);
+  await expect.poll(async () => (await storedTabState(tabId))?.match?.status).toBe('ok');
+  const session = await context.browser()!.newBrowserCDPSession();
+  const restarted = context.waitForEvent('serviceworker');
+  // Loading the same unpacked path reloads it through the browser's extension
+  // loader, without uninstalling or clearing the test profile's local data.
+  const loaded = await session.send('Extensions.loadUnpacked', { path: extensionPath });
+  expect(loaded.id).toBe(extensionId);
+  const openingPopup = openPopup(tabId);
+  worker = await restarted;
+  const popup = await openingPopup;
+  await expect(popup.locator('#anime-check-title')).toHaveText('Нет подключения к странице');
+  await expect(popup.locator('#not-found-report')).toBeHidden();
+  await popup.close();
+  await page.reload();
+  await expect.poll(async () => (await storedTabState(tabId))?.match?.status).toBe('ok');
+  const recovered = await openPopup(tabId);
+  await expect(recovered.locator('#anime-check-title')).toHaveText('Аниме найдено');
+  await recovered.close();
+  await page.close();
+});
+
+test('does not mistake a restricted browser page for an anime recognition miss', async () => {
+  const page = await context.newPage();
+  // Without the tabs permission Chrome redacts restricted-page URLs. Capture
+  // the exact ID while the tab is still an authorized HTTP document.
+  await page.goto(`${siteBase}/generic-video.html`);
+  const tabId = await extensionTabId(`${siteBase}/generic-video.html`);
+  await page.goto('about:blank');
+  const popup = await openPopup(tabId);
+  await expect(popup.locator('#anime-check-title')).toHaveText('Эта страница недоступна расширению');
+  await expect(popup.locator('#not-found-report')).toBeHidden();
+  await expect(popup.locator('#page-recovery')).toBeHidden();
+  await popup.close();
+  await page.close();
+});
+
+test('requires a choice for duplicate exact matches, stores it locally, and syncs immediately', async ({}, testInfo) => {
+  await worker.evaluate(async () => {
+    await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/session?on=1&user=18');
     await chrome.storage.local.set({
       'auto-mark': true,
       'sync-account': { id: 18, name: 'TestUser' },
@@ -482,6 +1680,11 @@ test('requires a choice for duplicate exact matches, stores it locally, and sync
   await expect(popup.locator('#anime-check-title')).toHaveText('Нужно подтвердить аниме');
   await expect(popup.locator('#anireko-match')).toHaveText('Совпадение в каталоге ещё не подтверждено');
   await expect(popup.locator('.match-candidate')).toHaveCount(2);
+  await popup.setViewportSize({ width: 360, height: 850 });
+  expect(await popup.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+  const ambiguousScreenshot = testInfo.outputPath('compact-ambiguous-ru.png');
+  await popup.screenshot({ path: ambiguousScreenshot, fullPage: true });
+  await testInfo.attach('compact-ambiguous-ru', { path: ambiguousScreenshot, contentType: 'image/png' });
   const chosenCandidate = popup.locator('.match-candidate').filter({ hasText: '2022 · ONA' });
   await expect(chosenCandidate).toHaveCount(1);
   await expect.poll(() => worker.evaluate(
@@ -500,12 +1703,12 @@ test('requires a choice for duplicate exact matches, stores it locally, and sync
   )).not.toBe('!');
   await expect.poll(async () => {
     const posts = await worker.evaluate(async () =>
-      (await (await fetch('http://127.0.0.1:4178/__test/progress')).json()));
+      (await (await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/progress')).json()));
     return posts.at(-1)?.anime_id ?? null;
   }).toBe(19119);
   await expect.poll(async () => {
     const posts = await worker.evaluate(async () =>
-      (await (await fetch('http://127.0.0.1:4178/__test/status-posts')).json()));
+      (await (await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/status-posts')).json()));
     return posts.at(-1)?.status ?? null;
   }).toBe('watching');
 
@@ -600,6 +1803,47 @@ test('prefers a later episode H1 over duplicated site-brand headings', async () 
       animeId: state?.match?.animeId ?? null,
     };
   }).toEqual({ title: 'Saimin Jutsu 2', animeId: 23001 });
+  await page.close();
+});
+
+test('current-title aliases hydrate on the same URL, exclude recommendations, and revoke ambiguous scope', async () => {
+  const page = await context.newPage();
+  await page.goto(`${siteBase}/title-alternatives.html`);
+  const tabId = await extensionTabId(`${siteBase}/title-alternatives.html`);
+  await expect.poll(async () => (await storedTabState(tabId))?.match?.status).toBe('none');
+  // Even a same-title .titles block inside recommendations cannot authorize aliases.
+  await page.locator('aside').evaluate(block => {
+    block.innerHTML = '<div class="titles"><h1>Водное поло на грани фола</h1>'
+      + '<ul class="alt-names-list"><li>Hantsu x Trash</li></ul></div>';
+  });
+  await expect.poll(async () => (await storedTabState(tabId))?.recognition?.alternativeTitles).toEqual([]);
+  await page.locator('.content-page .titles .alt-names-list').evaluate((list) => {
+    list.innerHTML = '<li>Hantsu x Torasshu</li><li>Hantsu x Trash</li><li>…</li>'
+      + '<li><a href="/other">Linked recommendation</a></li><li>ハンツー×トラッシュ</li>';
+  });
+  await expect.poll(async () => (await storedTabState(tabId))?.match?.animeId).toBe(11758);
+  expect((await storedTabState(tabId)).recognition.alternativeTitles)
+    .toEqual(['Hantsu x Torasshu', 'Hantsu x Trash', 'ハンツー×トラッシュ']);
+  // Several unchanged DOM rescans must not issue another search.
+  const before = await page.request.get(`${apiBase}/__test/request-counts`).then(r => r.json());
+  for (let index = 0; index < 3; index++) await page.evaluate(() => document.body.append(document.createElement('span')));
+  expect(await page.request.get(`${apiBase}/__test/request-counts`).then(r => r.json())).toMatchObject({ searchQueries: before.searchQueries });
+  expect(before.searchQueries).toEqual(['Водное поло на грани фола', 'Водное поло на грани фола',
+    'Hantsu x Torasshu', 'Hantsu x Trash', 'ハンツー×トラッシュ']);
+  await page.locator('.content-page .titles').evaluate(block => block.after(block.cloneNode(true)));
+  await expect.poll(async () => (await storedTabState(tabId))?.recognition?.alternativeTitles).toEqual([]);
+  await expect.poll(async () => (await storedTabState(tabId))?.match?.status).toBe('none');
+  await page.close();
+});
+
+test('same-title recommendation block cannot supply aliases for the actual primary H1', async () => {
+  const page = await context.newPage();
+  await page.goto(`${siteBase}/title-alternatives-decoy.html`);
+  const tabId = await extensionTabId(`${siteBase}/title-alternatives-decoy.html`);
+  await expect.poll(async () => (await storedTabState(tabId))?.match?.status).toBe('none');
+  expect((await storedTabState(tabId)).recognition.alternativeTitles).toEqual([]);
+  const counts = await page.request.get(`${apiBase}/__test/request-counts`).then(r => r.json());
+  expect(counts.searchQueries).toEqual(['Водное поло на грани фола']);
   await page.close();
 });
 
@@ -701,11 +1945,10 @@ test('detects a shadow-DOM web-component player and joins the host episode attri
     currentTime: 60,
     paused: false,
   });
-  await waitForPlayerProgress(tabId, 60 / 310);
-  const state = await storedTabState(tabId);
   // Episode is only an attribute on the <fake-player> host in the top page;
   // the frame itself reports episode=null and must be backfilled.
-  expect(state.player.episode).toBe(3);
+  await waitForPlayerProgress(tabId, 60 / 310);
+  await expect.poll(async () => (await storedTabState(tabId))?.player?.episode ?? null).toBe(3);
 
   // A top-page script cannot forge player state with postMessage.
   await page.evaluate(() => {
@@ -736,7 +1979,7 @@ test('detects a shadow-DOM web-component player and joins the host episode attri
   await page.close();
 });
 
-test('auto-reports a diagnostic when the anime is recognized but the player is unreadable', async () => {
+test('auto-report requires a confirmed anime and a real player interaction', async () => {
   // Diagnostics are a separate opt-in. Shrink the grace period so the test
   // can first prove default-off, then enable it explicitly.
   await worker.evaluate(async () => {
@@ -761,7 +2004,7 @@ test('auto-reports a diagnostic when the anime is recognized but the player is u
 
   // Auto-report (KAN-2715): exactly one anonymous POST, hostname only.
   const readDiagnostics = () => worker.evaluate(async () =>
-    (await (await fetch('http://127.0.0.1:4178/__test/diagnostics')).json()));
+    (await (await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/diagnostics')).json()));
   await page.waitForTimeout(2_000);
   expect(await readDiagnostics()).toHaveLength(0);
   await worker.evaluate(async () => {
@@ -771,6 +2014,20 @@ test('auto-reports a diagnostic when the anime is recognized but the player is u
     });
   });
   await page.reload();
+  await expect.poll(async () => {
+    const state = await storedTabState(tabId);
+    return state?.match?.status ?? null;
+  }, { timeout: 10_000 }).toBe('ok');
+  await page.waitForTimeout(2_000);
+  expect(await readDiagnostics()).toHaveLength(0);
+
+  // A generic CSS class containing "play" (display-flex) is not playback
+  // intent and must not re-open the noisy pre-play diagnostic path.
+  await page.locator('#unrelated-action').click();
+  await page.waitForTimeout(2_000);
+  expect(await readDiagnostics()).toHaveLength(0);
+
+  await page.frameLocator('#opaque-player').locator('#start-player').click();
   await expect.poll(readDiagnostics, { timeout: 10_000 }).toHaveLength(1);
   const [diagnostic] = await readDiagnostics();
   expect(diagnostic.host).toBe('127.0.0.2');
@@ -783,9 +2040,61 @@ test('auto-reports a diagnostic when the anime is recognized but the player is u
   // Repeat visit to the same host must NOT produce a second report (7d dedup).
   const secondPage = await context.newPage();
   await secondPage.goto(`${siteBase}/broken-anime.html`);
+  await secondPage.frameLocator('#opaque-player').locator('#start-player').click();
   await secondPage.waitForTimeout(3_000);
   expect(await readDiagnostics()).toHaveLength(1);
   await secondPage.close();
+});
+
+test('does not report a click-to-load player that becomes readable after interaction', async () => {
+  await worker.evaluate(async () => {
+    const stored = await chrome.storage.local.get('privacy-consent');
+    await chrome.storage.local.set({
+      'diag-grace-ms': 1500,
+      'privacy-consent': { ...stored['privacy-consent'], diagnostics: true },
+    });
+  });
+  const page = await context.newPage();
+  await page.goto(`${siteBase}/click-to-play-anime.html`);
+  const tabId = await extensionTabId(`${siteBase}/click-to-play-anime.html`);
+  const readDiagnostics = () => worker.evaluate(async () =>
+    (await (await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/diagnostics')).json()));
+
+  await expect.poll(async () => (await storedTabState(tabId))?.match?.status ?? null, {
+    timeout: 10_000,
+  }).toBe('ok');
+  await page.waitForTimeout(2_000);
+  expect(await readDiagnostics()).toHaveLength(0);
+  await page.frameLocator('#click-player').locator('#start-player').click();
+  await expect.poll(async () => (await storedTabState(tabId))?.player?.duration ?? 0, {
+    timeout: 10_000,
+  }).toBeGreaterThan(0);
+  await page.waitForTimeout(2_000);
+  expect(await readDiagnostics()).toHaveLength(0);
+  await page.close();
+});
+
+test('does not report an interacted player when catalog recognition is unconfirmed', async () => {
+  await worker.evaluate(async () => {
+    const stored = await chrome.storage.local.get('privacy-consent');
+    await chrome.storage.local.set({
+      'diag-grace-ms': 1500,
+      'privacy-consent': { ...stored['privacy-consent'], diagnostics: true },
+    });
+  });
+  const page = await context.newPage();
+  await page.goto(`${siteBase}/missing-catalog-broken-anime.html`);
+  const tabId = await extensionTabId(`${siteBase}/missing-catalog-broken-anime.html`);
+  await expect.poll(async () => (await storedTabState(tabId))?.match?.status ?? null, {
+    timeout: 10_000,
+  }).toBe('none');
+
+  await page.frameLocator('#opaque-player').locator('#start-player').click();
+  await page.waitForTimeout(3_000);
+  const diagnostics = await worker.evaluate(async () =>
+    (await (await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/diagnostics')).json()));
+  expect(diagnostics).toHaveLength(0);
+  await page.close();
 });
 
 test('tracks a full-length movie without any episode markup', async () => {
@@ -820,7 +2129,7 @@ test('shows episode and voice from an unstarted proprietary iframe shell', async
       'auto-mark': true,
       'sync-account': { id: 18, name: 'TestUser' },
     });
-    await fetch('http://127.0.0.1:4178/__test/session?on=1&user=18');
+    await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/session?on=1&user=18');
   });
   const page = await context.newPage();
   await page.goto(`${siteBase}/shell-anime.html`);
@@ -853,7 +2162,7 @@ test('manual sync sends saved terminal progress after reload leaves the player u
       'auto-mark': true,
       'sync-account': { id: 18, name: 'TestUser' },
     });
-    await fetch('http://127.0.0.1:4178/__test/session?on=1&user=18');
+    await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/session?on=1&user=18');
   });
   const page = await context.newPage();
   await page.goto(`${siteBase}/shell-terminal-anime.html`);
@@ -900,7 +2209,7 @@ test('manual sync sends saved terminal progress after reload leaves the player u
   await syncButton.click();
   await expect(syncButton).toHaveText('✓ обновлено');
   const progress = await worker.evaluate(async () =>
-    (await (await fetch('http://127.0.0.1:4178/__test/progress')).json()));
+    (await (await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/progress')).json()));
   expect(progress.at(-1)).toMatchObject({
     anime_id: 4242,
     episode: 12,
@@ -909,7 +2218,7 @@ test('manual sync sends saved terminal progress after reload leaves the player u
     expected_user_id: 18,
   });
   const status = await worker.evaluate(async () =>
-    (await (await fetch('http://127.0.0.1:4178/__test/status-posts')).json()));
+    (await (await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/status-posts')).json()));
   expect(status).toEqual([{ anime_id: 4242, status: 'completed', expected_user_id: 18 }]);
   const migratedAnimeId = await worker.evaluate(async () => {
     const history = (await chrome.storage.local.get('watch-history'))['watch-history'];
@@ -927,8 +2236,8 @@ test('manual sync shows a failure when saved progress exists but the write is re
       'auto-mark': true,
       'sync-account': { id: 18, name: 'TestUser' },
     });
-    await fetch('http://127.0.0.1:4178/__test/session?on=1&user=18');
-    await fetch('http://127.0.0.1:4178/__test/fail-progress-writes?on=1');
+    await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/session?on=1&user=18');
+    await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/fail-progress-writes?on=1');
   });
   const page = await context.newPage();
   await page.goto(`${siteBase}/shell-terminal-anime.html`);
@@ -967,7 +2276,7 @@ test('manual sync shows a failure when saved progress exists but the write is re
   await syncButton.click();
   await expect(syncButton).toHaveText('Не удалось синхронизировать');
   const progress = await worker.evaluate(async () =>
-    (await (await fetch('http://127.0.0.1:4178/__test/progress')).json()));
+    (await (await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/progress')).json()));
   expect(progress).toEqual([]);
 
   await popup.close();
@@ -980,7 +2289,7 @@ test('auto-marks watching on a completed episode 2+ even without earlier local h
       'auto-mark': true,
       'sync-account': { id: 18, name: 'TestUser' },
     });
-    await fetch('http://127.0.0.1:4178/__test/session?on=1');
+    await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/session?on=1');
   });
   const page = await context.newPage();
   await page.goto(`${siteBase}/anime.html`);
@@ -998,7 +2307,7 @@ test('auto-marks watching on a completed episode 2+ even without earlier local h
   await expect.poll(async () => (await storedTabState(tabId))?.player?.watched ?? false)
     .toBe(true);
   const readPosts = () => worker.evaluate(async () =>
-    (await (await fetch('http://127.0.0.1:4178/__test/status-posts')).json()));
+    (await (await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/status-posts')).json()));
   await page.waitForTimeout(2_000);
   expect(await readPosts()).toHaveLength(0);
 
@@ -1035,7 +2344,7 @@ test('promotes watching to completed once on finished episode 12 of 12', async (
     await chrome.storage.local.set({
       'auto-mark': true,
       'sync-account': { id: 18, name: 'TestUser' },
-      'search-cache-version': 7,
+      'search-cache-version': 8,
       'search-cache': {
         'расхититель гробниц': {
           match: {
@@ -1056,8 +2365,8 @@ test('promotes watching to completed once on finished episode 12 of 12', async (
         },
       },
     });
-    await fetch('http://127.0.0.1:4178/__test/session?on=1&user=18');
-    await fetch('http://127.0.0.1:4178/__test/watch-status?value=watching');
+    await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/session?on=1&user=18');
+    await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/watch-status?value=watching');
   });
   const page = await context.newPage();
   await page.goto(`${siteBase}/anime.html`);
@@ -1066,24 +2375,27 @@ test('promotes watching to completed once on finished episode 12 of 12', async (
     .selectOption({ label: '12 серия' });
   await expect.poll(async () => (await storedTabState(tabId))?.player?.episode ?? null)
     .toBe(12);
+  const countsBeforePlayback = await worker.evaluate(async () =>
+    (await (await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/request-counts')).json()));
+  expect(countsBeforePlayback.search, 'seeded partial cache should serve recognition without a search').toBe(0);
   await setSyntheticPlayback(page.frameLocator('#main-player'), '#main-video', {
     currentTime: 260,
     paused: false,
   });
 
   const readPosts = () => worker.evaluate(async () =>
-    (await (await fetch('http://127.0.0.1:4178/__test/status-posts')).json()));
+    (await (await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/status-posts')).json()));
   await expect.poll(readPosts, { timeout: 15_000 })
     .toEqual([{ anime_id: 4242, status: 'completed', expected_user_id: 18 }]);
   const countsAfterTransition = await worker.evaluate(async () =>
-    (await (await fetch('http://127.0.0.1:4178/__test/request-counts')).json()));
-  expect(countsAfterTransition.search).toBe(1);
+    (await (await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/request-counts')).json()));
+  expect(countsAfterTransition.search, JSON.stringify(countsAfterTransition.searchQueries)).toBe(1);
 
   // More watched ticks are folded by the local transition key before the
   // account/session lookup, not merely before the final POST.
   await page.waitForTimeout(6_000);
   const countsAfterMoreTicks = await worker.evaluate(async () =>
-    (await (await fetch('http://127.0.0.1:4178/__test/request-counts')).json()));
+    (await (await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/request-counts')).json()));
   expect(countsAfterMoreTicks.search).toBe(countsAfterTransition.search);
   expect(countsAfterMoreTicks.statusPosts).toBe(countsAfterTransition.statusPosts);
   await page.close();
@@ -1091,7 +2403,7 @@ test('promotes watching to completed once on finished episode 12 of 12', async (
 
 test('scopes taste cache to the live AniReko account', async () => {
   await worker.evaluate(async () => {
-    await fetch('http://127.0.0.1:4178/__test/session?on=1&user=18');
+    await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/session?on=1&user=18');
   });
   const page = await context.newPage();
   await page.goto(`${siteBase}/anime.html`);
@@ -1099,7 +2411,7 @@ test('scopes taste cache to the live AniReko account', async () => {
   await expect.poll(async () => (await storedTabState(tabId))?.taste?.percent ?? null).toBe(87);
 
   await worker.evaluate(async () => {
-    await fetch('http://127.0.0.1:4178/__test/session?on=1&user=953');
+    await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/session?on=1&user=953');
   });
   const accountPopup = await openPopup(tabId);
   await expect(accountPopup.locator('#account-label')).toContainText('Demo YooKassa');
@@ -1122,7 +2434,7 @@ test('syncs resume progress on pause (episode, position, voice — no URL)', asy
       'auto-mark': true,
       'sync-account': { id: 18, name: 'TestUser' },
     });
-    await fetch('http://127.0.0.1:4178/__test/session?on=1&user=18');
+    await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/session?on=1&user=18');
   });
   const page = await context.newPage();
   await page.goto(`${siteBase}/anime.html`);
@@ -1139,7 +2451,7 @@ test('syncs resume progress on pause (episode, position, voice — no URL)', asy
     .evaluate((video) => (video as HTMLVideoElement).pause());
 
   const readProgress = () => worker.evaluate(async () =>
-    (await (await fetch('http://127.0.0.1:4178/__test/progress')).json()));
+    (await (await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/progress')).json()));
   await expect.poll(async () => {
     const progress = await readProgress();
     return progress[progress.length - 1]?.position_sec ?? null;
@@ -1188,9 +2500,14 @@ test('serializes progress writes and restores the final state after a cold worke
       'auto-mark': true,
       'sync-account': { id: 18, name: 'TestUser' },
     });
-    await fetch('http://127.0.0.1:4178/__test/session?on=1&user=18');
+    await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/session?on=1&user=18');
+    // A preceding closed tab can observe the fixture's reset guest session.
+    // Observe the new account through the production read/epoch path before
+    // capturing direct-writer bindings; never suppress write_binding_changed.
+    const session = await (globalThis as any).handlePopupRequest({ type: 'popup-session-info' });
+    if (!session.ok || session.payload?.user?.id !== 18) throw new Error('fixture_account_not_ready');
     const state = {
-      sourceOrigin: 'http://127.0.0.2:4178',
+      sourceOrigin: (globalThis as any).AniRekoRuntimeConfig.apiBase.replace('127.0.0.1', '127.0.0.2'),
       match: { status: 'ok', exact: true, animeId: 4242 },
       player: { playbackStarted: true, currentTime: 100, duration: 310, episode: 2, voice: 'AniTime Voice' },
       recognition: { voice: 'AniTime Voice' },
@@ -1202,16 +2519,16 @@ test('serializes progress writes and restores the final state after a cold worke
     await Promise.all([first, second]);
   });
   const counts = await worker.evaluate(async () =>
-    (await (await fetch('http://127.0.0.1:4178/__test/request-counts')).json()));
+    (await (await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/request-counts')).json()));
   expect(counts.maxProgressPostsInFlight).toBe(1);
   const directPosts = await worker.evaluate(async () =>
-    (await (await fetch('http://127.0.0.1:4178/__test/progress')).json()));
+    (await (await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/progress')).json()));
   expect(directPosts.map((post: { position_sec: number }) => post.position_sec)).toEqual([100, 200]);
 
   const coldTabId = 987654;
   await worker.evaluate(async ({ id, key }) => {
     const state = {
-      sourceOrigin: 'http://127.0.0.2:4178',
+      sourceOrigin: (globalThis as any).AniRekoRuntimeConfig.apiBase.replace('127.0.0.1', '127.0.0.2'),
       match: { status: 'ok', exact: true, animeId: 4242 },
       recognition: { voice: 'AniTime Voice' },
       player: {
@@ -1229,7 +2546,7 @@ test('serializes progress writes and restores the final state after a cold worke
   }, { id: coldTabId, key: `tab:${coldTabId}` });
   await expect.poll(async () => {
     const posts = await worker.evaluate(async () =>
-      (await (await fetch('http://127.0.0.1:4178/__test/progress')).json()));
+      (await (await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/progress')).json()));
     return posts.at(-1)?.position_sec ?? null;
   }, { timeout: 10_000 }).toBe(240);
 });
@@ -1240,8 +2557,8 @@ test('pauses sync when the site cookie switches to another account until explici
       'auto-mark': true,
       'sync-account': { id: 18, name: 'TestUser' },
     });
-    await fetch('http://127.0.0.1:4178/__test/session?on=1&user=18');
-    await fetch('http://127.0.0.1:4178/__test/session?on=1&user=953');
+    await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/session?on=1&user=18');
+    await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/session?on=1&user=953');
   });
   const page = await context.newPage();
   await page.goto(`${siteBase}/anime.html`);
@@ -1254,7 +2571,7 @@ test('pauses sync when the site cookie switches to another account until explici
   await expect(popup.locator('#resume-sync')).toBeDisabled();
 
   const before = await worker.evaluate(async () =>
-    (await (await fetch('http://127.0.0.1:4178/__test/progress')).json()).length);
+    (await (await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/progress')).json()).length);
   await worker.evaluate(async () => {
     await eval('maybeSyncProgress')({
       match: { status: 'ok', exact: true, animeId: 4242 },
@@ -1264,7 +2581,7 @@ test('pauses sync when the site cookie switches to another account until explici
   });
   await page.waitForTimeout(300);
   const afterBlocked = await worker.evaluate(async () =>
-    (await (await fetch('http://127.0.0.1:4178/__test/progress')).json()).length);
+    (await (await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/progress')).json()).length);
   expect(afterBlocked).toBe(before);
 
   popup.once('dialog', (dialog) => dialog.accept());
@@ -1276,7 +2593,7 @@ test('pauses sync when the site cookie switches to another account until explici
       'auto-mark': true,
       'sync-account': { id: 18, name: 'TestUser' },
     });
-    await fetch('http://127.0.0.1:4178/__test/session?on=1&user=18');
+    await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/session?on=1&user=18');
   });
   await popup.close();
   await page.close();
@@ -1314,7 +2631,7 @@ test('keeps the visible episodic player active when a hidden short video is also
 });
 
 test('native Chrome host access detects an unseen site and its cross-origin player', async () => {
-  const unseenOrigin = 'http://127.0.0.3:4178';
+  const unseenOrigin = `http://127.0.0.3:${fixturePort}`;
   const page = await context.newPage();
   await page.goto(`${unseenOrigin}/anime.html`);
   const tabId = await extensionTabId(`${unseenOrigin}/*`);

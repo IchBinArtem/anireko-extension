@@ -4,8 +4,9 @@ import os from 'node:os';
 import path from 'node:path';
 
 const sourceExtensionPath = path.resolve(__dirname, '../../../extension');
-const apiBase = 'http://127.0.0.1:4178';
-const siteBase = 'http://127.0.0.2:4178';
+const fixturePort = Number(process.env.ANIREKO_EXTENSION_FIXTURE_PORT || 4178);
+const apiBase = `http://127.0.0.1:${fixturePort}`;
+const siteBase = `http://127.0.0.2:${fixturePort}`;
 
 test('browser restart preserves consent and native host access but clears URL-bearing session state', async () => {
   test.setTimeout(60_000);
