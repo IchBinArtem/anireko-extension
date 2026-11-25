@@ -1183,8 +1183,9 @@ test('compact popup keeps a long recognized title and action usable at 360 and 3
     await expect.poll(() => popup!.evaluate(() => {
       const brand = document.querySelector('.brand')!.getBoundingClientRect();
       const card = document.querySelector('#anime-check')!.getBoundingClientRect();
-      return brand.bottom <= card.top && document.documentElement.scrollWidth <= 220;
-    })).toBe(true);
+      const root = document.documentElement;
+      return { brandAboveCard: brand.bottom <= card.top, horizontalOverflow: root.scrollWidth - root.clientWidth };
+    })).toEqual({ brandAboveCard: true, horizontalOverflow: 0 });
     const geometries = [];
     for (const width of [360, 390]) {
       await popup.setViewportSize({ width, height: 850 });

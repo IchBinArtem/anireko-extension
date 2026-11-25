@@ -29,6 +29,9 @@ main:has(#privacy-disclosure[hidden]) #anime-check-title { padding-right: 100px;
 @media (max-width: 320px) {
   main:has(#privacy-disclosure[hidden]) > .brand { position: static; margin-bottom: 8px; }
   main:has(#privacy-disclosure[hidden]) #anime-check-title { padding-right: 0; }
+  main { padding-inline: 10px; overflow-wrap: anywhere; }
+  .stats-head { flex-wrap: wrap; }
+  #resume-sync { max-width: 100%; white-space: normal; }
 }
 .privacy-disclosure {
   margin: 0 0 12px;
