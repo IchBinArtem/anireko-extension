@@ -640,7 +640,7 @@
       .slice(0, 50).map((frame) => ({
         src: frame.src,
         visible: isLocallyVisible(frame),
-        episode: recognitionApi.episodeFromPlayerUrl(frame.src || ''),
+        episode: recognitionApi.episodeFromPlayerUrl(frame.src || '') ?? episodeFromFrameHost(frame),
         rect: {
           width: Math.round(frame.getBoundingClientRect().width),
           height: Math.round(frame.getBoundingClientRect().height)
@@ -656,6 +656,15 @@
       frames,
       observedAt: Date.now()
     }).catch(() => {});
+  }
+
+  function episodeFromFrameHost(frame) {
+    const host = frame.getRootNode()?.host;
+    if (!host?.tagName?.includes('-')) return null;
+    const raw = host.getAttribute('episode') ?? host.getAttribute('data-episode');
+    if (!/^\d+$/u.test(raw ?? '')) return null;
+    const episode = Number(raw);
+    return episode > 0 && episode <= 5000 ? episode : null;
   }
 
   function reportPageObserved() {

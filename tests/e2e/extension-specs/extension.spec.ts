@@ -1148,6 +1148,21 @@ test('renders the English manifest and popup for an English Chrome UI', async ({
   }
 });
 
+test('toolbar popup opens at its natural width', async () => {
+  const inspector = await context.newPage();
+  try {
+    await inspector.goto(`chrome-extension://${extensionId}/popup.html`);
+    await worker.evaluate(() => chrome.action.openPopup());
+    await expect.poll(() => inspector.evaluate(() => {
+      const [popup] = chrome.extension.getViews({ type: 'popup' });
+      return popup?.document.body?.getBoundingClientRect().width ?? null;
+    })).toBe(360);
+  } finally {
+    await inspector.evaluate(() => chrome.extension.getViews({ type: 'popup' }).forEach(popup => popup.close()));
+    await inspector.close();
+  }
+});
+
 test('compact popup keeps a long recognized title and action usable at 360 and 390', async ({}, testInfo) => {
   const { page, tabId } = await localPopupPage();
   let popup: Page | null = null;
@@ -1162,6 +1177,14 @@ test('compact popup keeps a long recognized title and action usable at 360 and 3
     }, { key: `tab:${tabId}`, title: longTitle });
     popup = await openPopup(tabId);
     await expect(popup.locator('#title')).toHaveText(longTitle);
+    await popup.setViewportSize({ width: 800, height: 850 });
+    await expect.poll(() => popup!.locator('body').evaluate(node => node.getBoundingClientRect().width)).toBe(360);
+    await popup.setViewportSize({ width: 220, height: 850 });
+    await expect.poll(() => popup!.evaluate(() => {
+      const brand = document.querySelector('.brand')!.getBoundingClientRect();
+      const card = document.querySelector('#anime-check')!.getBoundingClientRect();
+      return brand.bottom <= card.top && document.documentElement.scrollWidth <= 220;
+    })).toBe(true);
     const geometries = [];
     for (const width of [360, 390]) {
       await popup.setViewportSize({ width, height: 850 });
