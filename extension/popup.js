@@ -841,11 +841,14 @@
   const watchCard = document.getElementById('watch-cycle-card');
   const watchFeedback = document.getElementById('watch-feedback');
   const watchActions = document.getElementById('watch-actions');
+  let watchCycleRenderVersion = 0;
   async function renderWatchCycle() {
     if (!matchConfirmed || !syncAccountActive) return;
+    const renderVersion = ++watchCycleRenderVersion;
     const renderEpoch = accountActivityEpoch;
     const renderRevision = localWriteRevision;
-    const canPublish = () => syncAccountActive && accountActivityEpoch === renderEpoch
+    const canPublish = () => renderVersion === watchCycleRenderVersion
+      && syncAccountActive && accountActivityEpoch === renderEpoch
       && localWriteRevision === renderRevision;
     watchProjection = null;
     await renderResume(false);
