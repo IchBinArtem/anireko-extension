@@ -1978,6 +1978,48 @@ test('actual status conflict cannot be crossed by a queued progress admission co
   assert.deepEqual(violations, [], 'no actual progress POST after the shared admission has closed');
 });
 
+test('popup history survives a player update without authorizing a stale progress event', async () => {
+  let release;
+  const held = new Promise(resolve => { release = resolve; });
+  const { context } = loadServiceWorker({ historyFetchImpl: async () => {
+    await held;
+    return { ok: true, status: 200, json: async () => adoptionSnapshot(false) };
+  } });
+  const state = { ...adoptionState(), tabId: 7 };
+  context.seedState = state;
+  vm.runInContext("stateByTab['7'] = seedState", context);
+  const event = context.captureProgressEvent(state);
+  const binding = context.captureLocalWrite();
+  const popupRead = context.readWatchHistory(event, binding, 18, true, true);
+  const progressRead = context.readWatchHistory(event, binding, 18);
+  state.player = { ...state.player, currentTime: 1001 };
+  release();
+  assert.equal((await popupRead)?.history_adopted, false);
+  assert.equal(await progressRead, null);
+});
+
+test('overlapping popup history refreshes share the same live read', async () => {
+  let reads = 0;
+  let release;
+  const held = new Promise(resolve => { release = resolve; });
+  const { context } = loadServiceWorker({ historyFetchImpl: async () => {
+    reads++;
+    await held;
+    return { ok: true, status: 200, json: async () => adoptionSnapshot(false) };
+  } });
+  const state = adoptionState();
+  const event = context.captureProgressEvent(state);
+  const binding = context.captureLocalWrite();
+  const first = context.readWatchHistory(event, binding, 18, true);
+  const second = context.readWatchHistory(event, binding, 18, true);
+  release();
+  const snapshots = await Promise.all([first, second]);
+  assert.equal(reads, 1);
+  assert.deepEqual(snapshots.map(snapshot => snapshot?.history_adopted), [false, false]);
+  await context.readWatchHistory(event, binding, 18, true);
+  assert.equal(reads, 2, 'refresh after completion still fetches a new snapshot');
+});
+
 test('server conflict closes cached false adoption until explicit fresh read', async () => {
   let reads = 0; let posts = 0;
   const { context } = loadServiceWorker({
@@ -2435,7 +2477,7 @@ test('local history queue captures media and match before its asynchronous turn'
 test('day details snapshot actual observations, not mutable resume, and keep legacy and overflow partial', async () => {
   const { context, storage } = loadServiceWorker({ fetchImpl: async () => { throw Error('unexpected_network'); } });
   const midnight = new Date(2026, 9, 5, 0, 0, 0).getTime();
-  const state = { recognition: { title: 'Observed Anime' }, match: { status: 'none' } };
+  const state = { recognition: { title: 'Observed Anime' }, match: { status: 'ok', exact: true, animeId: 100 } };
   const send = async (overrides, previous = null) => {
     state.player = { episode: 1, currentTime: 10, duration: 1200, observedAt: midnight,
       reason: 'pause', playbackStarted: true, ...overrides };
@@ -2457,7 +2499,7 @@ test('day details snapshot actual observations, not mutable resume, and keep leg
   assert.equal(day.details.length, 3, 'voice and confirmed identity are separate');
   assert.equal(day.details[0].watchedSeconds, 5);
   assert.equal(day.details[0].position, 2, 'latest rewind, not greatest position');
-  assert.equal(day.details[0].animeId, null);
+  assert.equal(day.details[0].animeId, 100);
   assert.equal(day.details[2].animeId, 101);
   await send({ currentTime: 999, observedAt: midnight + 500, voice: 'A' });
   assert.equal(day.details[2].position, 50, 'older observations cannot replace the confirmed endpoint');
@@ -2475,7 +2517,7 @@ test('existing day without details stays partial even with zero total', async ()
     watchedSeconds: 0, voice: 'Old voice', lastWatchedAt: observedAt - 1000 } },
     days: { [key]: { watchedSeconds: 0, episodeKeys: [] } } } });
   const { context, storage } = loadServiceWorker({ localStorage, fetchImpl: async () => { throw Error('unexpected_network'); } });
-  const state = { recognition: { title: 'Legacy' }, match: { status: 'none' },
+  const state = { recognition: { title: 'Legacy' }, match: { status: 'ok', exact: true, animeId: 101 },
     player: { episode: 1, currentTime: 0, duration: 1200, observedAt, reason: 'pause' } };
   await context.queueHistoryUpdate(state, state.player, null);
   const day = (await storage.local.get('watch-history'))['watch-history'].days[key];
@@ -2496,14 +2538,15 @@ test('local history queue rejects a replacement page or anime before writing', a
   assert.equal((await storage.local.get('watch-history'))['watch-history'], undefined);
 });
 
-test('unmatched first-page history remains local without inventing an anime ID', async () => {
+test('unmatched video does not enter local history at any duration', async () => {
   const { context, storage } = loadServiceWorker({ fetchImpl: async () => { throw Error('unexpected_network'); } });
   const state = { tabId: 5, recognition: { title: 'Unresolved Anime' }, match: { status: 'none' },
     player: { episode: 1, currentTime: 10, duration: 1200, observedAt: 1000, reason: 'pause' } };
-  await context.queueHistoryUpdate(state, state.player, null);
-  const record = (await storage.local.get('watch-history'))['watch-history']?.records['unresolved anime::1'];
-  assert.equal(record?.animeId, null);
-  assert.equal(record?.position, 10);
+  for (const duration of [30, 1200]) {
+    state.player.duration = duration;
+    await context.queueHistoryUpdate(state, state.player, null);
+  }
+  assert.equal((await storage.local.get('watch-history'))['watch-history'], undefined);
 });
 
 test('metadata response for a replaced player cannot publish or write completion', async () => {

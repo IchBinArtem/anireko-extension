@@ -202,11 +202,11 @@ async function setupExtension() {
 
 test.beforeEach(async () => {
   await worker.evaluate(async () => {
+    const hooks = (globalThis as any).AniRekoTestHooks;
+    // Drain writes from the preceding test before resetting the fake server.
+    await hooks.resetLocalStorage();
+    hooks.resetVolatileCaches();
     await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/reset');
-    (globalThis as any).AniRekoTestHooks.resetVolatileCaches();
-    const access = await chrome.storage.local.get(['privacy-consent']);
-    await chrome.storage.local.clear();
-    await chrome.storage.local.set(access);
   });
 });
 
@@ -395,6 +395,24 @@ for (const kind of ['session', 'history'] as const) {
   }
 }
 
+test('popup loads watch history while the same player reports progress', async () => {
+  const { page, tabId } = await localPopupPage();
+  let popup: Page | null = null;
+  try {
+    await popupReadGate('history', '&hold=1');
+    popup = await openPopup(tabId);
+    await expect.poll(async () => (await popupReadGate('history')).pending).toBeGreaterThan(0);
+    await setSyntheticPlayback(page.frameLocator('#main-player'), '#main-video', { currentTime: 2, paused: true });
+    await expect.poll(async () => (await storedTabState(tabId))?.player?.currentTime).toBe(2);
+    await popupReadGate('history', '&hold=0');
+    await expect(popup.locator('#watch-completion')).toContainText('Уже просмотрено');
+  } finally {
+    await popupReadGate('history', '&hold=0&status=200');
+    await popup?.close();
+    await page.close();
+  }
+});
+
 test('popup keeps local UI on failed session and rejects old taste after an account switch during the read', async () => {
   const { page, tabId } = await localPopupPage();
   let popup: Page | null = null;
@@ -440,9 +458,8 @@ async function startCycleFixture(popup: Page, tabId: number) {
     const start = history.payload?.actions?.find((action: any) => action.command === 'start');
     if (!start) throw new Error('synthetic_start_capability_missing');
     const reply = await chrome.runtime.sendMessage({ type: 'popup-watch-command', capabilityId: start.capabilityId, expectedRevision });
-    const pending = await chrome.storage.local.get('watch-command-pending-v1');
     return { ok: reply?.ok === true, status: reply?.status, error: reply?.payload?.error || reply?.error,
-      pending: Object.hasOwn(pending, 'watch-command-pending-v1') };
+      pending: reply?.payload?.pending === true };
   }, tabId);
   if (!outcome.ok && !outcome.pending) throw new Error('synthetic_start_not_admitted: ' + JSON.stringify(outcome));
   await popup.reload();
@@ -555,6 +572,7 @@ test('native movie Complete80 then close/reopen starts one repeat without popup 
     await page.goto(`${siteBase}/movie-anime.html`);
     let tabId = await extensionTabId(`${siteBase}/movie-anime.html`);
     await waitForDetectorReady(tabId);
+    await expect.poll(async () => (await storedTabState(tabId))?.match?.animeId).toBe(4242);
     await setSyntheticPlayback(page.frameLocator('#movie-player'), '#movie-video', { currentTime: 0, paused: false });
     await expect.poll(async () => (await commands()).filter((r: any) => r.command === 'start').length,
       { timeout: 18000 }).toBe(1);
@@ -566,6 +584,7 @@ test('native movie Complete80 then close/reopen starts one repeat without popup 
     await page.goto(`${siteBase}/movie-anime.html`);
     tabId = await extensionTabId(`${siteBase}/movie-anime.html`);
     await waitForDetectorReady(tabId);
+    await expect.poll(async () => (await storedTabState(tabId))?.match?.animeId).toBe(4242);
     expect((await commands()).filter((r: any) => r.command === 'start')).toHaveLength(1);
     await setSyntheticPlayback(page.frameLocator('#movie-player'), '#movie-video', { currentTime: 0, paused: false });
     await expect.poll(async () => (await commands()).filter((r: any) => r.command === 'start').length,
@@ -2121,11 +2140,34 @@ test('does not report an interacted player when catalog recognition is unconfirm
   await page.close();
 });
 
+test('video with a recognized title but no catalog match does not enter local watch statistics', async () => {
+  const page = await context.newPage();
+  const url = `${siteBase}/missing-catalog-anime.html`;
+  try {
+    await page.goto(url);
+    const tabId = await extensionTabId(url);
+    await expect.poll(async () => {
+      const state = await storedTabState(tabId);
+      return { title: state?.recognition?.title, match: state?.match?.status };
+    }).toEqual({ title: 'Совсем неизвестное', match: 'none' });
+
+    await setSyntheticPlayback(page.frameLocator('#main-player'), '#main-video', { currentTime: 60, paused: false });
+    await expect.poll(async () => (await storedTabState(tabId))?.player?.currentTime ?? 0).toBeGreaterThan(59);
+
+    const history = await worker.evaluate(async () => (await chrome.storage.local.get('watch-history'))['watch-history']);
+    expect(history?.records ?? {}).toEqual({});
+    expect(history?.days ?? {}).toEqual({});
+  } finally {
+    await page.close();
+  }
+});
+
 test('tracks a full-length movie without any episode markup', async () => {
   const page = await context.newPage();
   await page.goto(`${siteBase}/movie-anime.html`);
   const tabId = await extensionTabId(`${siteBase}/movie-anime.html`);
   await waitForDetectorReady(tabId);
+  await expect.poll(async () => (await storedTabState(tabId))?.match?.animeId).toBe(4242);
 
   await setSyntheticPlayback(page.frameLocator('#movie-player'), '#movie-video', {
     currentTime: 60,
@@ -2142,7 +2184,9 @@ test('tracks a full-length movie without any episode markup', async () => {
   await expect.poll(async () => {
     const history = await worker.evaluate(async () =>
       (await chrome.storage.local.get('watch-history'))['watch-history']);
-    return Object.keys(history?.records || {}).some((key) => key.endsWith('::full'));
+    const records = Object.entries(history?.records || {});
+    return records.some(([key, record]: [string, any]) => key.endsWith('::full') && record.animeId === 4242)
+      && Object.values(history?.days || {}).some((day: any) => day.details?.some((item: any) => item.animeId === 4242 && item.episode === null));
   }, { timeout: 10_000 }).toBe(true);
   await page.close();
 });

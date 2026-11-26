@@ -1199,10 +1199,13 @@ function validWatchHistorySnapshot(value, userId, animeId) {
     && (value.history_adopted !== false || value.foreground.cycle_id === null);
 }
 
-async function readWatchHistory(event, writeBinding, userId, refresh = false) {
-  if (!progressEventCurrent(event, writeBinding)) return null;
+async function readWatchHistory(event, writeBinding, userId, refresh = false, documentOnly = false) {
+  const isCurrent = () => documentOnly ? watchDocumentCurrent(event, writeBinding)
+    : progressEventCurrent(event, writeBinding);
+  if (!isCurrent()) return null;
   let entry = watchHistoryReads.get(event.liveState);
-  if (refresh || !watchHistoryBindingCurrent(entry, event, writeBinding, userId)) {
+  const sameBinding = watchHistoryBindingCurrent(entry, event, writeBinding, userId);
+  if (!sameBinding || (refresh && (!entry.pending || entry.blocked))) {
     entry = { userId, animeId: event.match.animeId, revision: writeBinding.revision,
       generation: watchControllerGeneration,
       pageUrl: event.pageUrl, documentId: event.topDocumentId, navigationToken: event.navigationToken,
@@ -1222,10 +1225,11 @@ async function readWatchHistory(event, writeBinding, userId, refresh = false) {
           entry.snapshot = JSON.parse(JSON.stringify(response.payload));
         }
       } catch { /* unavailable remains unknown, not an implicit legacy fallback */ }
+      finally { entry.pending = null; }
     })();
   }
   await entry.pending;
-  if (!progressEventCurrent(event, writeBinding) || watchHistoryReads.get(event.liveState) !== entry
+  if (!isCurrent() || watchHistoryReads.get(event.liveState) !== entry
     || !watchHistoryBindingCurrent(entry, event, writeBinding, userId) || entry.blocked) return null;
   return entry.snapshot;
 }
@@ -1478,7 +1482,7 @@ async function loadWatchController(event, binding, userId, suppliedSnapshot = nu
     && prepared.generation === watchControllerGeneration && prepared.revision === binding.revision
     && watchDocumentCurrent(event, binding)) return prepared.projection;
   if (!await verifyWatchDocument(event, binding)) throw new Error('current_document_required');
-  let snapshot = suppliedSnapshot || await readWatchHistory(event, binding, userId, true);
+  let snapshot = suppliedSnapshot || await readWatchHistory(event, binding, userId, true, true);
   if (!snapshot || !watchDocumentCurrent(event, binding)) throw new Error('history_snapshot_unavailable');
   const cycleId = snapshot.foreground.cycle_id;
   const visible = snapshot.origins?.some((origin) => origin.state?.current?.cycle_id === cycleId);
@@ -2845,7 +2849,7 @@ function queueHistoryUpdate(state, player, previousPlayer, writeBinding = captur
   const recognition = event.recognition;
   player = Object.freeze({ ...(player || {}) });
   previousPlayer = previousPlayer ? Object.freeze({ ...previousPlayer }) : null;
-  if (!recognition?.title || !Number.isFinite(player?.currentTime)) {
+  if (!confirmedAnimeMatch(event.match) || !recognition?.title || !Number.isFinite(player?.currentTime)) {
     return Promise.resolve();
   }
   if (isDreamCastReleaseUrl(event.pageUrl) && player.frameId === 0 && !player.playbackStarted) {
@@ -2880,9 +2884,8 @@ function queueHistoryUpdate(state, player, previousPlayer, writeBinding = captur
       && mediaDelta > 0 && mediaDelta <= 20
       ? Math.min(wallDelta, mediaDelta)
       : 0;
-    const matchedAnimeId = confirmedAnimeMatch(event.match) ? Number(event.match.animeId) : null;
+    const matchedAnimeId = Number(event.match.animeId);
     const storedRecord = history.records[recordKey];
-    if (storedRecord?.animeId && matchedAnimeId == null) return;
     const existing = storedRecord?.animeId && Number(storedRecord.animeId) !== matchedAnimeId
       ? {
         title: recognition.title,
@@ -3505,7 +3508,7 @@ async function handlePopupRequest(message, writeBinding = captureLocalWrite()) {
       }
       const event = captureProgressEvent(state);
       const syncAccount = await activeSyncAccount(writeBinding);
-      if (!syncAccount || !progressEventCurrent(event, writeBinding)) {
+      if (!syncAccount || !watchDocumentCurrent(event, writeBinding)) {
         return { ok: false, status: 409, payload: { error: 'sync_account_mismatch' } };
       }
       const projection = await loadWatchController(event, writeBinding, syncAccount.userId);
@@ -3812,6 +3815,13 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 
 if (AniRekoRuntimeConfig.testMode === true) {
   globalThis.AniRekoTestHooks = Object.freeze({
+    async resetLocalStorage() {
+      await exclusiveLocalControl(async () => {
+        const consent = await chrome.storage.local.get('privacy-consent');
+        await chrome.storage.local.clear();
+        await chrome.storage.local.set(consent);
+      });
+    },
     resetVolatileCaches() {
       historyCache = null;
       historyLastFlushAt = 0;
