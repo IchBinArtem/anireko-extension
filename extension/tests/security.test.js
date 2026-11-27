@@ -403,6 +403,10 @@ test('public export contains every source and fixture used by release verificati
     'extension/tests/test_cws_publish.py',
     'extension/tests/test_release_workflow.py',
     'tests/e2e/extension-specs/global-setup.cjs',
+    'tests/e2e/extension-specs/extension.spec.ts-snapshots/current-cycle-resume-360-win32.png',
+    'tests/e2e/extension-specs/extension.spec.ts-snapshots/current-cycle-resume-390-win32.png',
+    'tests/e2e/extension-specs/extension.spec.ts-snapshots/current-cycle-second-watch-360-win32.png',
+    'tests/e2e/extension-specs/extension.spec.ts-snapshots/current-cycle-second-watch-390-win32.png',
     'tests/e2e/extension-specs/ad.mp4',
     'tests/e2e/extension-specs/episode.mp4',
   ];
@@ -411,7 +415,7 @@ test('public export contains every source and fixture used by release verificati
     assert.equal(fs.existsSync(path.join(repo, relative)), true, `public source misses ${relative}`);
   }
 
-  assert.equal(listed.size, 65, 'public export allowlist changed without an explicit review');
+  assert.equal(listed.size, 69, 'public export allowlist changed without an explicit review');
   const exactSupportFiles = new Set([
     '.github/dependabot.yml',
     '.github/workflows/extension-release.yml',

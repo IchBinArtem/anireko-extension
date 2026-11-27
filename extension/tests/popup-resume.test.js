@@ -11,7 +11,7 @@ async function render({ match, records, playing = false, bulk = {}, syncAccountA
   assert.ok(start >= 0 && end > start, 'execute the actual production renderer');
   const elements = {
     'resume-label': { hidden: true },
-    resume: { hidden: true, textContent: '' },
+    resume: { hidden: true, textContent: '', append(...items) { this.textContent += items.map(item => item.textContent ?? item).join(''); } },
   };
   const context = vm.createContext({
     animeFound: true,
@@ -28,7 +28,7 @@ async function render({ match, records, playing = false, bulk = {}, syncAccountA
       if (duringLoad) context.watchProjection = duringLoad;
       return { byAnime: bulk };
     },
-    document: { getElementById: (id) => elements[id] },
+    document: { getElementById: (id) => elements[id], createElement: () => ({ textContent: '' }) },
   });
   vm.runInContext(`${source.slice(start, end)}\n globalThis.run = renderResume;`, context);
   await context.run(false);
@@ -126,7 +126,7 @@ test('current active and sole paused cycle restore episode, position and voice w
   for (const status of ['active', 'paused']) {
     const resume = await renderCycleResume(cycleResumeProjection(status));
     assert.equal(resume.hidden, false);
-    assert.ok(resume.textContent.startsWith('episodeLabel:1 · 22:51 · Dream Cast'));
+    assert.ok(resume.textContent.startsWith('episodeLabel:1 · 22:51 Dream Cast'));
     assert.ok(resume.textContent.includes('resumeCycleUpdated:'), 'date is explicitly cycle-update time');
     assert.equal(resume.textContent.includes('Old cycle'), false);
   }
@@ -142,7 +142,7 @@ test('cycle position survives an absent or mismatched historical timestamp row',
     if (mode === 'invalidDate') projection.snapshot.cycles[0].cycle.updated_at = '2026-02-30T12:00:00Z';
     const resume = await renderCycleResume(projection);
     assert.equal(resume.hidden, false, mode);
-    assert.equal(resume.textContent, 'episodeLabel:1 · 22:51 · Dream Cast', mode);
+    assert.equal(resume.textContent, 'episodeLabel:1 · 22:51 Dream Cast', mode);
   }
 });
 
@@ -154,7 +154,7 @@ test('off-page active foreground can use its selected origin without requiring a
   projection.snapshot.cycles = [];
   const resume = await renderCycleResume(projection);
   assert.equal(resume.hidden, false);
-  assert.equal(resume.textContent, 'episodeLabel:1 · 22:51 · Dream Cast');
+  assert.equal(resume.textContent, 'episodeLabel:1 · 22:51 Dream Cast');
 });
 
 test('unknown, foreign, pending and reconciliation snapshots clear cycle resume', async () => {
@@ -287,12 +287,12 @@ test('failed explicit action remains visible after a fresh nonpending projection
   const elements = new Map(['watch-completion', 'watch-current', 'watch-actions', 'watch-feedback',
     'watch-cycle-card', 'resume-label', 'resume'].map(id => [id, element('div')]));
   const projection = { pending: false, snapshot: { history_adopted: true, readiness: 'ready', origins: [],
-    foreground: { cycle_id: null } }, actions: [{ command: 'pause', capabilityId: 'stale-capability' }] };
+    foreground: { cycle_id: null } }, actions: [] };
   projection.snapshot.foreground.cycle_id = 'first-view';
   projection.snapshot.origins = [{ anime_id: 101, state: { current: {
     cycle_id: 'first-view', status: 'active', kind: 'watching', episode: 1,
   } } }];
-  projection.actions = [{ command: 'cancel', capabilityId: 'cancel-first-view' }];
+  projection.actions = [{ command: 'reconcile', capabilityId: 'repair-cycle', groups: [] }];
   const context = vm.createContext({ matchConfirmed: true, syncAccountActive: true, tab: { id: 71 },
     accountActivityEpoch: 0, localWriteRevision: 'revision', playerFound: true,
     watchProjection: null, pauseSessionStateReload: false, renderResume: async () => {},
@@ -308,7 +308,7 @@ test('failed explicit action remains visible after a fresh nonpending projection
     document: { createElement: element, getElementById: id => elements.get(id) } });
   vm.runInContext(`${source.slice(start, end)}\n globalThis.run = renderWatchCycle;`, context);
   await context.run();
-  const button = elements.get('watch-actions').children[0].children[1];
+  const button = elements.get('watch-actions').children.find(child => child.tagName === 'BUTTON');
   await button.events.click();
   assert.equal(elements.get('watch-feedback').textContent, 'watchActionFailed');
   assert.equal(elements.get('watch-cycle-card').hidden, false, 'failure stays visible when successor has only automatic Start');
@@ -367,7 +367,7 @@ test('actual cycle renderer retains completion and shows only component tracked 
   assert.ok(displayed.includes('watchRewatching'));
   assert.equal(displayed.includes('watchTrackedCycle:2'), false);
   assert.equal(displayed.includes('watchEarlierCountUnknown'), false);
-  assert.ok(displayed.includes('episodeLabel:3'));
+  assert.equal(displayed, 'watchRewatching');
   assert.equal(displayed.includes('SUMMER'), false, 'calendar season is not a season number');
   snapshot.start_state.completed_count_lower_bound = 1;
   snapshot.foreground.cycle_id = null;
@@ -375,13 +375,13 @@ test('actual cycle renderer retains completion and shows only component tracked 
   await context.run();
   assert.equal(elements.get('watch-completion').textContent, 'watchPreviouslyCompleted');
   assert.ok(elements.get('watch-current').textContent.includes('watchPaused'));
-  assert.ok(elements.get('watch-current').textContent.includes('episodeLabel:3'));
+  assert.equal(elements.get('watch-current').textContent, 'watchPaused');
   snapshot.start_state.lifetime_completed_count = 5;
   await context.run();
   assert.equal(elements.get('watch-completion').textContent, 'watchPreviouslyCompleted', 'unknown tracking totals are not lifetime estimates');
   snapshot.totals = { completed: 1 };
   await context.run();
-  assert.equal(elements.get('watch-completion').textContent, 'watchPreviouslyCompleted · watchTrackedCompletions:1');
+  assert.equal(elements.get('watch-completion').textContent, 'watchPreviouslyCompleted');
   const retainedCurrent = { ...current, status: 'active', tracked_start_ordinal: 6 };
   snapshot.start_state.lifetime_completed_count = 1;
   snapshot.foreground.cycle_id = 'retained';
@@ -389,25 +389,15 @@ test('actual cycle renderer retains completion and shows only component tracked 
   snapshot.origins.push({ history_id: 'same-history', anime_id: 202, state: { current: retainedCurrent,
     lifetime_completed_count: 5, completed_count_lower_bound: 5 } });
   await context.run();
-  assert.equal(elements.get('watch-completion').textContent, 'watchPreviouslyCompleted · watchTrackedCompletions:1',
+  assert.equal(elements.get('watch-completion').textContent, 'watchPreviouslyCompleted',
     'one component total, not a sum of overlapping lifetime counters');
   snapshot.origins[1].state.lifetime_completed_count = null;
   await context.run();
-  assert.ok(elements.get('watch-completion').textContent.includes('watchTrackedCompletions:1'));
+  assert.equal(elements.get('watch-completion').textContent, 'watchPreviouslyCompleted');
   assert.equal(elements.get('watch-completion').textContent.includes('watchCompletedCount:'), false, 'no invented lifetime sum');
   projection.actions = [{ command: 'pause', capabilityId: 'pause-action' }];
   await context.run();
-  let manual = elements.get('watch-actions').children[0];
-  assert.equal(manual.open, false, 'optional controls initially closed');
-  manual.open = true;
-  projection.actions = [{ command: 'resume', capabilityId: 'resume-action' }];
-  await context.run();
-  manual = elements.get('watch-actions').children[0];
-  assert.equal(manual.open, true, 'user disclosure choice survives command/state refresh');
-  assert.equal(manual.children[1].textContent, 'watchAction_resume');
-  manual.open = false;
-  await context.run();
-  assert.equal(elements.get('watch-actions').children[0].open, false, 'user collapse is also preserved');
+  assert.equal(elements.get('watch-actions').children.length, 0, 'routine controls stay hidden');
   projection.pending = true;
   projection.pendingIntent = { animeId: 303, action: 'start', commandId: 'original-id' };
   await context.run();

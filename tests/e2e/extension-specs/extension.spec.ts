@@ -120,8 +120,24 @@ async function extensionTabId(urlPattern: string): Promise<number> {
   }, urlPattern);
 }
 
-async function openPopup(tabId: number, origin = siteBase): Promise<Page> {
+async function openPopup(tabId: number, origin = siteBase, fixedTime?: Date): Promise<Page> {
   const popup = await context.newPage();
+  if (fixedTime) {
+    // Playwright Clock applies to the whole context, including later tests.
+    await popup.addInitScript((timestamp) => {
+      Date = new Proxy(Date, {
+        construct(target, args, newTarget) {
+          return Reflect.construct(target, args.length ? args : [timestamp], newTarget);
+        },
+        apply(target) {
+          return new target(timestamp).toString();
+        },
+        get(target, key, receiver) {
+          return key === 'now' ? () => timestamp : Reflect.get(target, key, receiver);
+        },
+      });
+    }, fixedTime.getTime());
+  }
   await popup.goto(`chrome-extension://${extensionId}/popup.html?tabId=${tabId}&testOrigin=${encodeURIComponent(origin)}`);
   return popup;
 }
@@ -218,12 +234,12 @@ async function popupReadGate(kind: 'session' | 'history', query = '') {
   }, { kind, query });
 }
 
-async function localPopupPage() {
-  await worker.evaluate(async () => {
+async function localPopupPage(accountName = 'TestUser') {
+  await worker.evaluate(async (name) => {
     const base = (globalThis as any).AniRekoRuntimeConfig.apiBase;
-    await fetch(base + '/__test/session?on=1&user=18');
+    await fetch(base + '/__test/session?on=1&user=18&name=' + encodeURIComponent(name));
     await fetch(base + '/__test/cycle-history');
-  });
+  }, accountName);
   const page = await context.newPage();
   await page.goto(`${siteBase}/anime.html`);
   const tabId = await extensionTabId(`${siteBase}/*`);
@@ -243,62 +259,100 @@ async function localPopupPage() {
   return { page, tabId };
 }
 
-for (const status of ['active', 'paused', 'noDate'] as const) {
+for (const status of ['active', 'rewatch', 'paused', 'noDate'] as const) {
   test(`popup current-cycle resume restores saved position and voice (${status})`, async ({}, testInfo) => {
-    const { page, tabId } = await localPopupPage();
+    const accountName = status === 'active' ? 'Александра ОченьДлиннаяФамилияБезПробелов' : 'TestUser';
+    const { page, tabId } = await localPopupPage(accountName);
     let popup: Page | null = null;
     try {
       await worker.evaluate(async (mode) => {
         const base = (globalThis as any).AniRekoRuntimeConfig.apiBase;
-        await fetch(base + '/__test/cycle-history?resume=' + (mode === 'noDate' ? 'paused&noDate=1' : mode));
+        const scenarios = { noDate: 'paused&noDate=1', active: 'active&firstWatch=1', rewatch: 'active', paused: 'paused' };
+        const scenario = scenarios[mode];
+        await fetch(base + '/__test/cycle-history?resume=' + scenario);
       }, status);
       // Resume is intentionally hidden during active playback. Establish the
       // sensor's paused state, not only its earlier seek position, before opening.
       await setSyntheticPlayback(page.frameLocator('#main-player'), '#main-video', { currentTime: 1, paused: true });
       await expect.poll(async () => (await storedTabState(tabId))?.player?.playing).toBe(false);
-      popup = await openPopup(tabId);
+      const compareScreenshot = (status === 'active' || status === 'rewatch') && process.platform === 'win32';
+      if (compareScreenshot) {
+        await worker.evaluate(async () => {
+          await (globalThis as any).AniRekoTestHooks.seedLocalHistory({
+            records: {},
+            days: { '2026-11-27': { watchedSeconds: 600, episodeKeys: ['local::2'] } },
+          });
+        });
+      }
+      popup = await openPopup(tabId, siteBase, compareScreenshot ? new Date(2026, 10, 27, 12) : undefined);
       await expect(popup.locator('#resume-label')).toHaveText('Где остановился');
       await expect(popup.locator('#resume')).toBeVisible();
-      await expect(popup.locator('#resume')).toContainText('Серия 1 · 22:51 · Dream Cast');
-      if (status === 'noDate') await expect(popup.locator('#resume')).toHaveText('Серия 1 · 22:51 · Dream Cast');
+      await expect(popup.locator('#resume')).toContainText('Серия 1 · 22:51 Dream Cast');
+      if (status === 'noDate') await expect(popup.locator('#resume')).toHaveText('Серия 1 · 22:51 Dream Cast');
       else await expect(popup.locator('#resume')).toContainText('Обновлено:');
-      const resumeBox = await popup.locator('#anime-fields').boundingBox();
-      const statsBox = await popup.locator('#stats-card').boundingBox();
-      expect(resumeBox).not.toBeNull(); expect(statsBox).not.toBeNull();
-      expect(resumeBox!.y).toBeLessThan(statsBox!.y);
+      await expect(popup.locator('#watch-completion')).toHaveText('Полностью просмотрено');
+      if (status === 'rewatch') await expect(popup.locator('#watch-current')).toHaveText('Смотрю 2-й раз');
+      await expect(popup.locator('#watch-actions')).toBeEmpty();
+      await expect(popup.locator('#watch-current')).not.toContainText(/Серия\s+\d+/);
+      await expect(popup.locator('#account-label .profile-link')).toHaveText(accountName);
       for (const width of [360, 390]) {
         await popup.setViewportSize({ width, height: 850 });
         const positions = await popup.evaluate(() => {
-          const anime = document.getElementById('anime-check')!.getBoundingClientRect();
-          const resume = document.getElementById('anime-fields')!.getBoundingClientRect();
-          const player = document.getElementById('player-check')!.getBoundingClientRect();
+          const sections = ['#anime-check', '#anime-fields', '#player-check', '#watch-cycle-card',
+            '#stats-card', '#account', '.privacy-controls'].map((selector) => {
+            const rect = document.querySelector(selector)!.getBoundingClientRect();
+            return { selector, top: rect.top, bottom: rect.bottom, left: rect.left, right: rect.right };
+          });
           const change = document.getElementById('match-change')!;
-          return { order: anime.bottom <= resume.top && resume.bottom <= player.top,
+          const profile = document.querySelector('#account-label .profile-link')!;
+          const label = document.getElementById('account-label')!;
+          const sync = document.getElementById('resume-sync')!;
+          const name = profile.getBoundingClientRect();
+          return { sections, viewport: document.documentElement.clientWidth,
+            scrollWidth: document.documentElement.scrollWidth,
+            accountNameFits: name.top > label.getBoundingClientRect().top
+              && name.right <= sync.getBoundingClientRect().left
+              && profile.scrollWidth <= profile.clientWidth,
             changeHeight: change.getBoundingClientRect().height,
             changeBackground: getComputedStyle(change).backgroundColor };
         });
-        expect(positions.order).toBe(true);
+        expect(positions.scrollWidth).toBeLessThanOrEqual(positions.viewport);
+        expect(positions.accountNameFits).toBe(true);
+        expect(positions.sections[0].right - positions.sections[0].left).toBe(width - 32);
+        for (const [index, section] of positions.sections.entries()) {
+          expect(section.bottom - section.top, section.selector).toBeGreaterThan(0);
+          expect(section.left, section.selector).toBeGreaterThanOrEqual(0);
+          expect(section.right, section.selector).toBeLessThanOrEqual(positions.viewport);
+          if (index > 0) {
+            expect(section.top, section.selector).toBeGreaterThanOrEqual(positions.sections[index - 1].bottom);
+          }
+        }
         expect(positions.changeHeight).toBeGreaterThanOrEqual(24);
         expect(positions.changeBackground).toBe('rgba(0, 0, 0, 0)');
+        if (compareScreenshot) {
+          // Chromium uses platform fonts. These baselines were generated on Windows.
+          const scenario = status === 'rewatch' ? 'second-watch' : 'resume';
+          await expect(popup).toHaveScreenshot(`current-cycle-${scenario}-${width}.png`, {
+            fullPage: true,
+            maxDiffPixels: 0,
+          });
+        }
       }
       await expect(popup.locator('#match-change')).toHaveText('Не то аниме?');
       const commands = () => worker.evaluate(async () => (await (await fetch(
         (globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/cycle-history')).json()).posts);
       expect(await commands()).toEqual([], 'read-only resume opening cannot start, adopt or migrate');
-      await popup.setViewportSize({ width: 390, height: 850 });
-      const resumeScreenshot = testInfo.outputPath('current-cycle-resume.png');
-      await popup.screenshot({ path: resumeScreenshot, fullPage: true });
-      await testInfo.attach('current-cycle-resume', { path: resumeScreenshot, contentType: 'image/png' });
       if (status === 'active') {
-        await popup.getByText('Управление вручную', { exact: true }).click();
-        await popup.getByRole('button', { name: /^Приостановить просмотр/ }).click();
+        await expect(popup.locator('#watch-current')).toBeEmpty();
+        await expect(popup.locator('#watch-actions')).toBeEmpty();
+        await runCycleFixture(popup, tabId, 'pause');
         await expect(popup.locator('#watch-current')).toContainText('Просмотр на паузе');
-        await expect(popup.locator('#resume')).toContainText('Серия 1 · 22:51 · Dream Cast');
+        await expect(popup.locator('#resume')).toContainText('Серия 1 · 22:51 Dream Cast');
         expect((await commands()).map((item: any) => item.command)).toEqual(['pause']);
       }
       await popup.close();
       popup = await openPopup(tabId);
-      await expect(popup.locator('#resume')).toContainText('Серия 1 · 22:51 · Dream Cast');
+      await expect(popup.locator('#resume')).toContainText('Серия 1 · 22:51 Dream Cast');
     } finally {
       await popup?.close();
       await page.close();
@@ -313,11 +367,11 @@ test('popup manual Sync refreshes the authoritative cycle resume in the same pop
     await worker.evaluate(async () => { await fetch(
       (globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/cycle-history?resume=active'); });
     popup = await openPopup(tabId);
-    await expect(popup.locator('#resume')).toContainText('22:51 · Dream Cast');
+    await expect(popup.locator('#resume')).toContainText('22:51 Dream Cast');
     await expect(popup.locator('#resume-sync')).toBeEnabled();
     await popup.locator('#resume-sync').click();
     await expect(popup.locator('#resume-sync')).toHaveText('✓ обновлено');
-    await expect(popup.locator('#resume')).toContainText('Серия 2 · 0:01 · AniTime Voice');
+    await expect(popup.locator('#resume')).toContainText('Серия 2 · 0:01 AniTime Voice');
     await expect(popup.locator('#resume')).not.toContainText('Dream Cast');
     const commands = await worker.evaluate(async () => (await (await fetch(
       (globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/cycle-history')).json()).posts);
@@ -337,7 +391,7 @@ for (const kind of ['session', 'history'] as const) {
       try {
         if (warm) {
           const first = await openPopup(tabId);
-          await expect(first.locator('#watch-completion')).toContainText('Уже просмотрено');
+          await expect(first.locator('#watch-completion')).toContainText('Полностью просмотрено');
           await first.close();
         }
         const postsBefore = await worker.evaluate(async () => (await (await fetch(
@@ -380,7 +434,7 @@ for (const kind of ['session', 'history'] as const) {
           contentType: 'application/json' });
         console.log('popup local-before-network ' + JSON.stringify({ kind, warm, localFirstMs }));
         await popupReadGate(kind, '&hold=0');
-        await expect(popup.locator('#watch-completion')).toContainText('Уже просмотрено');
+        await expect(popup.locator('#watch-completion')).toContainText('Полностью просмотрено');
         await expect(popup.locator('#resume-sync')).toBeEnabled();
         await expect(popup.locator('#resume')).toBeHidden();
         const postsAfter = await worker.evaluate(async () => (await (await fetch(
@@ -405,7 +459,7 @@ test('popup loads watch history while the same player reports progress', async (
     await setSyntheticPlayback(page.frameLocator('#main-player'), '#main-video', { currentTime: 2, paused: true });
     await expect.poll(async () => (await storedTabState(tabId))?.player?.currentTime).toBe(2);
     await popupReadGate('history', '&hold=0');
-    await expect(popup.locator('#watch-completion')).toContainText('Уже просмотрено');
+    await expect(popup.locator('#watch-completion')).toContainText('Полностью просмотрено');
   } finally {
     await popupReadGate('history', '&hold=0&status=200');
     await popup?.close();
@@ -448,24 +502,24 @@ test('popup keeps local UI on failed session and rejects old taste after an acco
 
 // Test setup only: the user-facing Start control is intentionally absent.
 // Exercise the existing immutable capability transport to create recovery fixtures.
-async function startCycleFixture(popup: Page, tabId: number) {
+async function runCycleFixture(popup: Page, tabId: number, command = 'start') {
   // The removed button used to provide this readiness wait implicitly.
-  await expect(popup.locator('#watch-completion')).toContainText('Уже просмотрено');
-  const outcome = await popup.evaluate(async (tabId) => {
+  await expect(popup.locator('#watch-completion')).toContainText('Полностью просмотрено');
+  const outcome = await popup.evaluate(async ({ tabId, command }) => {
     const runtime = await chrome.runtime.sendMessage({ type: 'popup-runtime-info' });
     const expectedRevision = runtime.payload.localWriteRevision;
     const history = await chrome.runtime.sendMessage({ type: 'popup-watch-history', tabId, expectedRevision });
-    const start = history.payload?.actions?.find((action: any) => action.command === 'start');
-    if (!start) throw new Error('synthetic_start_capability_missing');
-    const reply = await chrome.runtime.sendMessage({ type: 'popup-watch-command', capabilityId: start.capabilityId, expectedRevision });
+    const capability = history.payload?.actions?.find((action: any) => action.command === command);
+    if (!capability) throw new Error('synthetic_cycle_capability_missing');
+    const reply = await chrome.runtime.sendMessage({ type: 'popup-watch-command', capabilityId: capability.capabilityId, expectedRevision });
     return { ok: reply?.ok === true, status: reply?.status, error: reply?.payload?.error || reply?.error,
       pending: reply?.payload?.pending === true };
-  }, tabId);
-  if (!outcome.ok && !outcome.pending) throw new Error('synthetic_start_not_admitted: ' + JSON.stringify(outcome));
+  }, { tabId, command });
+  if (!outcome.ok && !outcome.pending) throw new Error('synthetic_cycle_not_admitted: ' + JSON.stringify(outcome));
   await popup.reload();
 }
 
-test('paused playback preserves previous completion and exposes optional manual controls', async ({}, testInfo) => {
+test('paused playback preserves previous completion and keeps routine cycle controls out of the popup', async ({}, testInfo) => {
   await worker.evaluate(async () => {
     await chrome.storage.local.set({ 'auto-mark': true, 'sync-account': { id: 18, name: 'TestUser' } });
     const base = (globalThis as any).AniRekoRuntimeConfig.apiBase;
@@ -481,7 +535,7 @@ test('paused playback preserves previous completion and exposes optional manual 
     popup = await openPopup(tabId);
     await popup.setViewportSize({ width: 390, height: 600 });
     await expect(popup.locator('#watch-cycle-card')).toBeVisible();
-    await expect(popup.locator('#watch-completion')).toHaveText('Уже просмотрено · Завершено с начала учёта: 1');
+    await expect(popup.locator('#watch-completion')).toHaveText('Полностью просмотрено');
     await expect(popup.locator('#watch-current')).toBeEmpty();
     await expect(popup.getByRole('button', { name: 'Начать новый просмотр', exact: true })).toHaveCount(0);
     await expect(popup.getByRole('button', { name: 'Подключить историю просмотров', exact: true })).toHaveCount(0);
@@ -490,26 +544,24 @@ test('paused playback preserves previous completion and exposes optional manual 
       return (await response.json()).posts;
     });
     expect(await commands()).toEqual([]);
-    await startCycleFixture(popup, tabId);
-    await expect(popup.locator('#watch-current')).toContainText('Пересматриваю');
-    await popup.getByText('Управление вручную', { exact: true }).click();
-    await expect(popup.locator('#watch-actions details')).toHaveAttribute('open', '');
+    await runCycleFixture(popup, tabId);
+    await expect(popup.locator('#watch-current')).toHaveText(/Смотрю \d+-й раз/);
+    await expect(popup.locator('#watch-actions')).toBeEmpty();
     const completionBox = await popup.locator('#watch-completion').boundingBox();
     const activityBox = await popup.locator('#stats-card').boundingBox();
     expect(completionBox).not.toBeNull(); expect(activityBox).not.toBeNull();
     expect(completionBox!.y + completionBox!.height).toBeLessThanOrEqual(600);
     expect(completionBox!.y).toBeLessThan(activityBox!.y);
     await expect(popup.locator('#watch-current')).not.toContainText('Цикл');
-    await expect(popup.locator('#watch-completion')).toHaveText('Уже просмотрено · Завершено с начала учёта: 1');
+    await expect(popup.locator('#watch-completion')).toHaveText('Полностью просмотрено');
     expect((await commands()).map((command: any) => command.command)).toEqual(['start']);
     const screenshotPath = testInfo.outputPath('watch-cycle-popup.png');
     await popup.screenshot({ path: screenshotPath, fullPage: true });
     await testInfo.attach('watch-cycle-popup', { path: screenshotPath, contentType: 'image/png' });
-    await popup.getByRole('button', { name: /Приостановить просмотр/ }).click();
+    await runCycleFixture(popup, tabId, 'pause');
     await expect(popup.locator('#watch-current')).toContainText('Просмотр на паузе');
-    await expect(popup.locator('#watch-actions details')).toHaveAttribute('open', '');
-    await expect(popup.getByRole('button', { name: /Продолжить просмотр/ })).toBeVisible();
-    await expect(popup.locator('#watch-completion')).toHaveText('Уже просмотрено · Завершено с начала учёта: 1');
+    await expect(popup.locator('#watch-actions')).toBeEmpty();
+    await expect(popup.locator('#watch-completion')).toHaveText('Полностью просмотрено');
     await expect(popup.locator('#watch-current')).toContainText('Просмотр на паузе');
     expect((await commands()).map((command: any) => command.command)).toEqual(['start', 'pause']);
     await expect(popup.locator('#resume')).toBeHidden();
@@ -542,8 +594,8 @@ test('natural playback starts a repeat without popup and later confirms already 
     expect((await commands())[0].command).toBe('start', 'no retrobound progress before Start');
     popup = await openPopup(tabId);
     await popup.setViewportSize({ width: 390, height: 600 });
-    await expect(popup.locator('#watch-completion')).toHaveText('Уже просмотрено · Завершено с начала учёта: 1');
-    await expect(popup.locator('#watch-current')).toContainText('Пересматриваю');
+    await expect(popup.locator('#watch-completion')).toHaveText('Полностью просмотрено');
+    await expect(popup.locator('#watch-current')).toHaveText(/Смотрю \d+-й раз/);
     const completionBox = await popup.locator('#watch-completion').boundingBox();
     const activityBox = await popup.locator('#stats-card').boundingBox();
     expect(completionBox).not.toBeNull(); expect(activityBox).not.toBeNull();
@@ -590,8 +642,8 @@ test('native movie Complete80 then close/reopen starts one repeat without popup 
     await expect.poll(async () => (await commands()).filter((r: any) => r.command === 'start').length,
       { timeout: 18000 }).toBe(2);
     popup = await openPopup(tabId);
-    await expect(popup.locator('#watch-completion')).toHaveText('Уже просмотрено · Завершено с начала учёта: 2');
-    await expect(popup.locator('#watch-current')).toContainText('Пересматриваю');
+    await expect(popup.locator('#watch-completion')).toHaveText('Полностью просмотрено');
+    await expect(popup.locator('#watch-current')).toHaveText(/Смотрю \d+-й раз/);
     expect((await commands()).filter((r: any) => r.command === 'complete')).toHaveLength(1);
   } finally { await popup?.close(); await page.close(); }
 });
@@ -623,7 +675,7 @@ test('cycle recovery silently settles a lost ACK across account transfer and pop
     }
   }, timestamp);
   const expectSilentRecovery = async (popup: Page) => {
-    await expect(popup.locator('#watch-current')).toContainText('Пересматриваю');
+    await expect(popup.locator('#watch-current')).toHaveText(/Смотрю \d+-й раз/);
     await expect(popup.locator('#watch-feedback')).toBeEmpty();
     await expect(popup.locator('#watch-actions')).toBeEmpty();
   };
@@ -632,7 +684,7 @@ test('cycle recovery silently settles a lost ACK across account transfer and pop
     const tabId = await extensionTabId(`${siteBase}/*`);
     await expect.poll(async () => (await storedTabState(tabId))?.match?.status).toBe('ok');
     popup = await openPopup(tabId);
-    await startCycleFixture(popup, tabId);
+    await runCycleFixture(popup, tabId);
     await expectSilentRecovery(popup);
     const original = await pending();
     expect(original.version).toBe(1);
@@ -669,10 +721,10 @@ test('cycle recovery silently settles a lost ACK across account transfer and pop
     expect((await receipts()).settlementPosts).toHaveLength(1);
     popup = await openPopup(tabId);
     await expect.poll(pending).toBeUndefined();
-    await expect(popup.locator('#watch-current')).toContainText('Пересматриваю');
-    await expect(popup.locator('#watch-completion')).toContainText('Уже просмотрено');
+    await expect(popup.locator('#watch-current')).toHaveText(/Смотрю \d+-й раз/);
+    await expect(popup.locator('#watch-completion')).toContainText('Полностью просмотрено');
     await expect(popup.locator('#watch-feedback')).toBeEmpty();
-    await expect(popup.getByText('Управление вручную', { exact: true })).toBeVisible();
+    await expect(popup.locator('#watch-actions')).toBeEmpty();
     const observed = await receipts();
     expect(observed.posts).toHaveLength(1);
     expect(observed.settlementPosts).toHaveLength(2);
@@ -708,17 +760,17 @@ test('Cancel survives actual MV3 worker stop while the same video keeps playing'
     const tabId = await extensionTabId(`${siteBase}/*`);
     await expect.poll(async () => (await storedTabState(tabId))?.match?.status).toBe('ok');
     popup = await openPopup(tabId);
-    await startCycleFixture(popup, tabId);
-    await expect(popup.locator('#watch-current')).toContainText('Пересматриваю');
+    await runCycleFixture(popup, tabId);
+    await expect(popup.locator('#watch-current')).toHaveText(/Смотрю \d+-й раз/);
     await popup.close(); popup = null;
     await setSyntheticPlayback(page.frameLocator('#main-player'), '#main-video', { currentTime: 0, paused: false });
     await expect.poll(async () => (await storedTabState(tabId))?.player?.playing).toBe(true);
     popup = await openPopup(tabId);
-    await popup.getByText('Управление вручную', { exact: true }).click();
-    await popup.getByRole('button', { name: /Отменить этот просмотр/ }).click();
+    await expect(popup.locator('#watch-actions')).toBeEmpty();
+    await runCycleFixture(popup, tabId, 'cancel');
     await expect(popup.locator('#watch-current')).toBeEmpty();
     await expect(popup.getByRole('button', { name: 'Начать новый просмотр', exact: true })).toHaveCount(0);
-    await expect(popup.locator('#watch-completion')).toContainText('Уже просмотрено');
+    await expect(popup.locator('#watch-completion')).toContainText('Полностью просмотрено');
     expect((await commands()).filter((request: any) => request.command === 'cancel')).toHaveLength(1);
     await expect.poll(() => worker.evaluate(async () =>
       (await chrome.storage.local.get('watch-command-pending-v1'))['watch-command-pending-v1'])).toBeUndefined();
@@ -812,13 +864,13 @@ test('cycle repair requires separate explicit choices for complete related group
     await expect(apply).toBeDisabled();
     await groups.nth(1).getByRole('radio').nth(0).check();
     await expect(apply).toBeEnabled();
-    await expect(popup.locator('#watch-completion')).toContainText('Уже просмотрено');
+    await expect(popup.locator('#watch-completion')).toContainText('Полностью просмотрено');
     const screenshotPath = testInfo.outputPath('watch-choice-popup.png');
     await popup.screenshot({ path: screenshotPath, fullPage: true });
     await testInfo.attach('watch-choice-popup', { path: screenshotPath, contentType: 'image/png' });
     await apply.click();
     await expect(groups).toHaveCount(0);
-    await expect(popup.locator('#watch-completion')).toContainText('Уже просмотрено');
+    await expect(popup.locator('#watch-completion')).toContainText('Полностью просмотрено');
     const posts = await worker.evaluate(async () => {
       const response = await fetch((globalThis as any).AniRekoRuntimeConfig.apiBase + '/__test/cycle-history');
       return (await response.json()).posts;
@@ -986,6 +1038,7 @@ test('account calendar reuses one bounded bulk read and hides records after opt-
     await page.goto(`${siteBase}/anime.html`);
     const tabId = await extensionTabId(`${siteBase}/*`);
     await waitForDetectorReady(tabId);
+    await expect.poll(async () => (await storedTabState(tabId))?.match?.animeId).toBe(4242);
     popup = await openPopup(tabId);
     const localTime = await popup.locator('#today-time').innerText();
     await expect(popup.locator('.activity-account-entry')).toHaveCount(0);
@@ -1197,7 +1250,7 @@ test('compact popup keeps a long recognized title and action usable at 360 and 3
     popup = await openPopup(tabId);
     await expect(popup.locator('#title')).toHaveText(longTitle);
     await popup.setViewportSize({ width: 800, height: 850 });
-    await expect.poll(() => popup!.locator('body').evaluate(node => node.getBoundingClientRect().width)).toBe(360);
+    await expect.poll(() => popup!.locator('body').evaluate(node => node.getBoundingClientRect().width)).toBe(390);
     await popup.setViewportSize({ width: 220, height: 850 });
     await expect.poll(() => popup!.evaluate(() => {
       const brand = document.querySelector('.brand')!.getBoundingClientRect();
@@ -2539,7 +2592,7 @@ test('syncs resume progress on pause (episode, position, voice — no URL)', asy
   // Попап показывает «где остановился» (resume-bulk кэш / bulk-GET).
   const popup = await openPopup(tabId);
   await expect(popup.locator('#resume')).toBeVisible();
-  await expect(popup.locator('#resume')).toContainText(/Серия 2 · \d+:\d{2} · AniTime Voice · сегодня/);
+  await expect(popup.locator('#resume')).toContainText(/Серия 2 · \d+:\d{2}\s+AniTime Voice · сегодня/);
 
   // Кнопка ручного синка: работает и уходит в кулдаун (защита от закликивания).
   const syncButton = popup.locator('#resume-sync');
