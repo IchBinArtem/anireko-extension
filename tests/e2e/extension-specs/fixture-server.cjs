@@ -449,7 +449,7 @@ const server = http.createServer((request, response) => {
     cycleHistoryEnabled = true;
     const settings = new URL(request.url, 'http://localhost').searchParams;
     if (['active', 'paused'].includes(settings.get('resume'))) {
-      cycleCurrent = { cycle_id: cycleId, status: settings.get('resume'), kind: 'rewatching',
+      cycleCurrent = { cycle_id: cycleId, status: settings.get('resume'), kind: settings.has('firstWatch') ? 'watching' : 'rewatching',
         tracked_start_ordinal: 2, episode: 1, position_sec: 1371, duration_sec: 1500, voice: 'Dream Cast' };
       cycleVersion++; cycleGeneration++;
       cycleUpdatedAt = '2026-10-05T12:00:00Z';
@@ -841,7 +841,7 @@ const server = http.createServer((request, response) => {
     const query = new URL(request.url, 'http://localhost').searchParams;
     const on = query.get('on') === '1';
     const userId = Number(query.get('user') || 18);
-    sessionUser = on ? { id: userId, name: userId === 953 ? 'Demo YooKassa' : 'TestUser' } : null;
+    sessionUser = on ? { id: userId, name: query.get('name') || (userId === 953 ? 'Demo YooKassa' : 'TestUser') } : null;
     response.writeHead(200, { 'content-type': 'application/json' });
     response.end(JSON.stringify({ ok: true, sessionUser }));
     return;

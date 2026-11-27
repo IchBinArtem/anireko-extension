@@ -54,6 +54,10 @@ extension/tests/test_release_workflow.py
 tests/e2e/extension-specs/ad.mp4
 tests/e2e/extension-specs/episode.mp4
 tests/e2e/extension-specs/extension.spec.ts
+tests/e2e/extension-specs/extension.spec.ts-snapshots/current-cycle-resume-360-win32.png
+tests/e2e/extension-specs/extension.spec.ts-snapshots/current-cycle-resume-390-win32.png
+tests/e2e/extension-specs/extension.spec.ts-snapshots/current-cycle-second-watch-360-win32.png
+tests/e2e/extension-specs/extension.spec.ts-snapshots/current-cycle-second-watch-390-win32.png
 tests/e2e/extension-specs/extension-restart.spec.ts
 tests/e2e/extension-specs/fixture-server.cjs
 tests/e2e/extension-specs/global-setup.cjs

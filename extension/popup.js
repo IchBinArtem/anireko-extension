@@ -260,7 +260,7 @@
         profile.target = '_blank';
         profile.rel = 'noopener';
         profile.textContent = payload.user.name || t('profileFallback');
-        label.replaceChildren(`${t('accountOnSite')} `, profile);
+        label.replaceChildren(t('accountOnSite'), profile);
         autoMarkToggle.disabled = false;
         autoMarkToggle.checked = syncAccountActive;
         if (!sameAccount) {
@@ -854,8 +854,8 @@
     await renderResume(false);
     if (!canPublish()) return;
     watchCard.hidden = false;
-    for (const node of [...Array.from(watchActions.children), ...watchActions.querySelectorAll('details')]) {
-      if (node.tagName === 'DETAILS' && node.watchDisclosure) {
+    for (const node of watchActions.querySelectorAll('details')) {
+      if (node.watchDisclosure) {
         watchActions[node.watchDisclosure] = node.open;
       }
     }
@@ -874,20 +874,27 @@
       }
       const origins = [...(snapshot.origins || []), ...(snapshot.selected_origin ? [snapshot.selected_origin] : [])];
       const currentOrigin = origins.find((origin) => origin.state?.current?.cycle_id === snapshot.foreground?.cycle_id);
-      let completion = snapshot.previously_completed ? t('watchPreviouslyCompleted') : '';
-      // Component totals are tracked completions, not an invented lifetime total.
       const count = snapshot.totals?.completed;
-      if (Number.isSafeInteger(count) && count > 0) {
-        completion += `${completion ? ' · ' : ''}${t('watchTrackedCompletions', String(count))}`;
-      }
+      const completed = Number.isSafeInteger(count) && count > 0;
+      const completion = snapshot.previously_completed || completed ? t('watchPreviouslyCompleted') : '';
       set('watch-completion', completion);
       const current = currentOrigin?.state?.current;
       const parts = [];
       if (snapshot.readiness !== 'ready') parts.push(t('watchReconciliation'));
       else if (current) {
-        parts.push(t(current.kind === 'rewatching' ? 'watchRewatching' : 'statusWatching'));
-        if (current.episode != null) parts.push(t('episodeLabel', String(current.episode)));
-        if (currentOrigin.anime_id !== snapshot.requested_anime_id) parts.push(t('watchOtherTitle'));
+        const otherTitle = currentOrigin.anime_id !== snapshot.requested_anime_id;
+        if (current.kind === 'rewatching' || otherTitle) {
+          if (current.kind === 'rewatching') {
+            // Number repeats from recorded completions. A legacy completion
+            // marker alone is insufficient to assign a number.
+            parts.push(completed && !otherTitle
+              ? t('watchRewatchingNumber', String(count + 1))
+              : t('watchRewatching'));
+          } else {
+            parts.push(t('statusWatching'));
+          }
+          if (otherTitle) parts.push(t('watchOtherTitle'));
+        }
       } else {
         const paused = origins.filter((origin) => origin.state?.current?.status === 'paused');
         const seenPaused = new Set();
@@ -895,8 +902,7 @@
           const cycle = origin.state.current;
           if (seenPaused.has(cycle.cycle_id)) continue;
           seenPaused.add(cycle.cycle_id);
-          parts.push(t('watchPaused')
-            + (cycle.episode == null ? '' : ` · ${t('episodeLabel', String(cycle.episode))}`));
+          parts.push(t('watchPaused'));
         }
       }
       set('watch-current', parts.join(' · '));
@@ -925,85 +931,64 @@
       };
       if (!watchProjection.pending) {
         if (watchProjection.repairComplete === false) watchFeedback.textContent = t('watchChoicesIncomplete');
-        let manualActions = null;
         for (const action of watchProjection.actions || []) {
-          // Playback owns ordinary initialization/start; do not ask users to do it twice.
-          if (action.command === 'initialize' || action.command === 'start') continue;
-          if (action.command === 'reconcile') {
-            const selected = new Map();
-            const groups = action.groups || [];
-            const hint = document.createElement('p');
-            hint.className = 'watch-choice-hint';
-            hint.textContent = t('watchChoicesHint');
-            watchActions.append(hint);
-            const apply = document.createElement('button');
-            apply.type = 'button';
-            apply.textContent = t('watchAction_reconcile');
-            apply.disabled = groups.length > 0;
-            groups.forEach((group, index) => {
-              const fieldset = document.createElement('fieldset');
-              fieldset.className = 'watch-choice-group';
-              const legend = document.createElement('legend');
+          if (action.command !== 'reconcile') continue;
+          const selected = new Map();
+          const groups = action.groups || [];
+          const hint = document.createElement('p');
+          hint.className = 'watch-choice-hint';
+          hint.textContent = t('watchChoicesHint');
+          watchActions.append(hint);
+          const apply = document.createElement('button');
+          apply.type = 'button';
+          apply.textContent = t('watchAction_reconcile');
+          apply.disabled = groups.length > 0;
+          groups.forEach((group, index) => {
+            const fieldset = document.createElement('fieldset');
+            fieldset.className = 'watch-choice-group';
+            const legend = document.createElement('legend');
             legend.textContent = group.catalog?.title_ru || group.catalog?.title
-                || group.catalog?.title_en || t('watchChoiceGroup', String(index + 1));
-              fieldset.append(legend);
-              for (const [optionIndex, option] of group.options.entries()) {
-                const label = document.createElement('label');
-                const radio = document.createElement('input');
-                radio.type = 'radio';
-                radio.name = `watch-choice-${index}`;
-                radio.value = option.cycleId;
-                radio.checked = false;
-                const detail = document.createElement('span');
-                detail.textContent = [t(option.kind === 'rewatching' ? 'watchRewatching' : 'statusWatching'),
-                  t('watchChoiceOption', String(optionIndex + 1)),
-                  t('watchTrackedCycle', String(option.ordinal)),
-                  ...(option.episode == null ? [] : [t('episodeLabel', String(option.episode))])].join(' · ');
-                radio.addEventListener('change', () => {
-                  if (!radio.checked) return;
-                  selected.set(index, option.cycleId);
-                  apply.disabled = selected.size !== groups.length;
-                });
-                label.append(radio);
-                label.append(detail);
-                fieldset.append(label);
-                const identity = document.createElement('details');
-                identity.watchDisclosure = `choice:${option.cycleId}`;
-                identity.open = !!watchActions[identity.watchDisclosure];
-                const identitySummary = document.createElement('summary');
-                identitySummary.textContent = t('watchChoiceDetails', String(optionIndex + 1));
-                const identityText = document.createElement('p');
-                identityText.textContent = [t('watchOriginalTarget', String(option.animeId)),
-                  t('watchHistoryIdentity', String(option.historyId))].join(' · ');
-                identity.append(identitySummary); identity.append(identityText);
-                fieldset.append(identity);
-              }
-              watchActions.append(fieldset);
-            });
-            apply.addEventListener('click', () => {
-              if (apply.disabled || selected.size !== groups.length) return;
-              run('popup-watch-command', { capabilityId: action.capabilityId,
-                choiceCycleIds: groups.map((_, index) => selected.get(index)) });
-            });
-            watchActions.append(apply);
-            continue;
-          }
-          const label = t(`watchAction_${action.command}`);
-          const suffix = action.ordinal == null ? '' : ` · ${t('watchTrackedCycle', String(action.ordinal))}`;
-          if (!manualActions) {
-            manualActions = document.createElement('details');
-            manualActions.watchDisclosure = 'manualControlsOpen';
-            manualActions.open = !!watchActions.manualControlsOpen;
-            const summary = document.createElement('summary');
-            summary.textContent = t('watchManualControls');
-            manualActions.append(summary);
-            watchActions.append(manualActions);
-          }
-          const button = document.createElement('button');
-          button.type = 'button';
-          button.textContent = label + suffix;
-          button.addEventListener('click', () => run('popup-watch-command', { capabilityId: action.capabilityId }));
-          manualActions.append(button);
+              || group.catalog?.title_en || t('watchChoiceGroup', String(index + 1));
+            fieldset.append(legend);
+            for (const [optionIndex, option] of group.options.entries()) {
+              const label = document.createElement('label');
+              const radio = document.createElement('input');
+              radio.type = 'radio';
+              radio.name = `watch-choice-${index}`;
+              radio.value = option.cycleId;
+              radio.checked = false;
+              const detail = document.createElement('span');
+              detail.textContent = [t(option.kind === 'rewatching' ? 'watchRewatching' : 'statusWatching'),
+                t('watchChoiceOption', String(optionIndex + 1)),
+                t('watchTrackedCycle', String(option.ordinal)),
+                ...(option.episode == null ? [] : [t('episodeLabel', String(option.episode))])].join(' · ');
+              radio.addEventListener('change', () => {
+                if (!radio.checked) return;
+                selected.set(index, option.cycleId);
+                apply.disabled = selected.size !== groups.length;
+              });
+              label.append(radio);
+              label.append(detail);
+              fieldset.append(label);
+              const identity = document.createElement('details');
+              identity.watchDisclosure = `choice:${option.cycleId}`;
+              identity.open = !!watchActions[identity.watchDisclosure];
+              const identitySummary = document.createElement('summary');
+              identitySummary.textContent = t('watchChoiceDetails', String(optionIndex + 1));
+              const identityText = document.createElement('p');
+              identityText.textContent = [t('watchOriginalTarget', String(option.animeId)),
+                t('watchHistoryIdentity', String(option.historyId))].join(' · ');
+              identity.append(identitySummary); identity.append(identityText);
+              fieldset.append(identity);
+            }
+            watchActions.append(fieldset);
+          });
+          apply.addEventListener('click', () => {
+            if (apply.disabled || selected.size !== groups.length) return;
+            return run('popup-watch-command', { capabilityId: action.capabilityId,
+              choiceCycleIds: groups.map((_, index) => selected.get(index)) });
+          });
+          watchActions.append(apply);
         }
       }
       if (!completion && parts.length === 0 && !watchFeedback.textContent && watchActions.children.length === 0) {
@@ -1185,13 +1170,20 @@
     const parts = [];
     if (resume.episode != null) parts.push(t('episodeLabel', String(resume.episode)));
     parts.push(fmtTime(resume.position));
-    if (resume.voice) parts.push(resume.voice);
+    const metadata = [];
+    if (resume.voice) metadata.push(resume.voice);
     const when = fmtWhen(resume.at);
-    if (when) parts.push(resume.cycle ? t('resumeCycleUpdated', when) : when);
+    if (when) metadata.push(resume.cycle ? t('resumeCycleUpdated', when) : when);
     document.getElementById('resume-label').hidden = false;
     const resumeElement = document.getElementById('resume');
     resumeElement.hidden = false;
     resumeElement.textContent = parts.join(' · ');
+    if (metadata.length) {
+      const detail = document.createElement('span');
+      detail.className = 'resume-meta';
+      detail.textContent = metadata.join(' · ');
+      resumeElement.append(' ', detail);
+    }
   }
   renderResume(false);
 

@@ -22,7 +22,7 @@ function popup({ account, projection, syncReply, staleDocument = false, tasteUse
     const node = { textContent: '', hidden: ['resume', 'resume-label', 'watch-cycle-card'].includes(id),
       disabled: id === 'auto-mark', checked: false, dataset: {}, style: {}, children: [], events: {},
       classList: { add() {}, remove() {} }, setAttribute() {},
-      append(child) { this.children.push(child); },
+      append(...children) { this.children.push(...children); },
       replaceChildren(...children) { this.children = children; },
       addEventListener(type, listener) { this.events[type] = listener; },
       querySelector() { return element(); }, querySelectorAll() { return []; } };
@@ -363,7 +363,8 @@ test('full popup restores current resume after every no-write Sync terminal path
     assert.equal(ui.get('resume').hidden, false);
     await ui.get('resume-sync').events.click();
     assert.equal(ui.get('resume').hidden, false, 'unchanged current cycle remains available');
-    assert.equal(ui.get('resume').textContent, 'episodeLabel:1 · 22:51 · Dream Cast');
+    assert.equal(ui.get('resume').textContent, 'episodeLabel:1 · 22:51');
+    assert.equal(ui.get('resume').children.at(-1).textContent, 'Dream Cast');
     assert.equal(ui.calls.filter(call => call.type === 'popup-watch-history').length, 2);
     assert.equal(ui.calls.filter(call => call.type === 'popup-sync-current').length, 1);
     assert.ok(!ui.calls.some(call => /command|retry|update-preferences/.test(call.type)));

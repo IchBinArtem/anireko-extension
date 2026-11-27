@@ -12,6 +12,9 @@
 }
 [hidden] { display: none !important; }
 body { margin: 0; width: 360px; max-width: 100%; background: var(--surface); color: #f8fafc; }
+@media (min-width: 390px) {
+  body { width: 390px; }
+}
 main { position: relative; padding: 16px; }
 .brand { display: flex; align-items: center; gap: 8px; margin: 0 0 10px; }
 .brand-mark {
@@ -251,6 +254,15 @@ main:has(#privacy-disclosure[hidden]) #anime-check-title { padding-right: 100px;
 #anime-fields:not(:has(#resume:not([hidden]))) { display: none; }
 .resume-card > span { color: var(--muted); font-size: 9.5px; }
 .resume-card > strong { color: #e2e8f0; font-size: 11px; line-height: 1.35; }
+#anime-fields > #resume { font-size: 15px; font-weight: 700; font-variant-numeric: tabular-nums; }
+#resume .resume-meta {
+  display: block;
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 400;
+  overflow-wrap: anywhere;
+}
 .ok { color: #34d399; }
 .warn { color: #fbbf24; }
 .account {
@@ -267,6 +279,7 @@ main:has(#privacy-disclosure[hidden]) #anime-check-title { padding-right: 100px;
   line-height: 1.35;
 }
 #account-label { flex: 1 1 70px; min-width: 0; overflow-wrap: anywhere; }
+#account-label .profile-link { display: block; }
 #account-login {
   flex-shrink: 0;
   padding: 6px 11px;
