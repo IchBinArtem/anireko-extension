@@ -338,7 +338,18 @@
     if (dreamCast && !video.closest('#player') && !videoIds.has(video)) return;
     const rawWatched = progressApi.isWatched(video.currentTime, video.duration);
     if (!dreamCast && reason === 'timeupdate' && !rawWatched && now - runtime.lastReportAt < 5000) return;
-    const episode = readEpisode(true);
+    // The embedded player updates its selected episode button while the
+    // outer web component can retain the episode it was initialized with.
+    const episodeButtons = window === window.top ? []
+      : Array.from(document.querySelectorAll('button.chip--episode[aria-expanded]')).filter(isLocallyVisible);
+    const selectedEpisode = episodeButtons.length === 1
+      ? recognitionApi.uniqueSelectedEpisode([episodeButtons[0].textContent.trim()])
+      : null;
+    const sameSource = runtime.reportedSource === video.currentSrc;
+    const retainedSelection = sameSource ? runtime.reportedSelection : null;
+    const episode = selectedEpisode ?? retainedSelection ?? readEpisode(true);
+    if (selectedEpisode !== null && sameSource
+      && runtime.reportedEpisode !== episode && video.currentTime > 1) return;
     if (dreamCast) {
       const videos = [...document.querySelectorAll('#player video')];
       const current = videos.length === 1 && videos[0].isConnected ? videos[0] : null;
@@ -365,6 +376,9 @@
     if (reason === 'timeupdate' && !watchedTransition && now - runtime.lastReportAt < 5000
       && !(unavailable && runtime.dreamCastUnavailable !== true)) return;
     runtime.lastReportAt = now;
+    runtime.reportedSource = video.currentSrc;
+    runtime.reportedEpisode = reportedEpisode;
+    runtime.reportedSelection = selectedEpisode ?? retainedSelection;
     runtime.dreamCastUnavailable = unavailable;
     if (dreamCast) dreamCastLastValidVideo = unavailable ? null : video;
     if (watched) runtime.watchedEpisode = episodeKey;
