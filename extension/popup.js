@@ -355,6 +355,7 @@
       const entries = document.getElementById('activity-entries');
       entries.replaceChildren();
       const storedDay = history?.days?.[selectedActivityDate];
+      const localObservations = [];
       if (!Array.isArray(storedDay?.details) && !day.accountRecords?.length) {
         const note = document.createElement('p');
         note.textContent = t('activityDetailsUnavailable');
@@ -369,6 +370,7 @@
         for (const detail of storedDay.details) {
           if (!detail || typeof detail.title !== 'string'
             || !Number.isFinite(detail.watchedSeconds) || detail.watchedSeconds < 60) continue;
+          localObservations.push(detail);
           const groupKey = Number.isSafeInteger(detail.animeId) && detail.animeId > 0
             ? `anime:${detail.animeId}` : detail.animeId === null && typeof detail.titleKey === 'string' && detail.titleKey
               ? `title:${detail.titleKey}` : detail;
@@ -403,12 +405,15 @@
           group.element.append(row);
         }
       }
-      if (day.accountRecords?.length) {
+      const accountRecords = (day.accountRecords || []).filter(record => !localObservations.some(detail =>
+        detail.animeId === record.animeId && (detail.episode ?? null) === (record.episode ?? null)
+        && (detail.voice ?? null) === (record.voice ?? null)));
+      if (accountRecords.length) {
         const note = document.createElement('p');
         note.className = 'activity-account-note';
         note.textContent = t('activityAccountNote');
         entries.append(note);
-        for (const record of day.accountRecords) {
+        for (const record of accountRecords) {
           const entry = document.createElement('div');
           entry.className = 'activity-entry activity-account-entry';
           const title = document.createElement('strong');
@@ -427,11 +432,11 @@
           entry.append(title); entry.append(metadata); entry.append(position);
           entries.append(entry);
         }
-        if (day.accountPartial) {
-          const note = document.createElement('p');
-          note.textContent = t('activityDetailsPartial');
-          entries.append(note);
-        }
+      }
+      if (day.accountPartial) {
+        const note = document.createElement('p');
+        note.textContent = t('activityDetailsPartial');
+        entries.append(note);
       }
       for (const cell of chart.children) cell.setAttribute('aria-pressed', String(cell.activityDate === selectedActivityDate));
     };

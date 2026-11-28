@@ -1069,6 +1069,21 @@ test('account calendar reuses one bounded bulk read and hides records after opt-
     expect(Object.keys(stored.byAnime)).toEqual(['4343']);
     await popup.setViewportSize({ width: 390, height: 850 });
     await popup.screenshot({ path: testInfo.outputPath('account-calendar-ru.png'), fullPage: true });
+    await worker.evaluate(async () => {
+      const now = new Date();
+      const day = [now.getFullYear(), now.getMonth() + 1, now.getDate()]
+        .map((part) => String(part).padStart(2, '0')).join('-');
+      await (globalThis as any).AniRekoTestHooks.seedLocalHistory({ records: {}, days: {
+        [day]: { watchedSeconds: 120, episodeKeys: ['local::7'], details: [
+          { animeId: 4343, title: 'Аниме из аккаунта', episode: 7, voice: 'Account Voice',
+            watchedSeconds: 120, position: 1259, duration: 1440 },
+        ] },
+      } });
+    });
+    await popup.close(); popup = await openPopup(tabId);
+    await expect(popup.locator('#activity-heading')).toContainText('браузер + аккаунт');
+    await expect(popup.locator('.activity-entry').filter({ hasText: 'Аниме из аккаунта' })).toHaveCount(1);
+    await expect(popup.locator('.activity-account-entry')).toHaveCount(0);
     await worker.evaluate(async () => { await chrome.storage.local.set({ 'auto-mark': false }); });
     await expect(popup.locator('.activity-account-entry')).toHaveCount(0);
     await expect(popup.locator('#week-chart .has-account-records')).toHaveCount(0);
@@ -2020,6 +2035,34 @@ test('re-recognizes the page after SPA navigation without reload', async () => {
     return { title: state?.recognition?.title ?? null, match: state?.match?.status ?? null };
   }).toEqual({ title: 'Восхождение героя щита', match: 'none' });
   await page.close();
+});
+
+test('selected episode in the embedded player supersedes the stale host attribute', async () => {
+  const page = await context.newPage();
+  try {
+    const url = `${siteBase}/shadow-anime.html`;
+    await page.goto(url);
+    const tabId = await extensionTabId(url);
+    const frame = page.frameLocator('iframe');
+    await frame.locator('#shadow-video').evaluate(video => {
+      const selection = document.createElement('button');
+      selection.className = 'chip chip--episode';
+      selection.setAttribute('aria-expanded', 'false');
+      selection.textContent = 'Серия 3';
+      video.before(selection);
+      video.dispatchEvent(new Event('seeked'));
+    });
+    await setSyntheticPlayback(frame, '#shadow-video', { currentTime: 8, paused: false });
+    await expect.poll(async () => (await storedTabState(tabId))?.player?.episode).toBe(3);
+    await frame.locator('#shadow-video').evaluate(video => {
+      document.querySelector('button.chip--episode')!.textContent = 'Серия 5';
+      video.dispatchEvent(new Event('seeked'));
+    });
+    await setSyntheticPlayback(frame, '#shadow-video', { currentTime: 0, paused: true });
+    await expect.poll(async () => (await storedTabState(tabId))?.player?.episode).toBe(5);
+  } finally {
+    await page.close();
+  }
 });
 
 test('detects a shadow-DOM web-component player and joins the host episode attribute', async () => {
